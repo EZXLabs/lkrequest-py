@@ -1,0 +1,67 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "lkrequest"
+version = "0.1.0"
+description = "Python HTTP client with TLS/HTTP2/TCP fingerprint control, powered by Rust"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "BurstLinker Inc." }]
+keywords = [
+    "http",
+    "client",
+    "tls",
+    "fingerprint",
+    "ja3",
+    "ja4",
+    "http2",
+    "rust",
+    "async",
+    "web-scraping",
+]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+# NOTE: placeholder URLs — update once the public hosting location is decided.
+[project.urls]
+Homepage = "https://github.com/ez-opensource/lkrequest-py"
+Repository = "https://github.com/ez-opensource/lkrequest-py"
+Issues = "https://github.com/ez-opensource/lkrequest-py/issues"
+
+[project.optional-dependencies]
+# Test suite deps. The local server fixture (tests/conftest.py) runs httpbin
+# under hypercorn over TLS with H1/H2/H3 (aioquic), so tests do not depend on
+# the public httpbin.org. Install with: pip install -e .[test]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "httpbin",
+    "asgiref",
+    "hypercorn",
+    "aioquic",
+    "cryptography",
+]
+lint = [
+    "ruff==0.15.21",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "lkrequest._lkrequest"
+features = [
+    "pyo3/extension-module",
+    "quic-h3",
+    "telemetry",
+    "synthetic-fp",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

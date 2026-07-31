@@ -1,0 +1,5 @@
+httpx
+aiohttp
+requests
+pytest-benchmark
+tracemalloc

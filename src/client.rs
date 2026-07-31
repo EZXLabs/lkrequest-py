@@ -1,0 +1,1289 @@
+//! Async `Client` and blocking `BlockingClient` pyclasses: the configurable
+//! HTTP client entry points that build a `lkrequest::Client` from fingerprint,
+//! protocol, retry, proxy, and timeout settings and issue requests.
+
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use std::collections::HashMap;
+
+use crate::fingerprint::{PyH2Profile, PyTcpFingerprint, PyTlsProfile};
+use crate::hsts::PyHsts;
+use crate::middleware::{PyMiddleware, PyMiddlewareWrapper};
+use crate::protocol::{PyBrokenQuicPolicy, PyHttpIntent, PyProtocolPolicy};
+use crate::proxy::apply_session_proxy;
+use crate::randomize::PyRandomize;
+use crate::retry::{PyCallableRetryPolicy, PyExponentialBackoff, PyFixedInterval};
+use crate::session::{EventHooks, PyBlockingSession, PySession};
+use crate::types::{
+    resolve_h2_profile, resolve_tcp_fingerprint, resolve_tls_profile, validated_duration,
+    PyAcceptEncoding, PySessionResumptionConfig,
+};
+
+fn resolve_tls_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lktls::profile::TlsProfile> {
+    if let Ok(s) = obj.extract::<String>() {
+        resolve_tls_profile(&s)
+    } else if let Ok(p) = obj.extract::<PyTlsProfile>() {
+        Ok(p.inner)
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "tls_profile must be str (preset name) or TlsProfile object",
+        ))
+    }
+}
+
+fn resolve_h2_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkh2::profile::H2Profile> {
+    if let Ok(s) = obj.extract::<String>() {
+        resolve_h2_profile(&s)
+    } else if let Ok(p) = obj.extract::<PyH2Profile>() {
+        Ok(p.inner)
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "h2_profile must be str (preset name) or H2Profile object",
+        ))
+    }
+}
+
+/// Resolve a QUIC profile from a preset name (`"chrome"` / `"chrome_146"` /
+/// `"chrome_150"`) or a `QuicProfile` object. Requires the `quic-h3` feature;
+/// without it any value is rejected with a clear error.
+#[cfg(feature = "quic-h3")]
+fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProfile> {
+    if let Ok(s) = obj.extract::<String>() {
+        match s.as_str() {
+            "chrome" => Ok(lkrequest::lkh3::chrome_quic()),
+            "chrome_146" => Ok(lkrequest::lkh3::chrome_146_quic()),
+            "chrome_150" => Ok(lkrequest::lkh3::chrome_150_quic()),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150",
+                s
+            ))),
+        }
+    } else if let Ok(p) = obj.extract::<crate::quic::PyQuicProfile>() {
+        Ok(p.inner)
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "quic_profile must be str (preset name) or QuicProfile object",
+        ))
+    }
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn resolve_quic_from_any(_obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProfile> {
+    Err(pyo3::exceptions::PyRuntimeError::new_err(
+        "quic_profile requires building lkrequest-py with the 'quic-h3' feature: maturin develop --features quic-h3",
+    ))
+}
+
+fn resolve_tcp_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::TcpFingerprint> {
+    if let Ok(s) = obj.extract::<String>() {
+        resolve_tcp_fingerprint(&s)
+    } else if let Ok(p) = obj.extract::<PyTcpFingerprint>() {
+        Ok(p.inner)
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "tcp_fingerprint must be str (preset name or JA4T) or TcpFingerprint object",
+        ))
+    }
+}
+
+fn apply_retry_policy(
+    builder: lkrequest::session::SessionBuilder,
+    retry_obj: &Bound<'_, PyAny>,
+) -> PyResult<lkrequest::session::SessionBuilder> {
+    if let Ok(eb) = retry_obj.extract::<PyExponentialBackoff>() {
+        Ok(builder.retry_policy(eb.inner))
+    } else if let Ok(fi) = retry_obj.extract::<PyFixedInterval>() {
+        Ok(builder.retry_policy(fi.inner))
+    } else if retry_obj.is_callable() {
+        let callable = retry_obj.clone().unbind();
+        Ok(builder.retry_policy(PyCallableRetryPolicy::new(callable)))
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "retry must be ExponentialBackoff, FixedInterval, or a callable(attempt, error, status) -> float | None",
+        ))
+    }
+}
+
+fn apply_middlewares_to_session(
+    mut builder: lkrequest::session::SessionBuilder,
+    middlewares: &[PyMiddleware],
+) -> lkrequest::session::SessionBuilder {
+    for mw in middlewares {
+        builder = builder.middleware(PyMiddlewareWrapper::from_py(mw));
+    }
+    builder
+}
+
+fn resolve_dns_config(name: &str) -> PyResult<lkrequest::dns::DnsConfig> {
+    match name {
+        "system" => Ok(lkrequest::dns::DnsConfig::System),
+        "google" => Ok(lkrequest::dns::DnsConfig::Google),
+        "google_https" => Ok(lkrequest::dns::DnsConfig::GoogleHttps),
+        "cloudflare" => Ok(lkrequest::dns::DnsConfig::Cloudflare),
+        "cloudflare_https" => Ok(lkrequest::dns::DnsConfig::CloudflareHttps),
+        "quad9" => Ok(lkrequest::dns::DnsConfig::Quad9),
+        "quad9_https" => Ok(lkrequest::dns::DnsConfig::Quad9Https),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown DNS config: '{}'. Available: system, google, google_https, cloudflare, cloudflare_https, quad9, quad9_https",
+            name
+        ))),
+    }
+}
+
+/// All resolved options for constructing a [`lkrequest::Client`], grouped so
+/// the (long) set of settings is threaded by name rather than by ~30 positional
+/// arguments. Adding a new option is a single named field set at each call
+/// site, which the compiler checks for completeness — there is no risk of
+/// mis-aligning two same-typed positional arguments.
+#[derive(Default)]
+struct ClientConfig {
+    tls_profile: Option<lktls::profile::TlsProfile>,
+    h2_profile: Option<lkh2::profile::H2Profile>,
+    tcp_fingerprint: Option<lkrequest::TcpFingerprint>,
+    default_headers: Option<HashMap<String, String>>,
+    header_order: Option<Vec<String>>,
+    h3_header_order: Option<Vec<String>>,
+    cookie_order: Option<Vec<String>>,
+    dns_timeout: Option<f64>,
+    tcp_connect_timeout: Option<f64>,
+    tls_handshake_timeout: Option<f64>,
+    ttfb_timeout: Option<f64>,
+    total_timeout: Option<f64>,
+    max_response_body_size: Option<usize>,
+    max_connections_per_session: Option<usize>,
+    quic_connect_timeout: Option<f64>,
+    max_header_count: Option<usize>,
+    max_header_size: Option<usize>,
+    max_headers_total_size: Option<usize>,
+    min_transfer_rate: Option<usize>,
+    min_transfer_rate_window: Option<f64>,
+    h2_fallback_h1: Option<bool>,
+    proxy_fallback_direct: Option<bool>,
+    retry_on_connection_close: Option<bool>,
+    middleware: Option<Vec<PyMiddleware>>,
+    ca_cert: Option<String>,
+    ca_cert_pem: Option<Vec<u8>>,
+    ca_cert_der: Option<Vec<u8>>,
+    verify: Option<bool>,
+    use_native_certs: bool,
+    ech_config: Option<Vec<u8>>,
+    dns: Option<String>,
+    keylog: Option<String>,
+    protocol_policy: Option<lkrequest::ProtocolPolicy>,
+    session_resumption: Option<lktls::profile::types::SessionResumptionConfig>,
+    disable_http3: bool,
+    quic_fingerprint: Option<lktls::profile::TlsProfile>,
+    quic_profile: Option<lkrequest::QuicProfile>,
+    randomize: Option<lkrequest::Randomize>,
+}
+
+fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
+    let ClientConfig {
+        tls_profile,
+        h2_profile,
+        tcp_fingerprint,
+        default_headers,
+        header_order,
+        h3_header_order,
+        cookie_order,
+        dns_timeout,
+        tcp_connect_timeout,
+        tls_handshake_timeout,
+        ttfb_timeout,
+        total_timeout,
+        max_response_body_size,
+        max_connections_per_session,
+        quic_connect_timeout,
+        max_header_count,
+        max_header_size,
+        max_headers_total_size,
+        min_transfer_rate,
+        min_transfer_rate_window,
+        h2_fallback_h1,
+        proxy_fallback_direct,
+        retry_on_connection_close,
+        middleware,
+        ca_cert,
+        ca_cert_pem,
+        ca_cert_der,
+        verify,
+        use_native_certs,
+        ech_config,
+        dns,
+        keylog,
+        protocol_policy,
+        session_resumption,
+        disable_http3,
+        quic_fingerprint,
+        quic_profile,
+        randomize,
+    } = cfg;
+
+    let mut builder = lkrequest::Client::builder();
+
+    if let Some(p) = tls_profile {
+        builder = builder.fingerprint(p);
+    }
+    if let Some(p) = h2_profile {
+        builder = builder.h2_profile(p);
+    }
+    if let Some(fp) = tcp_fingerprint {
+        builder = builder.tcp_fingerprint(fp);
+    }
+    if let Some(headers) = default_headers {
+        for (k, v) in headers {
+            builder = builder.default_header(&k, &v);
+        }
+    }
+    if let Some(order) = header_order {
+        let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+        builder = builder.header_order(refs);
+    }
+    if let Some(order) = h3_header_order {
+        let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+        builder = builder.h3_header_order(refs);
+    }
+    if let Some(order) = cookie_order {
+        let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+        builder = builder.cookie_order(refs);
+    }
+    // Timeouts and resource limits are gathered into a single TimeoutConfig /
+    // ResourceLimits each (seeded from the defaults the builder would use) and
+    // applied via the whole-struct setters. This is how we reach fields with no
+    // dedicated ClientBuilder method — quic_connect_timeout, the header
+    // count/size caps, and min_transfer_rate — without clobbering the others.
+    if dns_timeout.is_some()
+        || tcp_connect_timeout.is_some()
+        || tls_handshake_timeout.is_some()
+        || ttfb_timeout.is_some()
+        || total_timeout.is_some()
+        || quic_connect_timeout.is_some()
+    {
+        let mut tc = lkrequest::TimeoutConfig::default();
+        if let Some(t) = dns_timeout {
+            tc.dns_timeout = Some(validated_duration(t)?);
+        }
+        if let Some(t) = tcp_connect_timeout {
+            tc.tcp_connect_timeout = Some(validated_duration(t)?);
+        }
+        if let Some(t) = tls_handshake_timeout {
+            tc.tls_handshake_timeout = Some(validated_duration(t)?);
+        }
+        if let Some(t) = ttfb_timeout {
+            tc.ttfb_timeout = Some(validated_duration(t)?);
+        }
+        if let Some(t) = total_timeout {
+            tc.total_timeout = Some(validated_duration(t)?);
+        }
+        if let Some(t) = quic_connect_timeout {
+            tc.quic_connect_timeout = Some(validated_duration(t)?);
+        }
+        builder = builder.timeout_config(tc);
+    }
+    if max_response_body_size.is_some()
+        || max_connections_per_session.is_some()
+        || max_header_count.is_some()
+        || max_header_size.is_some()
+        || max_headers_total_size.is_some()
+        || min_transfer_rate.is_some()
+    {
+        let mut rl = lkrequest::ResourceLimits::default();
+        if let Some(s) = max_response_body_size {
+            rl.max_response_body_size = s;
+        }
+        if let Some(n) = max_connections_per_session {
+            rl.max_connections_per_session = n;
+        }
+        if let Some(n) = max_header_count {
+            rl.max_header_count = n;
+        }
+        if let Some(n) = max_header_size {
+            rl.max_header_size = n;
+        }
+        if let Some(n) = max_headers_total_size {
+            rl.max_headers_total_size = n;
+        }
+        if let Some(rate) = min_transfer_rate {
+            rl.min_transfer_rate = Some(rate);
+            if let Some(w) = min_transfer_rate_window {
+                rl.transfer_rate_window = validated_duration(w)?;
+            }
+        }
+        builder = builder.resource_limits(rl);
+    }
+    if let Some(v) = h2_fallback_h1 {
+        builder = builder.h2_fallback_h1(v);
+    }
+    if let Some(v) = proxy_fallback_direct {
+        builder = builder.proxy_fallback_direct(v);
+    }
+    if let Some(v) = retry_on_connection_close {
+        builder = builder.retry_on_connection_close(v);
+    }
+    if let Some(mws) = middleware {
+        for mw in mws {
+            builder = builder.middleware(PyMiddlewareWrapper::from_py(&mw));
+        }
+    }
+    if let Some(path) = ca_cert {
+        let pem_data = std::fs::read(&path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "Failed to read CA cert '{}': {}",
+                path, e
+            ))
+        })?;
+        builder = builder.add_ca_certs_pem(&pem_data);
+    }
+    if let Some(pem) = ca_cert_pem {
+        builder = builder.add_ca_certs_pem(&pem);
+    }
+    if let Some(der) = ca_cert_der {
+        builder = builder.add_ca_cert_der(&der);
+    }
+    if let Some(v) = verify {
+        builder = builder.verify(v);
+    }
+    if use_native_certs {
+        builder = builder.use_native_certs();
+    }
+    if let Some(ech) = ech_config {
+        builder = builder.ech_config(ech);
+    }
+    if let Some(ref dns_name) = dns {
+        let config = resolve_dns_config(dns_name)?;
+        builder = builder.dns(config);
+    }
+    if let Some(ref path) = keylog {
+        let callback = lkrequest::keylog_to_file(path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "Failed to open keylog file '{}': {}",
+                path, e
+            ))
+        })?;
+        builder = builder.keylog(callback);
+    }
+    if let Some(policy) = protocol_policy {
+        builder = builder.protocol_policy(policy);
+    }
+    if let Some(cfg) = session_resumption {
+        builder = builder.session_resumption(cfg);
+    }
+    if let Some(p) = quic_fingerprint {
+        builder = builder.quic_fingerprint(p);
+    }
+    if let Some(p) = quic_profile {
+        builder = builder.quic_profile(p);
+    }
+    if disable_http3 {
+        builder = builder.disable_http3();
+    }
+    if let Some(policy) = randomize {
+        builder = builder.randomize(policy);
+    }
+
+    Ok(builder.build())
+}
+
+/// Build a `Client` from a high-level upstream preset bundle plus a TCP
+/// fingerprint.
+///
+/// Delegating to `lkrequest::preset::*` keeps the Python presets in lock-step
+/// with the Rust core: TLS/H2 profiles, header order, protocol policy, and
+/// (where modelled) the QUIC/H3 profile all come from a single source of
+/// truth, so new upstream browser builds flow through automatically. The TCP
+/// fingerprint is layered on top because `ClientPreset` does not cover it.
+fn build_preset_client(
+    preset: lkrequest::preset::ClientPreset,
+    tcp: lkrequest::TcpFingerprint,
+) -> lkrequest::Client {
+    lkrequest::Client::builder()
+        .preset(preset)
+        .tcp_fingerprint(tcp)
+        .build()
+}
+
+// ---------------------------------------------------------------------------
+// Async Client
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "Client")]
+#[derive(Clone)]
+pub struct PyClient {
+    pub(crate) inner: lkrequest::Client,
+}
+
+#[pymethods]
+impl PyClient {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        tls_profile=None,
+        h2_profile=None,
+        tcp_fingerprint=None,
+        default_headers=None,
+        header_order=None,
+        h3_header_order=None,
+        cookie_order=None,
+        dns_timeout=None,
+        tcp_connect_timeout=None,
+        tls_handshake_timeout=None,
+        ttfb_timeout=None,
+        total_timeout=None,
+        max_response_body_size=None,
+        max_connections_per_session=None,
+        quic_connect_timeout=None,
+        max_header_count=None,
+        max_header_size=None,
+        max_headers_total_size=None,
+        min_transfer_rate=None,
+        min_transfer_rate_window=None,
+        h2_fallback_h1=None,
+        proxy_fallback_direct=None,
+        retry_on_connection_close=None,
+        middleware=None,
+        ca_cert=None,
+        ca_cert_pem=None,
+        ca_cert_der=None,
+        verify=None,
+        use_native_certs=false,
+        ech_config=None,
+        dns=None,
+        keylog=None,
+        protocol_policy=None,
+        session_resumption=None,
+        disable_http3=false,
+        quic_fingerprint=None,
+        quic_profile=None,
+        randomize=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new<'py>(
+        tls_profile: Option<Bound<'py, PyAny>>,
+        h2_profile: Option<Bound<'py, PyAny>>,
+        tcp_fingerprint: Option<Bound<'py, PyAny>>,
+        default_headers: Option<HashMap<String, String>>,
+        header_order: Option<Vec<String>>,
+        h3_header_order: Option<Vec<String>>,
+        cookie_order: Option<Vec<String>>,
+        dns_timeout: Option<f64>,
+        tcp_connect_timeout: Option<f64>,
+        tls_handshake_timeout: Option<f64>,
+        ttfb_timeout: Option<f64>,
+        total_timeout: Option<f64>,
+        max_response_body_size: Option<usize>,
+        max_connections_per_session: Option<usize>,
+        quic_connect_timeout: Option<f64>,
+        max_header_count: Option<usize>,
+        max_header_size: Option<usize>,
+        max_headers_total_size: Option<usize>,
+        min_transfer_rate: Option<usize>,
+        min_transfer_rate_window: Option<f64>,
+        h2_fallback_h1: Option<bool>,
+        proxy_fallback_direct: Option<bool>,
+        retry_on_connection_close: Option<bool>,
+        middleware: Option<Vec<PyMiddleware>>,
+        ca_cert: Option<String>,
+        ca_cert_pem: Option<Vec<u8>>,
+        ca_cert_der: Option<Vec<u8>>,
+        verify: Option<bool>,
+        use_native_certs: bool,
+        ech_config: Option<Vec<u8>>,
+        dns: Option<String>,
+        keylog: Option<String>,
+        protocol_policy: Option<PyProtocolPolicy>,
+        session_resumption: Option<PySessionResumptionConfig>,
+        disable_http3: bool,
+        quic_fingerprint: Option<Bound<'py, PyAny>>,
+        quic_profile: Option<Bound<'py, PyAny>>,
+        randomize: Option<PyRandomize>,
+    ) -> PyResult<Self> {
+        let tls = tls_profile.as_ref().map(resolve_tls_from_any).transpose()?;
+        let h2 = h2_profile.as_ref().map(resolve_h2_from_any).transpose()?;
+        let tcp = tcp_fingerprint
+            .as_ref()
+            .map(resolve_tcp_from_any)
+            .transpose()?;
+        let quic_fp = quic_fingerprint
+            .as_ref()
+            .map(resolve_tls_from_any)
+            .transpose()?;
+        let quic = quic_profile
+            .as_ref()
+            .map(resolve_quic_from_any)
+            .transpose()?;
+        let client = build_client(ClientConfig {
+            tls_profile: tls,
+            h2_profile: h2,
+            tcp_fingerprint: tcp,
+            default_headers,
+            header_order,
+            h3_header_order,
+            cookie_order,
+            dns_timeout,
+            tcp_connect_timeout,
+            tls_handshake_timeout,
+            ttfb_timeout,
+            total_timeout,
+            max_response_body_size,
+            max_connections_per_session,
+            quic_connect_timeout,
+            max_header_count,
+            max_header_size,
+            max_headers_total_size,
+            min_transfer_rate,
+            min_transfer_rate_window,
+            h2_fallback_h1,
+            proxy_fallback_direct,
+            retry_on_connection_close,
+            middleware,
+            ca_cert,
+            ca_cert_pem,
+            ca_cert_der,
+            verify,
+            use_native_certs,
+            ech_config,
+            dns,
+            keylog,
+            protocol_policy: protocol_policy.map(|p| p.inner),
+            session_resumption: session_resumption.map(|c| c.inner),
+            disable_http3,
+            quic_fingerprint: quic_fp,
+            quic_profile: quic,
+            randomize: randomize.map(|r| r.inner),
+        })?;
+        tracing::info!(tls = %client.tls_profile().name, "Client created");
+        Ok(PyClient { inner: client })
+    }
+
+    #[staticmethod]
+    fn chrome_131() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_131(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_144() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_144(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_145() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_145(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_146() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_146(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_147() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_147(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_148() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_148(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_149() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_149(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_150() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_150(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn firefox_133() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::firefox_133(),
+                lkrequest::TcpFingerprint::firefox(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn firefox_147() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::firefox_147(),
+                lkrequest::TcpFingerprint::firefox(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn safari_18() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::safari_18(),
+                lkrequest::TcpFingerprint::safari(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn safari_26() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::safari_26(),
+                lkrequest::TcpFingerprint::safari(),
+            ),
+        }
+    }
+
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None))]
+    fn session<'py>(
+        &self,
+        _py: Python<'py>,
+        proxy: Option<Bound<'py, PyAny>>,
+        max_redirects: Option<u32>,
+        allow_redirects: bool,
+        http1_only: bool,
+        http2_only: bool,
+        http3_only: bool,
+        http3_with_fallback: bool,
+        retry: Option<Bound<'py, PyAny>>,
+        middleware: Option<Vec<PyMiddleware>>,
+        accept_encoding: Option<PyAcceptEncoding>,
+        ech_config: Option<Vec<u8>>,
+        max_connections: Option<usize>,
+        idle_timeout: Option<f64>,
+        on_request: Option<Py<PyAny>>,
+        on_response: Option<Py<PyAny>>,
+        protocol_policy: Option<PyProtocolPolicy>,
+        http_intent: Option<PyHttpIntent>,
+        broken_quic_policy: Option<PyBrokenQuicPolicy>,
+        header_order: Option<Vec<String>>,
+        h3_header_order: Option<Vec<String>>,
+        cookie_order: Option<Vec<String>>,
+        https_only: bool,
+        hsts: Option<PyHsts>,
+        base_url: Option<String>,
+    ) -> PyResult<PySession> {
+        let mut builder = self.inner.session();
+        if let Some(p) = proxy {
+            builder = apply_session_proxy(builder, &p)?;
+        }
+        if !allow_redirects {
+            // allow_redirects=False maps to RedirectPolicy::None — return the
+            // 3xx response as-is. This takes precedence over max_redirects;
+            // note that max_redirects=0 would instead raise TooManyRedirects.
+            builder = builder.redirect_policy(lkrequest::RedirectPolicy::None);
+        } else if let Some(n) = max_redirects {
+            builder = builder.max_redirects(n);
+        }
+        if http1_only {
+            builder = builder.http1_only();
+        }
+        if http2_only {
+            builder = builder.http2_only();
+        }
+        if http3_only {
+            builder = builder.http3_only();
+        }
+        if http3_with_fallback {
+            builder = builder.http3_with_fallback();
+        }
+        if let Some(ref retry_obj) = retry {
+            builder = apply_retry_policy(builder, retry_obj)?;
+        }
+        if let Some(ref mws) = middleware {
+            builder = apply_middlewares_to_session(builder, mws);
+        }
+        if let Some(ae) = accept_encoding {
+            builder = builder.default_accept_encoding(ae.inner);
+        }
+        if let Some(ech) = ech_config {
+            builder = builder.ech_config(ech);
+        }
+        if let Some(n) = max_connections {
+            builder = builder.max_connections(n);
+        }
+        if let Some(t) = idle_timeout {
+            builder = builder.idle_timeout(validated_duration(t)?);
+        }
+        if let Some(policy) = protocol_policy {
+            builder = builder.protocol_policy(policy.inner);
+        }
+        if let Some(intent) = http_intent {
+            builder = builder.http_intent(intent.into());
+        }
+        if let Some(policy) = broken_quic_policy {
+            builder = builder.broken_quic_policy(policy.into());
+        }
+        if let Some(order) = header_order {
+            let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+            builder = builder.header_order(refs);
+        }
+        if let Some(order) = cookie_order {
+            let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+            builder = builder.cookie_order(refs);
+        }
+        if let Some(order) = h3_header_order {
+            let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+            builder = builder.h3_header_order(refs);
+        }
+        if https_only {
+            builder = builder.https_only(true);
+        }
+        if let Some(policy) = hsts {
+            builder = policy.apply(builder);
+        }
+        let hooks = EventHooks::default();
+        if let Some(cb) = on_request {
+            hooks
+                .request_hooks
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
+                .push(cb);
+        }
+        if let Some(cb) = on_response {
+            hooks
+                .response_hooks
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
+                .push(cb);
+        }
+        Ok(PySession {
+            inner: builder.build(),
+            hooks,
+            base_url,
+        })
+    }
+
+    fn fingerprint_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("tls_profile", self.inner.tls_profile().name.as_str())?;
+        dict.set_item("h2_settings_count", self.inner.h2_profile().settings.len())?;
+        dict.set_item("h2_window_update", self.inner.h2_profile().window_update)?;
+        let tcp_ja4t = self.inner.tcp_fingerprint().and_then(|f| f.to_ja4t());
+        dict.set_item("tcp_ja4t", tcp_ja4t)?;
+        Ok(dict)
+    }
+
+    /// Return a copy of this client with TLS-extension randomization enabled.
+    ///
+    /// Only the fingerprint layers are carried over (TLS profile + its QUIC
+    /// fingerprint, H2 profile, TCP fingerprint). Other client-level
+    /// configuration — timeouts, default headers, header/cookie order,
+    /// certificate/`verify` settings, protocol policy, DNS, proxy and resource
+    /// limits — is NOT preserved and reverts to builder defaults. To keep that
+    /// config, pass a randomized `TlsProfile` (with its `randomization` set)
+    /// to the `Client(...)` constructor instead of calling this afterwards.
+    #[pyo3(signature = (*, shuffle_extensions=true))]
+    fn randomize_fingerprint(&self, shuffle_extensions: bool) -> Self {
+        let mut profile = self.inner.tls_profile().clone();
+        profile.randomization =
+            Some(lktls::profile::types::RandomizationConfig { shuffle_extensions });
+        let mut builder = lkrequest::Client::builder()
+            .fingerprint(profile)
+            .h2_profile(self.inner.h2_profile().clone());
+        if let Some(tcp) = self.inner.tcp_fingerprint() {
+            builder = builder.tcp_fingerprint(tcp.clone());
+        }
+        if let Some(quic_tls) = self.inner.quic_tls_profile() {
+            builder = builder.quic_fingerprint(quic_tls.clone());
+        }
+        PyClient {
+            inner: builder.build(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<Client tls='{}'>", self.inner.tls_profile().name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocking Client
+// ---------------------------------------------------------------------------
+
+// expect: a failed runtime build at process init is unrecoverable, and a
+// LazyLock initializer cannot return a Result to propagate the error.
+#[allow(clippy::expect_used)]
+static BLOCKING_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
+    std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime for blocking API")
+    });
+
+pub(crate) fn blocking_runtime() -> &'static tokio::runtime::Runtime {
+    &BLOCKING_RUNTIME
+}
+
+#[pyclass(name = "BlockingClient")]
+#[derive(Clone)]
+pub struct PyBlockingClient {
+    pub(crate) inner: lkrequest::Client,
+}
+
+#[pymethods]
+impl PyBlockingClient {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        tls_profile=None,
+        h2_profile=None,
+        tcp_fingerprint=None,
+        default_headers=None,
+        header_order=None,
+        h3_header_order=None,
+        cookie_order=None,
+        dns_timeout=None,
+        tcp_connect_timeout=None,
+        tls_handshake_timeout=None,
+        ttfb_timeout=None,
+        total_timeout=None,
+        max_response_body_size=None,
+        max_connections_per_session=None,
+        quic_connect_timeout=None,
+        max_header_count=None,
+        max_header_size=None,
+        max_headers_total_size=None,
+        min_transfer_rate=None,
+        min_transfer_rate_window=None,
+        h2_fallback_h1=None,
+        proxy_fallback_direct=None,
+        retry_on_connection_close=None,
+        middleware=None,
+        ca_cert=None,
+        ca_cert_pem=None,
+        ca_cert_der=None,
+        verify=None,
+        use_native_certs=false,
+        ech_config=None,
+        dns=None,
+        keylog=None,
+        protocol_policy=None,
+        session_resumption=None,
+        disable_http3=false,
+        quic_fingerprint=None,
+        quic_profile=None,
+        randomize=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new<'py>(
+        tls_profile: Option<Bound<'py, PyAny>>,
+        h2_profile: Option<Bound<'py, PyAny>>,
+        tcp_fingerprint: Option<Bound<'py, PyAny>>,
+        default_headers: Option<HashMap<String, String>>,
+        header_order: Option<Vec<String>>,
+        h3_header_order: Option<Vec<String>>,
+        cookie_order: Option<Vec<String>>,
+        dns_timeout: Option<f64>,
+        tcp_connect_timeout: Option<f64>,
+        tls_handshake_timeout: Option<f64>,
+        ttfb_timeout: Option<f64>,
+        total_timeout: Option<f64>,
+        max_response_body_size: Option<usize>,
+        max_connections_per_session: Option<usize>,
+        quic_connect_timeout: Option<f64>,
+        max_header_count: Option<usize>,
+        max_header_size: Option<usize>,
+        max_headers_total_size: Option<usize>,
+        min_transfer_rate: Option<usize>,
+        min_transfer_rate_window: Option<f64>,
+        h2_fallback_h1: Option<bool>,
+        proxy_fallback_direct: Option<bool>,
+        retry_on_connection_close: Option<bool>,
+        middleware: Option<Vec<PyMiddleware>>,
+        ca_cert: Option<String>,
+        ca_cert_pem: Option<Vec<u8>>,
+        ca_cert_der: Option<Vec<u8>>,
+        verify: Option<bool>,
+        use_native_certs: bool,
+        ech_config: Option<Vec<u8>>,
+        dns: Option<String>,
+        keylog: Option<String>,
+        protocol_policy: Option<PyProtocolPolicy>,
+        session_resumption: Option<PySessionResumptionConfig>,
+        disable_http3: bool,
+        quic_fingerprint: Option<Bound<'py, PyAny>>,
+        quic_profile: Option<Bound<'py, PyAny>>,
+        randomize: Option<PyRandomize>,
+    ) -> PyResult<Self> {
+        let tls = tls_profile.as_ref().map(resolve_tls_from_any).transpose()?;
+        let h2 = h2_profile.as_ref().map(resolve_h2_from_any).transpose()?;
+        let tcp = tcp_fingerprint
+            .as_ref()
+            .map(resolve_tcp_from_any)
+            .transpose()?;
+        let quic_fp = quic_fingerprint
+            .as_ref()
+            .map(resolve_tls_from_any)
+            .transpose()?;
+        let quic = quic_profile
+            .as_ref()
+            .map(resolve_quic_from_any)
+            .transpose()?;
+        let client = build_client(ClientConfig {
+            tls_profile: tls,
+            h2_profile: h2,
+            tcp_fingerprint: tcp,
+            default_headers,
+            header_order,
+            h3_header_order,
+            cookie_order,
+            dns_timeout,
+            tcp_connect_timeout,
+            tls_handshake_timeout,
+            ttfb_timeout,
+            total_timeout,
+            max_response_body_size,
+            max_connections_per_session,
+            quic_connect_timeout,
+            max_header_count,
+            max_header_size,
+            max_headers_total_size,
+            min_transfer_rate,
+            min_transfer_rate_window,
+            h2_fallback_h1,
+            proxy_fallback_direct,
+            retry_on_connection_close,
+            middleware,
+            ca_cert,
+            ca_cert_pem,
+            ca_cert_der,
+            verify,
+            use_native_certs,
+            ech_config,
+            dns,
+            keylog,
+            protocol_policy: protocol_policy.map(|p| p.inner),
+            session_resumption: session_resumption.map(|c| c.inner),
+            disable_http3,
+            quic_fingerprint: quic_fp,
+            quic_profile: quic,
+            randomize: randomize.map(|r| r.inner),
+        })?;
+        Ok(PyBlockingClient { inner: client })
+    }
+
+    #[staticmethod]
+    fn chrome_131() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_131(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_144() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_144(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_145() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_145(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_146() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_146(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_147() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_147(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_148() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_148(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_149() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_149(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_150() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_150(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn firefox_133() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::firefox_133(),
+                lkrequest::TcpFingerprint::firefox(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn firefox_147() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::firefox_147(),
+                lkrequest::TcpFingerprint::firefox(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn safari_18() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::safari_18(),
+                lkrequest::TcpFingerprint::safari(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn safari_26() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::safari_26(),
+                lkrequest::TcpFingerprint::safari(),
+            ),
+        }
+    }
+
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None))]
+    fn session<'py>(
+        &self,
+        _py: Python<'py>,
+        proxy: Option<Bound<'py, PyAny>>,
+        max_redirects: Option<u32>,
+        allow_redirects: bool,
+        http1_only: bool,
+        http2_only: bool,
+        http3_only: bool,
+        http3_with_fallback: bool,
+        retry: Option<Bound<'py, PyAny>>,
+        middleware: Option<Vec<PyMiddleware>>,
+        accept_encoding: Option<PyAcceptEncoding>,
+        ech_config: Option<Vec<u8>>,
+        max_connections: Option<usize>,
+        idle_timeout: Option<f64>,
+        on_request: Option<Py<PyAny>>,
+        on_response: Option<Py<PyAny>>,
+        protocol_policy: Option<PyProtocolPolicy>,
+        http_intent: Option<PyHttpIntent>,
+        broken_quic_policy: Option<PyBrokenQuicPolicy>,
+        header_order: Option<Vec<String>>,
+        h3_header_order: Option<Vec<String>>,
+        cookie_order: Option<Vec<String>>,
+        https_only: bool,
+        hsts: Option<PyHsts>,
+        base_url: Option<String>,
+    ) -> PyResult<PyBlockingSession> {
+        let mut builder = self.inner.session();
+        if let Some(p) = proxy {
+            builder = apply_session_proxy(builder, &p)?;
+        }
+        if !allow_redirects {
+            // allow_redirects=False maps to RedirectPolicy::None — return the
+            // 3xx response as-is. This takes precedence over max_redirects;
+            // note that max_redirects=0 would instead raise TooManyRedirects.
+            builder = builder.redirect_policy(lkrequest::RedirectPolicy::None);
+        } else if let Some(n) = max_redirects {
+            builder = builder.max_redirects(n);
+        }
+        if http1_only {
+            builder = builder.http1_only();
+        }
+        if http2_only {
+            builder = builder.http2_only();
+        }
+        if http3_only {
+            builder = builder.http3_only();
+        }
+        if http3_with_fallback {
+            builder = builder.http3_with_fallback();
+        }
+        if let Some(ref retry_obj) = retry {
+            builder = apply_retry_policy(builder, retry_obj)?;
+        }
+        if let Some(ref mws) = middleware {
+            builder = apply_middlewares_to_session(builder, mws);
+        }
+        if let Some(ae) = accept_encoding {
+            builder = builder.default_accept_encoding(ae.inner);
+        }
+        if let Some(ech) = ech_config {
+            builder = builder.ech_config(ech);
+        }
+        if let Some(n) = max_connections {
+            builder = builder.max_connections(n);
+        }
+        if let Some(t) = idle_timeout {
+            builder = builder.idle_timeout(validated_duration(t)?);
+        }
+        if let Some(policy) = protocol_policy {
+            builder = builder.protocol_policy(policy.inner);
+        }
+        if let Some(intent) = http_intent {
+            builder = builder.http_intent(intent.into());
+        }
+        if let Some(policy) = broken_quic_policy {
+            builder = builder.broken_quic_policy(policy.into());
+        }
+        if let Some(order) = header_order {
+            let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+            builder = builder.header_order(refs);
+        }
+        if let Some(order) = cookie_order {
+            let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+            builder = builder.cookie_order(refs);
+        }
+        if let Some(order) = h3_header_order {
+            let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
+            builder = builder.h3_header_order(refs);
+        }
+        if https_only {
+            builder = builder.https_only(true);
+        }
+        if let Some(policy) = hsts {
+            builder = policy.apply(builder);
+        }
+        let hooks = EventHooks::default();
+        if let Some(cb) = on_request {
+            hooks
+                .request_hooks
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
+                .push(cb);
+        }
+        if let Some(cb) = on_response {
+            hooks
+                .response_hooks
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
+                .push(cb);
+        }
+        Ok(PyBlockingSession {
+            inner: builder.build(),
+            hooks,
+            base_url,
+        })
+    }
+
+    fn fingerprint_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("tls_profile", self.inner.tls_profile().name.as_str())?;
+        dict.set_item("h2_settings_count", self.inner.h2_profile().settings.len())?;
+        dict.set_item("h2_window_update", self.inner.h2_profile().window_update)?;
+        let tcp_ja4t = self.inner.tcp_fingerprint().and_then(|f| f.to_ja4t());
+        dict.set_item("tcp_ja4t", tcp_ja4t)?;
+        Ok(dict)
+    }
+
+    /// Return a copy of this client with TLS-extension randomization enabled.
+    ///
+    /// Only the fingerprint layers are carried over (TLS profile + its QUIC
+    /// fingerprint, H2 profile, TCP fingerprint). Other client-level
+    /// configuration — timeouts, default headers, header/cookie order,
+    /// certificate/`verify` settings, protocol policy, DNS, proxy and resource
+    /// limits — is NOT preserved and reverts to builder defaults. To keep that
+    /// config, pass a randomized `TlsProfile` (with its `randomization` set)
+    /// to the `Client(...)` constructor instead of calling this afterwards.
+    #[pyo3(signature = (*, shuffle_extensions=true))]
+    fn randomize_fingerprint(&self, shuffle_extensions: bool) -> Self {
+        let mut profile = self.inner.tls_profile().clone();
+        profile.randomization =
+            Some(lktls::profile::types::RandomizationConfig { shuffle_extensions });
+        let mut builder = lkrequest::Client::builder()
+            .fingerprint(profile)
+            .h2_profile(self.inner.h2_profile().clone());
+        if let Some(tcp) = self.inner.tcp_fingerprint() {
+            builder = builder.tcp_fingerprint(tcp.clone());
+        }
+        if let Some(quic_tls) = self.inner.quic_tls_profile() {
+            builder = builder.quic_fingerprint(quic_tls.clone());
+        }
+        PyBlockingClient {
+            inner: builder.build(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<BlockingClient tls='{}'>", self.inner.tls_profile().name)
+    }
+}

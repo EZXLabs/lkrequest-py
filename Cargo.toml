@@ -1,0 +1,63 @@
+[package]
+name = "lkrequest-py"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "_lkrequest"
+crate-type = ["cdylib"]
+
+# Re-export pyo3's compile-time cfg flags (Py_LIMITED_API, Py_3_x) into this
+# crate so we can `#[cfg(not(Py_LIMITED_API))]` gate code that uses raw-FFI
+# bits the stable ABI does not expose (e.g. the buffer protocol on PyResponse).
+[build-dependencies]
+pyo3-build-config = "0.23"
+
+# lkrequest core crates come from the git repo so this package is
+# self-contained (installable via `pip install git+...` / sdist). Pinned to a
+# specific commit so a tagged release produces a reproducible build — bump
+# `rev` (and Cargo.lock) explicitly when picking up new upstream changes.
+# For local development, `.cargo/config.toml` [patch] redirects these to the
+# sibling `../lkrequest` checkout (that file is git-ignored, so it never ships).
+[dependencies]
+lkrequest = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
+lktls = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
+lkh2 = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
+lkprofile = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
+serde = "1"
+# abi3-py39: build a single stable-ABI wheel that works for Python 3.9+, so the
+# release matrix collapses from (OS × python-version) to just OS. The minimum
+# 3.9 matches `requires-python` in pyproject.toml.
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39", "multiple-pymethods"] }
+pyo3-async-runtimes = { version = "0.23", features = ["attributes", "tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+http = "1"
+hyper = "1"
+hyper-util = "0.1"
+bytes = "1"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+
+[features]
+default = []
+# Opt-in QUIC / HTTP/3 support. Forwards to lkrequest's `quic-h3` feature, which
+# pulls in lkquic + lkh3 + lktls-quic + quinn (heavier build, needs submodules).
+# Build with: maturin develop --features quic-h3
+quic-h3 = ["lkrequest/quic-h3"]
+# Opt-in transport telemetry: enables wire-byte / connection / request counters
+# behind `metrics_snapshot()`. Off by default so the default build carries zero
+# per-I/O instrumentation; the function still exists and reports zeros.
+telemetry = ["lkrequest/telemetry"]
+# Opt-in synthetic (Tier 3a/3b) fingerprint randomization: enables
+# Randomize.recombine()/full() and the Layers mask, which synthesize
+# fingerprints that match no real browser. Off by default so it cannot be
+# enabled by accident against allowlist targets (where it fails instantly).
+# Build with: maturin develop --features synthetic-fp
+synthetic-fp = ["lkrequest/synthetic-fp"]
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
