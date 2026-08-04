@@ -2,7 +2,7 @@
 
 Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性能实现。
 
-[English](README.md) | [简体中文](README-zh.md)
+[English](https://github.com/EZ-XLabs/lkrequest-py/blob/main/README.md) | [简体中文](https://github.com/EZ-XLabs/lkrequest-py/blob/main/README-zh.md)
 
 ## 特性
 
@@ -54,7 +54,7 @@ uv add lkrequest
 使用 venv 和 pip：
 
 ```bash
-git clone https://github.com/ez-opensource/lkrequest-py
+git clone https://github.com/EZ-XLabs/lkrequest-py
 cd lkrequest-py
 python3 -m venv .venv                 # Linux/macOS
 # py -m venv .venv                    # Windows
@@ -68,7 +68,7 @@ python -m pip install -e ".[test,lint]"
 使用 uv（自动创建和管理 `.venv`）：
 
 ```bash
-git clone https://github.com/ez-opensource/lkrequest-py
+git clone https://github.com/EZ-XLabs/lkrequest-py
 cd lkrequest-py
 uv sync --extra test --extra lint
 ```

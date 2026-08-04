@@ -2,7 +2,7 @@
 
 A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for high performance.
 
-[English](README.md) | [简体中文](README-zh.md)
+[English](https://github.com/EZ-XLabs/lkrequest-py/blob/main/README.md) | [简体中文](https://github.com/EZ-XLabs/lkrequest-py/blob/main/README-zh.md)
 
 ## Features
 
@@ -54,7 +54,7 @@ uv add lkrequest
 Using venv and pip:
 
 ```bash
-git clone https://github.com/ez-opensource/lkrequest-py
+git clone https://github.com/EZ-XLabs/lkrequest-py
 cd lkrequest-py
 python3 -m venv .venv                 # Linux/macOS
 # py -m venv .venv                    # Windows
@@ -68,7 +68,7 @@ python -m pip install -e ".[test,lint]"
 Using uv (creates and manages `.venv` automatically):
 
 ```bash
-git clone https://github.com/ez-opensource/lkrequest-py
+git clone https://github.com/EZ-XLabs/lkrequest-py
 cd lkrequest-py
 uv sync --extra test --extra lint
 ```

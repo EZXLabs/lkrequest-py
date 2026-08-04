@@ -18,6 +18,15 @@ All important changes to this project will be documented in this file.
 - **ECH + PSK + HRR Binders** — `pre_shared_key` remains exclusively in `ClientHelloInner`; CH1 and CH2 binders now use the correct truncated Inner transcripts, including `message_hash(ClientHelloInner1) + HRR` for CH2.
 - **QUIC/H3 HRR State Transitions** — QUIC revokes 0-RTT stream and packet state after HRR and maps local TLS alerts to QUIC `CRYPTO_ERROR` codes.
 
+## lkrequest-py 0.1.1
+
+### 🐞 Fixes
+- **Project URLs** — `Homepage`, `Repository`, and `Issues` in the package metadata pointed at a repository path that does not exist, so every link on the PyPI project page returned 404. They now point at `github.com/EZ-XLabs/lkrequest-py`.
+- **README Links on PyPI** — the language switcher at the top of both READMEs used relative paths (`README.md` / `README-zh.md`), which PyPI cannot resolve when it renders the long description. Both now use absolute URLs, so switching between English and 简体中文 works from the project page.
+
+### 📝 Documentation
+- **Development Setup** — the setup section now walks through the full local workflow on Linux/macOS and Windows: creating and activating a virtualenv, installing maturin, `pip install -e ".[test,lint]"`, and running the suite via `just test`. An equivalent `uv sync --extra test --extra lint` path is documented alongside it.
+
 ## lkrequest-py 0.1.0
 
 ### 🚀 Features

@@ -159,37 +159,25 @@ jobs:
             dist/*.tar.gz
           fail_on_unmatched_files: true
 
-  check-pypi-token:
-    name: Check PyPI token
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    outputs:
-      configured: ${{ steps.check.outputs.configured }}
-    steps:
-      - id: check
-        env:
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          if [ -n "$PYPI_API_TOKEN" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "PYPI_API_TOKEN is set; publish-pypi will run."
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::PYPI_API_TOKEN is not set; skipping publish-pypi (GitHub Release assets are unaffected)."
-          fi
-
   publish-pypi:
     name: Publish to PyPI
-    if: startsWith(github.ref, 'refs/tags/v') && needs.check-pypi-token.outputs.configured == 'true'
-    needs: [test-wheel, build-sdist, check-pypi-token]
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test-wheel, build-sdist]
     runs-on: ubuntu-latest
+    environment:
+      name: lkrequest-py
+      url: https://pypi.org/project/lkrequest/
+    permissions:
+      id-token: write
     steps:
+      # Only the release artifacts — anything else added to this workflow later
+      # would otherwise land in dist/ and be rejected as an invalid package.
       - uses: actions/download-artifact@v4
         with:
+          pattern: "{wheel-*,sdist}"
           path: dist
           merge-multiple: true
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          password: ${{ secrets.PYPI_API_TOKEN }}
