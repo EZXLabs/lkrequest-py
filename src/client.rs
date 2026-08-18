@@ -44,7 +44,7 @@ fn resolve_h2_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkh2::profile::H2Prof
 }
 
 /// Resolve a QUIC profile from a preset name (`"chrome"` / `"chrome_146"` /
-/// `"chrome_150"`) or a `QuicProfile` object. Requires the `quic-h3` feature;
+/// `"chrome_150"` / `"chrome_151"`) or a `QuicProfile` object. Requires the `quic-h3` feature;
 /// without it any value is rejected with a clear error.
 #[cfg(feature = "quic-h3")]
 fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProfile> {
@@ -53,8 +53,9 @@ fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProf
             "chrome" => Ok(lkrequest::lkh3::chrome_quic()),
             "chrome_146" => Ok(lkrequest::lkh3::chrome_146_quic()),
             "chrome_150" => Ok(lkrequest::lkh3::chrome_150_quic()),
+            "chrome_151" => Ok(lkrequest::lkh3::chrome_151_quic()),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150",
+                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151",
                 s
             ))),
         }
@@ -151,6 +152,7 @@ struct ClientConfig {
     total_timeout: Option<f64>,
     max_response_body_size: Option<usize>,
     max_connections_per_session: Option<usize>,
+    max_pending_h2_requests: Option<usize>,
     quic_connect_timeout: Option<f64>,
     max_header_count: Option<usize>,
     max_header_size: Option<usize>,
@@ -168,6 +170,8 @@ struct ClientConfig {
     use_native_certs: bool,
     ech_config: Option<Vec<u8>>,
     dns: Option<String>,
+    system_dns_cache_ttl: Option<f64>,
+    system_dns_cache_max_entries: Option<usize>,
     keylog: Option<String>,
     protocol_policy: Option<lkrequest::ProtocolPolicy>,
     session_resumption: Option<lktls::profile::types::SessionResumptionConfig>,
@@ -193,6 +197,7 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         total_timeout,
         max_response_body_size,
         max_connections_per_session,
+        max_pending_h2_requests,
         quic_connect_timeout,
         max_header_count,
         max_header_size,
@@ -210,6 +215,8 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         use_native_certs,
         ech_config,
         dns,
+        system_dns_cache_ttl,
+        system_dns_cache_max_entries,
         keylog,
         protocol_policy,
         session_resumption,
@@ -311,6 +318,16 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         }
         builder = builder.resource_limits(rl);
     }
+    // Upstream asserts this is non-zero, which would surface as a panic rather
+    // than a Python exception. Leaving it unset keeps the default (unbounded).
+    if let Some(n) = max_pending_h2_requests {
+        if n == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_pending_h2_requests must be greater than 0 (omit it for unbounded)",
+            ));
+        }
+        builder = builder.max_pending_h2_requests(n);
+    }
     if let Some(v) = h2_fallback_h1 {
         builder = builder.h2_fallback_h1(v);
     }
@@ -348,6 +365,26 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
     }
     if let Some(ech) = ech_config {
         builder = builder.ech_config(ech);
+    }
+    // The cache implies the system resolver. Combined with `dns=` one of the
+    // two would silently win (upstream: last resolver-setting call wins), so
+    // reject the ambiguity instead.
+    if system_dns_cache_ttl.is_some() && dns.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "system_dns_cache_ttl cannot be combined with dns: the cache already selects the system resolver",
+        ));
+    }
+    if system_dns_cache_max_entries.is_some() && system_dns_cache_ttl.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "system_dns_cache_max_entries requires system_dns_cache_ttl",
+        ));
+    }
+    if let Some(ttl) = system_dns_cache_ttl {
+        let mut cache = lkrequest::SystemDnsCacheConfig::positive(validated_duration(ttl)?);
+        if let Some(n) = system_dns_cache_max_entries {
+            cache = cache.with_max_entries(n);
+        }
+        builder = builder.system_dns_cache(cache);
     }
     if let Some(ref dns_name) = dns {
         let config = resolve_dns_config(dns_name)?;
@@ -431,6 +468,7 @@ impl PyClient {
         total_timeout=None,
         max_response_body_size=None,
         max_connections_per_session=None,
+        max_pending_h2_requests=None,
         quic_connect_timeout=None,
         max_header_count=None,
         max_header_size=None,
@@ -448,6 +486,8 @@ impl PyClient {
         use_native_certs=false,
         ech_config=None,
         dns=None,
+        system_dns_cache_ttl=None,
+        system_dns_cache_max_entries=None,
         keylog=None,
         protocol_policy=None,
         session_resumption=None,
@@ -472,6 +512,7 @@ impl PyClient {
         total_timeout: Option<f64>,
         max_response_body_size: Option<usize>,
         max_connections_per_session: Option<usize>,
+        max_pending_h2_requests: Option<usize>,
         quic_connect_timeout: Option<f64>,
         max_header_count: Option<usize>,
         max_header_size: Option<usize>,
@@ -489,6 +530,8 @@ impl PyClient {
         use_native_certs: bool,
         ech_config: Option<Vec<u8>>,
         dns: Option<String>,
+        system_dns_cache_ttl: Option<f64>,
+        system_dns_cache_max_entries: Option<usize>,
         keylog: Option<String>,
         protocol_policy: Option<PyProtocolPolicy>,
         session_resumption: Option<PySessionResumptionConfig>,
@@ -526,6 +569,7 @@ impl PyClient {
             total_timeout,
             max_response_body_size,
             max_connections_per_session,
+            max_pending_h2_requests,
             quic_connect_timeout,
             max_header_count,
             max_header_size,
@@ -543,6 +587,8 @@ impl PyClient {
             use_native_certs,
             ech_config,
             dns,
+            system_dns_cache_ttl,
+            system_dns_cache_max_entries,
             keylog,
             protocol_policy: protocol_policy.map(|p| p.inner),
             session_resumption: session_resumption.map(|c| c.inner),
@@ -630,6 +676,16 @@ impl PyClient {
         PyClient {
             inner: build_preset_client(
                 lkrequest::preset::chrome_150(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_151() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_151(),
                 lkrequest::TcpFingerprint::chrome(),
             ),
         }
@@ -882,6 +938,7 @@ impl PyBlockingClient {
         total_timeout=None,
         max_response_body_size=None,
         max_connections_per_session=None,
+        max_pending_h2_requests=None,
         quic_connect_timeout=None,
         max_header_count=None,
         max_header_size=None,
@@ -899,6 +956,8 @@ impl PyBlockingClient {
         use_native_certs=false,
         ech_config=None,
         dns=None,
+        system_dns_cache_ttl=None,
+        system_dns_cache_max_entries=None,
         keylog=None,
         protocol_policy=None,
         session_resumption=None,
@@ -923,6 +982,7 @@ impl PyBlockingClient {
         total_timeout: Option<f64>,
         max_response_body_size: Option<usize>,
         max_connections_per_session: Option<usize>,
+        max_pending_h2_requests: Option<usize>,
         quic_connect_timeout: Option<f64>,
         max_header_count: Option<usize>,
         max_header_size: Option<usize>,
@@ -940,6 +1000,8 @@ impl PyBlockingClient {
         use_native_certs: bool,
         ech_config: Option<Vec<u8>>,
         dns: Option<String>,
+        system_dns_cache_ttl: Option<f64>,
+        system_dns_cache_max_entries: Option<usize>,
         keylog: Option<String>,
         protocol_policy: Option<PyProtocolPolicy>,
         session_resumption: Option<PySessionResumptionConfig>,
@@ -977,6 +1039,7 @@ impl PyBlockingClient {
             total_timeout,
             max_response_body_size,
             max_connections_per_session,
+            max_pending_h2_requests,
             quic_connect_timeout,
             max_header_count,
             max_header_size,
@@ -994,6 +1057,8 @@ impl PyBlockingClient {
             use_native_certs,
             ech_config,
             dns,
+            system_dns_cache_ttl,
+            system_dns_cache_max_entries,
             keylog,
             protocol_policy: protocol_policy.map(|p| p.inner),
             session_resumption: session_resumption.map(|c| c.inner),
@@ -1080,6 +1145,16 @@ impl PyBlockingClient {
         PyBlockingClient {
             inner: build_preset_client(
                 lkrequest::preset::chrome_150(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_151() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_151(),
                 lkrequest::TcpFingerprint::chrome(),
             ),
         }

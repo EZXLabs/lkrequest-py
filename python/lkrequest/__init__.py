@@ -91,6 +91,9 @@ from lkrequest._lkrequest import (
     enable_metrics,
     metrics_snapshot,
     validate_fingerprint_consistency,
+    pending_requests,
+    drain_pending,
+    blocking_drain_pending,
 )
 
 # QuicProfile is only present when built with the `quic-h3` feature
@@ -203,6 +206,9 @@ __all__ = [
     "enable_metrics",
     "metrics_snapshot",
     "validate_fingerprint_consistency",
+    "pending_requests",
+    "drain_pending",
+    "blocking_drain_pending",
 ]
 
 # Feature-gated symbols: only export the ones that were actually importable so

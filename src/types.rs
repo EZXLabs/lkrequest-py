@@ -254,12 +254,13 @@ pub fn resolve_tls_profile(name: &str) -> PyResult<lktls::profile::TlsProfile> {
         "chrome_148" => Ok(lktls::profile::presets::chrome_148()),
         "chrome_149" => Ok(lktls::profile::presets::chrome_149()),
         "chrome_150" => Ok(lktls::profile::presets::chrome_150()),
+        "chrome_151" => Ok(lktls::profile::presets::chrome_151()),
         "firefox_133" => Ok(lktls::profile::presets::firefox_133()),
         "firefox_147" => Ok(lktls::profile::presets::firefox_147()),
         "safari_18" => Ok(lktls::profile::presets::safari_18()),
         "safari_26" => Ok(lktls::profile::presets::safari_26()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, firefox_133, firefox_147, safari_18, safari_26",
+            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, firefox_133, firefox_147, safari_18, safari_26",
             name
         ))),
     }
@@ -275,12 +276,13 @@ pub fn resolve_h2_profile(name: &str) -> PyResult<lkh2::profile::H2Profile> {
         "chrome_148" => Ok(lkh2::profile::chrome_148_h2()),
         "chrome_149" => Ok(lkh2::profile::chrome_149_h2()),
         "chrome_150" => Ok(lkh2::profile::chrome_150_h2()),
+        "chrome_151" => Ok(lkh2::profile::chrome_151_h2()),
         "firefox_133" => Ok(lkh2::profile::firefox_133_h2()),
         "firefox_147" => Ok(lkh2::profile::firefox_147_h2()),
         "safari_18" => Ok(lkh2::profile::safari_18_h2()),
         "safari_26" => Ok(lkh2::profile::safari_26_h2()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, firefox_133, firefox_147, safari_18, safari_26",
+            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, firefox_133, firefox_147, safari_18, safari_26",
             name
         ))),
     }

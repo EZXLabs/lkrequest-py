@@ -103,7 +103,7 @@ impl PyWsConnection {
 impl PyWsConnection {
     fn send_text<'py>(&self, py: Python<'py>, text: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let conn = guard
                 .as_mut()
@@ -116,7 +116,7 @@ impl PyWsConnection {
 
     fn send_binary<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let conn = guard
                 .as_mut()
@@ -129,7 +129,7 @@ impl PyWsConnection {
 
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let conn = guard
                 .as_mut()
@@ -149,7 +149,7 @@ impl PyWsConnection {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let reason = reason.to_string();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let conn = guard
                 .as_mut()
@@ -168,7 +168,7 @@ impl PyWsConnection {
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let conn = match guard.as_mut() {
                 Some(c) => c,

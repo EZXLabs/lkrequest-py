@@ -469,6 +469,36 @@ impl PyTlsProfile {
         }
     }
     #[staticmethod]
+    fn chrome_151() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_151(),
+        }
+    }
+    /// Chrome 146 QUIC-TLS profile: the ClientHello Chrome sends *inside* QUIC,
+    /// which differs from the TCP profile of the same version. Pass it to
+    /// `Client(quic_fingerprint=...)`; HTTP/3 otherwise reuses the main TLS profile.
+    #[staticmethod]
+    fn chrome_146_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_146_quic(),
+        }
+    }
+    /// Chrome 150 QUIC-TLS profile (see `chrome_146_quic`).
+    #[staticmethod]
+    fn chrome_150_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_150_quic(),
+        }
+    }
+    /// Chrome 151 QUIC-TLS profile: Chrome 150's QUIC ClientHello minus the three
+    /// ML-DSA signature algorithms, matching real Chrome 151 HTTP/3 captures.
+    #[staticmethod]
+    fn chrome_151_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_151_quic(),
+        }
+    }
+    #[staticmethod]
     fn firefox_133() -> Self {
         PyTlsProfile {
             inner: lktls::profile::presets::firefox_133(),
@@ -973,6 +1003,12 @@ impl PyH2Profile {
     fn chrome_150() -> Self {
         PyH2Profile {
             inner: lkh2::profile::chrome_150_h2(),
+        }
+    }
+    #[staticmethod]
+    fn chrome_151() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_151_h2(),
         }
     }
     #[staticmethod]

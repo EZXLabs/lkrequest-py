@@ -340,6 +340,9 @@ class QuicProfile:
     def chrome_150() -> QuicProfile:
         """Chrome 150 QUIC fingerprint preset."""
     @staticmethod
+    def chrome_151() -> QuicProfile:
+        """Chrome 151 QUIC fingerprint preset (no ML-DSA signature algorithms)."""
+    @staticmethod
     def from_json(json_str: str) -> QuicProfile:
         """Build a QuicProfile from a JSON string."""
     def to_json(self) -> str:
@@ -1223,6 +1226,7 @@ class Client:
         total_timeout: Optional[float] = None,
         max_response_body_size: Optional[int] = None,
         max_connections_per_session: Optional[int] = None,
+        max_pending_h2_requests: Optional[int] = None,
         quic_connect_timeout: Optional[float] = None,
         max_header_count: Optional[int] = None,
         max_header_size: Optional[int] = None,
@@ -1240,6 +1244,8 @@ class Client:
         use_native_certs: bool = False,
         ech_config: Optional[bytes] = None,
         dns: Optional[str] = None,
+        system_dns_cache_ttl: Optional[float] = None,
+        system_dns_cache_max_entries: Optional[int] = None,
         keylog: Optional[str] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         session_resumption: Optional[SessionResumptionConfig] = None,
@@ -1272,6 +1278,9 @@ class Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def chrome_150() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_151() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_133() -> Client:
@@ -1351,6 +1360,7 @@ class BlockingClient:
         total_timeout: Optional[float] = None,
         max_response_body_size: Optional[int] = None,
         max_connections_per_session: Optional[int] = None,
+        max_pending_h2_requests: Optional[int] = None,
         quic_connect_timeout: Optional[float] = None,
         max_header_count: Optional[int] = None,
         max_header_size: Optional[int] = None,
@@ -1368,6 +1378,8 @@ class BlockingClient:
         use_native_certs: bool = False,
         ech_config: Optional[bytes] = None,
         dns: Optional[str] = None,
+        system_dns_cache_ttl: Optional[float] = None,
+        system_dns_cache_max_entries: Optional[int] = None,
         keylog: Optional[str] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         session_resumption: Optional[SessionResumptionConfig] = None,
@@ -1400,6 +1412,9 @@ class BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def chrome_150() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_151() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_133() -> BlockingClient:
@@ -1673,6 +1688,18 @@ class TlsProfile:
     def chrome_150() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
     @staticmethod
+    def chrome_151() -> TlsProfile:
+        """TLS fingerprint preset for this browser version."""
+    @staticmethod
+    def chrome_146_quic() -> TlsProfile:
+        """Chrome 146 QUIC-TLS preset (the ClientHello sent inside QUIC), for ``Client(quic_fingerprint=...)``."""
+    @staticmethod
+    def chrome_150_quic() -> TlsProfile:
+        """Chrome 150 QUIC-TLS preset, for ``Client(quic_fingerprint=...)``."""
+    @staticmethod
+    def chrome_151_quic() -> TlsProfile:
+        """Chrome 151 QUIC-TLS preset: Chrome 150's QUIC ClientHello without the three ML-DSA signature algorithms."""
+    @staticmethod
     def firefox_133() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
     @staticmethod
@@ -1810,6 +1837,9 @@ class H2Profile:
     def chrome_150() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
     @staticmethod
+    def chrome_151() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version."""
+    @staticmethod
     def firefox_133() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
     @staticmethod
@@ -1904,6 +1934,15 @@ class ClientPool:
 # ---------------------------------------------------------------------------
 # Module-level functions
 # ---------------------------------------------------------------------------
+
+def pending_requests() -> int:
+    """Number of async operations handed to Python that have not finished yet (process-wide)."""
+
+async def drain_pending(timeout: Optional[float] = None) -> bool:
+    """Wait until nothing is in flight; ``timeout`` in seconds, ``None`` waits forever. True if it drained."""
+
+def blocking_drain_pending(timeout: Optional[float] = None) -> bool:
+    """Blocking counterpart of :func:`drain_pending`."""
 
 def set_log_level(level: str, *, format: str = "compact") -> bool:
     """Set the global log level (e.g. ``"info"`` or a filter like ``"lkrequest=debug"``); ``format`` selects the output style."""

@@ -32,7 +32,7 @@ A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for
 - **Protocol policy** — `ProtocolPolicy` / `HttpIntent` control H2/H3 selection, acquisition, and fallback (client / session / request level)
 - **Session resumption control** — `SessionResumptionConfig` controls TLS1.3 PSK / TLS1.2 ticket resumption
 - **Request-level protocol override** — `preferred_http_version` / `idempotency` (0-RTT replay-safety declaration)
-- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150 `QuicProfile` presets (available only when the feature is enabled)
+- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
 - **Synthetic fingerprints (advanced)** — Optional feature (`maturin develop --features synthetic-fp`): `Client(randomize=Randomize.recombine())` synthesizes a cross-layer (TLS+H2+H3) unique identity per session; `Randomize.full()` additionally draws out-of-corpus values for H2/QUIC; the `Layers` mask (e.g. `Randomize.recombine_layers(Layers.TLS | Layers.H2)`) restricts which layers are synthesized. Synthetic fingerprints match no real browser and are only for blocklist (negative-model) targets — against an allowlist they fail instantly
 
 ## Installation
@@ -598,6 +598,19 @@ snap = lkrequest.metrics_snapshot()
 
 > Counters are all 0 by default; only building with the `telemetry` feature (`maturin build --features telemetry`) enables transport-layer byte counting.
 
+### Draining before shutdown
+
+A result that arrives after its event loop has closed has nowhere to go and is dropped. If requests may still be running when you tear the loop down, wait for them:
+
+```python
+await lkrequest.drain_pending()            # wait indefinitely
+await lkrequest.drain_pending(timeout=5)   # -> False if it did not finish in time
+lkrequest.pending_requests()               # how many are still in flight
+lkrequest.blocking_drain_pending(5)        # same, outside an event loop
+```
+
+Counts are process-wide and cover every async call, not just requests. Cancelling a request releases it immediately — the underlying work is abandoned, not awaited.
+
 ### Certificate management
 
 ```python
@@ -660,6 +673,7 @@ except lkrequest.RequestError as e:
 | `Client.chrome_148()` | Chrome 148 | Chrome 148 | Chrome |
 | `Client.chrome_149()` | Chrome 149 | Chrome 149 | Chrome |
 | `Client.chrome_150()` | Chrome 150 | Chrome 150 | Chrome |
+| `Client.chrome_151()` | Chrome 151 | Chrome 151 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
@@ -681,11 +695,13 @@ TCP fingerprints are OS-specific: `chrome_win` / `chrome_linux` / `chrome_macos`
 | `cookie_order` | Cookie send order |
 | `dns_timeout` / `tcp_connect_timeout` / `tls_handshake_timeout` / `ttfb_timeout` / `total_timeout` / `quic_connect_timeout` | Timeout control |
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | Resource limits / DoS protection |
+| `max_pending_h2_requests` | Cap HTTP/2 requests queued for a remote stream slot (default: unbounded) |
 | `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | Fault-tolerance options |
 | `middleware` | Middleware list |
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | Certificate configuration |
 | `ech_config` | ECH configuration |
 | `dns` | Custom DNS |
+| `system_dns_cache_ttl` / `system_dns_cache_max_entries` | Cache successful OS-resolver lookups for `ttl` seconds (TTL `0` disables caching but keeps in-flight coalescing; cannot be combined with `dns`) |
 | `keylog` | TLS key log file path |
 
 | Method | Description |

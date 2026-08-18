@@ -46,6 +46,16 @@ impl PyQuicProfile {
         }
     }
 
+    /// Chrome 151 QUIC / HTTP/3 profile captured from public H3 origins. Unlike
+    /// Chrome 150 it omits the three ML-DSA signature algorithms; transport
+    /// parameters and H3 SETTINGS stay aligned with Chrome 150.
+    #[staticmethod]
+    fn chrome_151() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_151_quic(),
+        }
+    }
+
     /// Load a profile from a JSON string.
     #[staticmethod]
     fn from_json(json_str: &str) -> PyResult<Self> {

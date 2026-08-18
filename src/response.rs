@@ -497,7 +497,7 @@ impl PyStreamingResponse {
 
     fn chunk<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let stream = guard.as_mut().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
@@ -515,7 +515,7 @@ impl PyStreamingResponse {
 
     fn chunk_decoded<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let stream = guard.as_mut().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
@@ -533,7 +533,7 @@ impl PyStreamingResponse {
 
     fn bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let stream = guard.take().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
@@ -547,7 +547,7 @@ impl PyStreamingResponse {
 
     fn text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let stream = guard.take().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
@@ -565,7 +565,7 @@ impl PyStreamingResponse {
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let stream = match guard.as_mut() {
                 Some(s) => s,

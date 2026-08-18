@@ -387,7 +387,7 @@ impl PySession {
             accept_encoding,
             opts,
         };
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             execute_request(session, prepared, hooks).await
         })
     }
@@ -873,7 +873,7 @@ impl PySession {
         protocols: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let session = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut builder = session.websocket(&url);
             if let Some(h) = headers {
                 for (k, v) in h.0 {
@@ -943,7 +943,7 @@ impl PySession {
 
     fn preconnect<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let session = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             session.preconnect(&url).await.map_err(to_py_err)?;
             Ok(())
         })
@@ -955,7 +955,7 @@ impl PySession {
         urls: Vec<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let session = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
             let results = session.preconnect_many(&url_refs).await;
             Python::with_gil(|py| {
@@ -979,7 +979,7 @@ impl PySession {
 
     fn prefetch<'py>(&self, py: Python<'py>, urls: Vec<String>) -> PyResult<Bound<'py, PyAny>> {
         let session = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
             let results = session.prefetch(&url_refs).await;
             Python::with_gil(|py| {
@@ -1061,7 +1061,7 @@ impl PySession {
                 ..Default::default()
             },
         };
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let rb = apply_request_options(&session, prepared)?;
             let resp = rb.send_streaming().await.map_err(to_py_err)?;
             Ok(crate::response::PyStreamingResponse::new(resp))

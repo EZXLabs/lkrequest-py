@@ -248,7 +248,7 @@ impl PyProxyPool {
 
     fn acquire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let guard = pool.acquire().await;
             let proxy_url = guard.proxy().map(|p| p.identity()).unwrap_or_default();
             tracing::debug!(proxy = %proxy_url, "proxy_pool.acquire");

@@ -32,7 +32,7 @@ Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性�
 - **协议策略** — `ProtocolPolicy` / `HttpIntent` 控制 H2/H3 选择、获取与回退（client / session / 请求级）
 - **会话恢复控制** — `SessionResumptionConfig` 控制 TLS1.3 PSK / TLS1.2 ticket 恢复
 - **请求级协议覆盖** — `preferred_http_version` / `idempotency`（0-RTT 重放安全声明）
-- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150 `QuicProfile` 预设（仅 feature 开启时可用）
+- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
 - **合成指纹（高级）** — 可选 feature（`maturin develop --features synthetic-fp`）：`Client(randomize=Randomize.recombine())` 为每个 session 合成一个跨层（TLS+H2+H3）唯一身份；`Randomize.full()` 进一步对 H2/QUIC 取语料外数值；`Layers` 掩码（如 `Randomize.recombine_layers(Layers.TLS | Layers.H2)`）限定合成层。合成指纹不匹配任何真实浏览器，仅用于黑名单（negative-model）目标，对白名单会立即失败
 
 ## 安装
@@ -597,6 +597,19 @@ snap = lkrequest.metrics_snapshot()
 
 > 计数器默认全为 0；构建时加 `telemetry` feature（`maturin build --features telemetry`）才会启用传输层字节计数。
 
+### 关闭前收尾
+
+事件循环关闭后才返回的结果没有接收方，会被直接丢弃。如果拆掉循环时可能仍有请求在跑，先等它们收干净：
+
+```python
+await lkrequest.drain_pending()            # 一直等
+await lkrequest.drain_pending(timeout=5)   # 超时未收完返回 False
+lkrequest.pending_requests()               # 当前仍在途的数量
+lkrequest.blocking_drain_pending(5)        # 同上，用于非异步场景
+```
+
+计数是进程级的，覆盖所有异步调用而不只是请求。取消某个请求会立即释放它——底层工作被丢弃，而不是等它跑完。
+
 ### 证书管理
 
 ```python
@@ -659,6 +672,7 @@ except lkrequest.RequestError as e:
 | `Client.chrome_148()` | Chrome 148 | Chrome 148 | Chrome |
 | `Client.chrome_149()` | Chrome 149 | Chrome 149 | Chrome |
 | `Client.chrome_150()` | Chrome 150 | Chrome 150 | Chrome |
+| `Client.chrome_151()` | Chrome 151 | Chrome 151 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
@@ -680,11 +694,13 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `cookie_order` | Cookie 发送顺序 |
 | `dns_timeout` / `tcp_connect_timeout` / `tls_handshake_timeout` / `ttfb_timeout` / `total_timeout` / `quic_connect_timeout` | 超时控制 |
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | 资源限制 / 抗 DoS |
+| `max_pending_h2_requests` | 限制等待 HTTP/2 流槽位的排队请求数（默认不限）|
 | `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | 容错选项 |
 | `middleware` | 中间件列表 |
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | 证书配置 |
 | `ech_config` | ECH 配置 |
 | `dns` | 自定义 DNS |
+| `system_dns_cache_ttl` / `system_dns_cache_max_entries` | 缓存系统解析器的成功查询 `ttl` 秒（TTL `0` 关闭缓存但保留并发查询合并；不能与 `dns` 同时使用）|
 | `keylog` | TLS key log 文件路径 |
 
 | 方法 | 说明 |

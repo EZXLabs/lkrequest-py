@@ -12,6 +12,7 @@
 // timeout, proxy, encoding, …). Collapsing them to <=7 would hurt the binding.
 #![allow(clippy::too_many_arguments)]
 
+mod bridge;
 mod client;
 mod client_pool;
 mod error;
@@ -140,8 +141,43 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(metrics::enable_metrics, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(validate_fingerprint_consistency, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(metrics_snapshot, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(pending_requests, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(drain_pending, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(blocking_drain_pending, m)?)?;
 
     Ok(())
+}
+
+/// Number of async operations that have been handed to Python but have not
+/// finished yet, counted process-wide.
+#[pyfunction]
+fn pending_requests() -> usize {
+    bridge::pending_count()
+}
+
+/// Wait until no async operation is still in flight.
+///
+/// Call this before the event loop closes if requests may still be running:
+/// a result arriving after the loop is gone has nowhere to go and is dropped.
+///
+/// ``timeout`` is in seconds; ``None`` waits indefinitely. Returns True if
+/// everything finished, False if the timeout elapsed first.
+#[pyfunction]
+#[pyo3(signature = (timeout=None))]
+fn drain_pending(py: Python<'_>, timeout: Option<f64>) -> PyResult<Bound<'_, PyAny>> {
+    let timeout = timeout.map(types::validated_duration).transpose()?;
+    // Untracked: a tracked drain would be counted as in flight and wait on itself.
+    bridge::future_into_py_untracked(py, async move { Ok(bridge::drain(timeout).await) })
+}
+
+/// Blocking counterpart of :func:`drain_pending`.
+#[pyfunction]
+#[pyo3(signature = (timeout=None))]
+fn blocking_drain_pending(py: Python<'_>, timeout: Option<f64>) -> PyResult<bool> {
+    let timeout = timeout.map(types::validated_duration).transpose()?;
+    Ok(py.allow_threads(|| {
+        pyo3_async_runtimes::tokio::get_runtime().block_on(bridge::drain(timeout))
+    }))
 }
 
 /// Validate that TLS, H2, and TCP fingerprint configurations are consistent.

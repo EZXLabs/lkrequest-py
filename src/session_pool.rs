@@ -63,7 +63,7 @@ impl PySessionPool {
 
     fn acquire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             tracing::debug!("session_pool.acquire");
             let guard = pool.acquire().await;
             Ok(PySessionGuard {
@@ -79,7 +79,7 @@ impl PySessionPool {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let old_guard = bad_guard.guard.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             tracing::debug!("session_pool.acquire_fresh (marking old session bad)");
             {
                 let mut lock = old_guard.lock().await;
@@ -102,7 +102,7 @@ impl PySessionPool {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let guard_arc = session_guard.guard.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let lock = guard_arc.lock().await;
             if let Some(ref g) = *lock {
                 pool.mark_bad(g);
@@ -113,7 +113,7 @@ impl PySessionPool {
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let stats = pool.stats().await;
             Ok(crate::types::PySessionPoolStats::from(stats))
         })
@@ -138,7 +138,7 @@ impl PySessionGuard {
     #[getter]
     fn session<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let guard_arc = self.guard.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let lock = guard_arc.lock().await;
             let g = lock.as_ref().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("SessionGuard already released")
@@ -153,7 +153,7 @@ impl PySessionGuard {
 
     fn __aenter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let guard_arc = slf.guard.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let lock = guard_arc.lock().await;
             let g = lock.as_ref().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("SessionGuard already released")
@@ -174,7 +174,7 @@ impl PySessionGuard {
         _exc_tb: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let guard_arc = self.guard.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::bridge::future_into_py(py, async move {
             let mut lock = guard_arc.lock().await;
             *lock = None;
             Ok(false)

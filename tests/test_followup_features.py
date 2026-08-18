@@ -8,6 +8,8 @@ These are construction/type tests plus localhost-only kwarg-acceptance checks,
 so they do not depend on external network reachability.
 """
 
+import json
+
 import pytest
 
 import lkrequest
@@ -20,6 +22,7 @@ NEW_CHROME_PRESETS = [
     "chrome_148",
     "chrome_149",
     "chrome_150",
+    "chrome_151",
 ]
 
 
@@ -49,6 +52,63 @@ class TestNewPresets:
         info = lkrequest.Client.chrome_148().fingerprint_info()
         assert "148" in info["tls_profile"]
 
+    def test_chrome_151_reuses_chrome_150_tcp_shape(self):
+        # Python mirror of upstream's `chrome_151_matches_chrome_150_tcp_stable_
+        # fields`: Chrome 151 reuses Chrome 150's TCP capture, so the serialized
+        # TLS profiles differ only by `name` and the H2 profiles (which carry no
+        # name) are identical. Guards against a future upstream capture
+        # diverging without a matching binding/doc update here.
+        tls150 = json.loads(lkrequest.TlsProfile.chrome_150().to_json())
+        tls151 = json.loads(lkrequest.TlsProfile.chrome_151().to_json())
+        assert (tls150.pop("name"), tls151.pop("name")) == ("Chrome 150", "Chrome 151")
+        assert tls150 == tls151
+        assert (
+            lkrequest.H2Profile.chrome_151().to_json()
+            == lkrequest.H2Profile.chrome_150().to_json()
+        )
+
+    def test_quic_tls_presets_differ_from_their_tcp_counterparts(self):
+        # The QUIC-TLS presets are the ClientHello Chrome sends inside QUIC; they
+        # are plain TLS profiles (no quic-h3 feature needed) and must not be
+        # confused with the TCP profile of the same version.
+        for name in ("chrome_146", "chrome_150", "chrome_151"):
+            tcp = json.loads(getattr(lkrequest.TlsProfile, name)().to_json())
+            quic = json.loads(getattr(lkrequest.TlsProfile, f"{name}_quic")().to_json())
+            assert quic["name"] == f"{tcp['name']} QUIC"
+            assert quic != tcp
+            # Usable where a QUIC-specific fingerprint is expected.
+            client = lkrequest.Client(
+                quic_fingerprint=getattr(lkrequest.TlsProfile, f"{name}_quic")()
+            )
+            assert "Client" in repr(client)
+
+    def test_chrome_151_quic_omits_ml_dsa_signature_algorithms(self):
+        # Python mirror of upstream's
+        # `chrome_151_quic_matches_public_h3_capture_signature_algorithms`: real
+        # Chrome 151 H3 captures drop the three ML-DSA codepoints that Chrome 150
+        # sends, while Chrome 151's TCP profile keeps them.
+        ml_dsa = {0x0904, 0x0905, 0x0906}
+        sig_algs = {
+            name: json.loads(getattr(lkrequest.TlsProfile, name)().to_json())[
+                "signature_algorithms"
+            ]
+            for name in ("chrome_151", "chrome_150_quic", "chrome_151_quic")
+        }
+        assert ml_dsa.issubset(sig_algs["chrome_151"])
+        assert ml_dsa.issubset(sig_algs["chrome_150_quic"])
+        assert ml_dsa.isdisjoint(sig_algs["chrome_151_quic"])
+        assert sig_algs["chrome_151_quic"] == [
+            0x0403,
+            0x0804,
+            0x0401,
+            0x0503,
+            0x0805,
+            0x0501,
+            0x0806,
+            0x0601,
+            0x0201,
+        ]
+
     def test_unknown_preset_still_errors(self):
         with pytest.raises(ValueError, match="Unknown TLS profile"):
             lkrequest.Client(tls_profile="chrome_999")
@@ -64,6 +124,7 @@ class TestNewPresets:
             "chrome_148",
             "chrome_149",
             "chrome_150",
+            "chrome_151",
             "firefox_133",
             "firefox_147",
             "safari_18",
@@ -223,7 +284,7 @@ class TestQuicSurface:
         if not hasattr(lkrequest, "QuicProfile"):
             pytest.skip("built without the quic-h3 feature")
         profiles = {}
-        for name in ("chrome_146", "chrome_150"):
+        for name in ("chrome_146", "chrome_150", "chrome_151"):
             qp = getattr(lkrequest.QuicProfile, name)()
             assert qp.connection_id_length >= 0
             qp.validate()  # raises on invalid
@@ -237,6 +298,13 @@ class TestQuicSurface:
             profiles[name] = qp.to_json()
 
         assert profiles["chrome_150"] != profiles["chrome_146"]
+        # Chrome 151 keeps Chrome 150's QUIC transport parameters and H3
+        # SETTINGS verbatim; the two presets differ only in their QUIC-TLS
+        # signature algorithms (Chrome 151 drops the three ML-DSA codepoints),
+        # which live in the QUIC-TLS profile rather than in QuicProfile. That
+        # profile is reachable only through `Client.chrome_151()`, so the
+        # difference is not observable on QuicProfile itself.
+        assert profiles["chrome_151"] == profiles["chrome_150"]
 
 
 # ==========================================================================

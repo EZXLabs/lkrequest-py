@@ -92,6 +92,42 @@ class _ServerHandle:
         self._thread.join(timeout=5.0)
 
 
+def _with_early_hints(inner):
+    """Add an `/early-hints` route that emits `103` before its final `200`.
+
+    httpbin is a WSGI app and so cannot send 1xx informational responses, which
+    makes it useless for pinning the HTTP/2 interim-response path. This shim
+    serves one directly: a `103 Early Hints` block followed by the real `200`,
+    mirroring what Cloudflare sends. Everything else is delegated to httpbin.
+
+    Hypercorn only offers the extension on HTTP/2 and HTTP/3, so on HTTP/1.1
+    the hint is skipped and the client just sees the final response.
+    """
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http" or scope["path"] != "/early-hints":
+            await inner(scope, receive, send)
+            return
+
+        if "http.response.early_hint" in scope.get("extensions", {}):
+            await send(
+                {
+                    "type": "http.response.early_hint",
+                    "links": [b"</style.css>; rel=preload; as=style"],
+                }
+            )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"final"})
+
+    return app
+
+
 def _start_server(cert_file, key_file, ca_pem, *, with_quic: bool) -> _ServerHandle:
     """Start a hypercorn httpbin server in a background thread.
 
@@ -106,7 +142,7 @@ def _start_server(cert_file, key_file, ca_pem, *, with_quic: bool) -> _ServerHan
     from hypercorn.config import Config
 
     port = _free_port()
-    asgi_app = WsgiToAsgi(flask_app)
+    asgi_app = _with_early_hints(WsgiToAsgi(flask_app))
 
     config = Config()
     config.bind = [f"127.0.0.1:{port}"]
@@ -132,6 +168,17 @@ def _start_server(cert_file, key_file, ca_pem, *, with_quic: bool) -> _ServerHan
             loop.run_until_complete(
                 serve(asgi_app, config, shutdown_trigger=_shutdown_trigger)
             )
+        except BaseException:
+            # Graceful shutdown cancels any handler still parked on receive()
+            # (e.g. an H3 request whose client reset the stream and went away,
+            # as the xfailed test_h3_get leaves behind). Hypercorn answers the
+            # cancellation by writing a 500 to that already-reset QUIC stream,
+            # aioquic asserts, and the ExceptionGroup escapes serve() — which
+            # pytest would report as an unhandled thread exception. Once stop
+            # is set the server has done its job and teardown noise is
+            # dropped; anything earlier is a real failure and still raises.
+            if not stop.is_set():
+                raise
         finally:
             loop.close()
 

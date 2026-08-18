@@ -1141,6 +1141,45 @@ class TestClientConfiguration:
         )
         assert "Client" in repr(client)
 
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_max_pending_h2_requests(self, cls):
+        # Bounds how many HTTP/2 requests may queue for a remote stream slot.
+        # Omitting it keeps upstream's default, which is unbounded.
+        assert "Client" in repr(cls(max_pending_h2_requests=8))
+        assert "Client" in repr(cls())
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_max_pending_h2_requests_rejects_zero(self, cls):
+        # Upstream asserts on zero, which would escape as a panic rather than a
+        # Python exception, so the binding rejects it up front.
+        with pytest.raises(ValueError, match="greater than 0"):
+            cls(max_pending_h2_requests=0)
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_system_dns_cache(self, cls):
+        # Enables a positive-result cache on the OS resolver. A zero TTL is
+        # valid upstream (disables caching while keeping in-flight coalescing),
+        # so it must not be rejected like max_pending's zero is.
+        assert "Client" in repr(cls(system_dns_cache_ttl=30.0))
+        assert "Client" in repr(
+            cls(system_dns_cache_ttl=30.0, system_dns_cache_max_entries=4096)
+        )
+        assert "Client" in repr(cls(system_dns_cache_ttl=0.0))
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_system_dns_cache_conflicts_with_dns(self, cls):
+        # The cache implies the system resolver; pairing it with an explicit
+        # dns= would let one silently override the other, so it is rejected.
+        with pytest.raises(ValueError, match="cannot be combined with dns"):
+            cls(system_dns_cache_ttl=30.0, dns="google")
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_system_dns_cache_max_entries_needs_ttl(self, cls):
+        # max_entries only configures the cache the TTL turns on, so on its own
+        # it is a no-op that almost certainly signals a mistake.
+        with pytest.raises(ValueError, match="requires system_dns_cache_ttl"):
+            cls(system_dns_cache_max_entries=100)
+
 
 # ==========================================================================
 # Session Configuration Options
