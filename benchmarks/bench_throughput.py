@@ -3,7 +3,7 @@
 import asyncio
 import time
 
-TARGET_URL = "https://httpbin.org/get"
+TARGET_URL = "https://postman-echo.com/get"
 CONCURRENCY = 50
 TOTAL_REQUESTS = 200
 
@@ -41,7 +41,9 @@ async def bench_lkrequest_async():
 async def bench_httpx_async():
     import httpx
 
-    async with httpx.AsyncClient(http2=True) as client:
+    # See bench_latency.py: all clients must go direct for a fair comparison.
+    # aiohttp already ignores the proxy environment unless trust_env=True.
+    async with httpx.AsyncClient(http2=True, trust_env=False) as client:
         sem = asyncio.Semaphore(CONCURRENCY)
         success = 0
         errors = 0

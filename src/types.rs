@@ -255,12 +255,13 @@ pub fn resolve_tls_profile(name: &str) -> PyResult<lktls::profile::TlsProfile> {
         "chrome_149" => Ok(lktls::profile::presets::chrome_149()),
         "chrome_150" => Ok(lktls::profile::presets::chrome_150()),
         "chrome_151" => Ok(lktls::profile::presets::chrome_151()),
+        "chrome_152" => Ok(lktls::profile::presets::chrome_152()),
         "firefox_133" => Ok(lktls::profile::presets::firefox_133()),
         "firefox_147" => Ok(lktls::profile::presets::firefox_147()),
         "safari_18" => Ok(lktls::profile::presets::safari_18()),
         "safari_26" => Ok(lktls::profile::presets::safari_26()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, firefox_133, firefox_147, safari_18, safari_26",
+            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, firefox_133, firefox_147, safari_18, safari_26",
             name
         ))),
     }
@@ -277,12 +278,13 @@ pub fn resolve_h2_profile(name: &str) -> PyResult<lkh2::profile::H2Profile> {
         "chrome_149" => Ok(lkh2::profile::chrome_149_h2()),
         "chrome_150" => Ok(lkh2::profile::chrome_150_h2()),
         "chrome_151" => Ok(lkh2::profile::chrome_151_h2()),
+        "chrome_152" => Ok(lkh2::profile::chrome_152_h2()),
         "firefox_133" => Ok(lkh2::profile::firefox_133_h2()),
         "firefox_147" => Ok(lkh2::profile::firefox_147_h2()),
         "safari_18" => Ok(lkh2::profile::safari_18_h2()),
         "safari_26" => Ok(lkh2::profile::safari_26_h2()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, firefox_133, firefox_147, safari_18, safari_26",
+            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, firefox_133, firefox_147, safari_18, safari_26",
             name
         ))),
     }
@@ -425,6 +427,90 @@ impl PySessionPoolStats {
             "SessionPoolStats(idle={}, max={})",
             self.idle_sessions, self.max_sessions
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H2DataFramePolicy
+// ---------------------------------------------------------------------------
+
+/// Capping policy for outbound HTTP/2 DATA frame payloads. Pass to
+/// `Client(h2_data_frame_policy=...)`.
+///
+/// The default keeps whatever the browser preset does natively; set this
+/// explicitly only when deliberately reshaping DATA framing, since the frame
+/// sizes are themselves an observable fingerprint trait.
+#[pyclass(name = "H2DataFramePolicy", eq)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct PyH2DataFramePolicy {
+    pub(crate) inner: lkrequest::H2DataFramePolicy,
+}
+
+#[pymethods]
+impl PyH2DataFramePolicy {
+    /// Keep the browser preset's native framing behaviour (the default).
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn BROWSER_DEFAULT() -> PyH2DataFramePolicy {
+        PyH2DataFramePolicy {
+            inner: lkrequest::H2DataFramePolicy::BrowserDefault,
+        }
+    }
+
+    /// Honour only the peer's SETTINGS_MAX_FRAME_SIZE, with no extra cap.
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn PEER_MAX_FRAME_SIZE() -> PyH2DataFramePolicy {
+        PyH2DataFramePolicy {
+            inner: lkrequest::H2DataFramePolicy::PeerMaxFrameSize,
+        }
+    }
+
+    /// Cap every DATA payload to a fixed byte count. `max_payload` must be
+    /// positive — upstream turns 0 into an `assert!` panic, so reject it here
+    /// with a clean ValueError.
+    #[staticmethod]
+    fn fixed_payload(max_payload: usize) -> PyResult<PyH2DataFramePolicy> {
+        if max_payload == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_payload must be greater than zero",
+            ));
+        }
+        Ok(PyH2DataFramePolicy {
+            inner: lkrequest::H2DataFramePolicy::FixedPayload(max_payload),
+        })
+    }
+
+    /// Reserve the 9-byte HTTP/2 frame header inside a target socket write
+    /// size. `max_write_size` must exceed 9 — upstream turns anything smaller
+    /// into an `assert!` panic, so reject it here with a clean ValueError.
+    #[staticmethod]
+    fn socket_write_aligned(max_write_size: usize) -> PyResult<PyH2DataFramePolicy> {
+        if max_write_size <= 9 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_write_size must exceed the 9-byte HTTP/2 frame header",
+            ));
+        }
+        Ok(PyH2DataFramePolicy {
+            inner: lkrequest::H2DataFramePolicy::SocketWriteAligned { max_write_size },
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        match self.inner {
+            lkrequest::H2DataFramePolicy::BrowserDefault => {
+                "H2DataFramePolicy.BROWSER_DEFAULT".to_string()
+            }
+            lkrequest::H2DataFramePolicy::PeerMaxFrameSize => {
+                "H2DataFramePolicy.PEER_MAX_FRAME_SIZE".to_string()
+            }
+            lkrequest::H2DataFramePolicy::FixedPayload(n) => {
+                format!("H2DataFramePolicy.fixed_payload({n})")
+            }
+            lkrequest::H2DataFramePolicy::SocketWriteAligned { max_write_size } => {
+                format!("H2DataFramePolicy.socket_write_aligned({max_write_size})")
+            }
+        }
     }
 }
 

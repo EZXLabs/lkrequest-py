@@ -43,14 +43,14 @@ lint:
 # Run benchmark suite
 bench:
     maturin develop --release
-    python benchmarks/bench_latency.py
-    python benchmarks/bench_throughput.py
-    python benchmarks/bench_memory.py
+    {{python}} benchmarks/bench_latency.py
+    {{python}} benchmarks/bench_throughput.py
+    {{python}} benchmarks/bench_memory.py
 
 # Verify TLS fingerprints against example.com
 verify-fingerprint:
     maturin develop --release
-    python benchmarks/verify_fingerprint.py
+    {{python}} benchmarks/verify_fingerprint.py
 
 # Clean build artifacts
 clean:

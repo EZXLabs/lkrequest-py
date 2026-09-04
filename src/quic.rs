@@ -56,6 +56,15 @@ impl PyQuicProfile {
         }
     }
 
+    /// Chrome 152 QUIC / HTTP/3 profile: Chrome 151's shape minus the obsolete
+    /// `google_initial_rtt` transport parameter.
+    #[staticmethod]
+    fn chrome_152() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_152_quic(),
+        }
+    }
+
     /// Load a profile from a JSON string.
     #[staticmethod]
     fn from_json(json_str: &str) -> PyResult<Self> {

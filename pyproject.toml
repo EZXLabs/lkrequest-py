@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "lkrequest"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python HTTP client with TLS/HTTP2/TCP fingerprint control, powered by Rust"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -60,6 +60,7 @@ features = [
     "quic-h3",
     "telemetry",
     "synthetic-fp",
+    "doh",
 ]
 
 [tool.pytest.ini_options]

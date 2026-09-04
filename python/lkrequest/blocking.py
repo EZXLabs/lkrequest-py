@@ -42,6 +42,10 @@ from lkrequest._lkrequest import (
     Idempotency,
     BrokenQuicPolicy,
     SessionResumptionConfig,
+    H2DataFramePolicy,
+    TlsSessionResumptionPolicy,
+    TlsSessionCachePartitionPolicy,
+    NetworkPartitionContext,
 )
 
 __all__ = [
@@ -76,4 +80,8 @@ __all__ = [
     "Idempotency",
     "BrokenQuicPolicy",
     "SessionResumptionConfig",
+    "H2DataFramePolicy",
+    "TlsSessionResumptionPolicy",
+    "TlsSessionCachePartitionPolicy",
+    "NetworkPartitionContext",
 ]

@@ -30,9 +30,11 @@ A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for
 - **ECH** — Encrypted Client Hello support, including TLS/QUIC HelloRetryRequest handling
 - **Request priority** — `RequestPriority` (RFC 9218 urgency/incremental), `session.get(url, priority=...)`
 - **Protocol policy** — `ProtocolPolicy` / `HttpIntent` control H2/H3 selection, acquisition, and fallback (client / session / request level)
-- **Session resumption control** — `SessionResumptionConfig` controls TLS1.3 PSK / TLS1.2 ticket resumption
+- **Session resumption control** — `SessionResumptionConfig` controls TLS1.3 PSK / TLS1.2 ticket resumption (fingerprint shape); `Client(tls_session_resumption_policy=..., tls_session_cache_partition_policy=...)` controls whether tickets are *stored* and how the cache is keyed, and `session(network_partition_context=NetworkPartitionContext(top_level_site, frame_site))` reproduces the browser's per-site partitioning
+- **H2 DATA framing** — `Client(h2_data_frame_policy=H2DataFramePolicy.BROWSER_DEFAULT / PEER_MAX_FRAME_SIZE / fixed_payload(n) / socket_write_aligned(n))` chooses how request bodies are split into DATA frames
+- **TLS close_notify** — `Client(require_close_notify=True)` rejects a response whose body was truncated without a TLS close_notify alert
 - **Request-level protocol override** — `preferred_http_version` / `idempotency` (0-RTT replay-safety declaration)
-- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
+- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151/152 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
 - **Synthetic fingerprints (advanced)** — Optional feature (`maturin develop --features synthetic-fp`): `Client(randomize=Randomize.recombine())` synthesizes a cross-layer (TLS+H2+H3) unique identity per session; `Randomize.full()` additionally draws out-of-corpus values for H2/QUIC; the `Layers` mask (e.g. `Randomize.recombine_layers(Layers.TLS | Layers.H2)`) restricts which layers are synthesized. Synthetic fingerprints match no real browser and are only for blocklist (negative-model) targets — against an allowlist they fail instantly
 
 ## Installation
@@ -674,6 +676,7 @@ except lkrequest.RequestError as e:
 | `Client.chrome_149()` | Chrome 149 | Chrome 149 | Chrome |
 | `Client.chrome_150()` | Chrome 150 | Chrome 150 | Chrome |
 | `Client.chrome_151()` | Chrome 151 | Chrome 151 | Chrome |
+| `Client.chrome_152()` | Chrome 152 | Chrome 152 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
@@ -697,6 +700,9 @@ TCP fingerprints are OS-specific: `chrome_win` / `chrome_linux` / `chrome_macos`
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | Resource limits / DoS protection |
 | `max_pending_h2_requests` | Cap HTTP/2 requests queued for a remote stream slot (default: unbounded) |
 | `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | Fault-tolerance options |
+| `h2_data_frame_policy` | How request bodies are split into HTTP/2 DATA frames (`H2DataFramePolicy`) |
+| `require_close_notify` | Reject a body truncated without a TLS close_notify alert (default: `False`) |
+| `tls_session_resumption_policy` / `tls_session_cache_partition_policy` | Whether TLS tickets are stored, and how the ticket cache is keyed |
 | `middleware` | Middleware list |
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | Certificate configuration |
 | `ech_config` | ECH configuration |
@@ -706,7 +712,7 @@ TCP fingerprints are OS-specific: `chrome_win` / `chrome_linux` / `chrome_macos`
 
 | Method | Description |
 |------|------|
-| `session(...)` | Create a session |
+| `session(...)` | Create a session (`network_partition_context=...` partitions the TLS ticket cache per site) |
 | `fingerprint_info()` | Return a fingerprint info dict |
 | `randomize_fingerprint(shuffle_extensions=True)` | Return a new Client with a randomized fingerprint |
 

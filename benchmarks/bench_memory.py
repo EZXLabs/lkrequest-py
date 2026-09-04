@@ -4,7 +4,7 @@ import tracemalloc
 import gc
 
 
-TARGET_URL = "https://httpbin.org/get"
+TARGET_URL = "https://postman-echo.com/get"
 NUM_REQUESTS = 50
 
 
@@ -47,7 +47,8 @@ def bench_lkrequest():
 def bench_httpx():
     import httpx
 
-    with httpx.Client(http2=True) as client:
+    # See bench_latency.py: all clients must go direct for a fair comparison.
+    with httpx.Client(http2=True, trust_env=False) as client:
         responses = []
         for _ in range(NUM_REQUESTS):
             resp = client.get(TARGET_URL)
@@ -59,6 +60,7 @@ def bench_requests():
     import requests as req
 
     session = req.Session()
+    session.trust_env = False  # go direct, as lkrequest does
     responses = []
     for _ in range(NUM_REQUESTS):
         resp = session.get(TARGET_URL)

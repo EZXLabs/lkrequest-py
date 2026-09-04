@@ -3,7 +3,7 @@
 import time
 import statistics
 
-TARGET_URL = "https://httpbin.org/get"
+TARGET_URL = "https://postman-echo.com/get"
 WARMUP_ROUNDS = 3
 BENCH_ROUNDS = 20
 
@@ -31,7 +31,10 @@ def bench_lkrequest_blocking():
 def bench_httpx():
     import httpx
 
-    with httpx.Client(http2=True) as client:
+    # trust_env=False: lkrequest never reads the proxy environment variables,
+    # so letting httpx pick up a *_PROXY from the environment would time this
+    # client through an extra proxy hop and the comparison would be meaningless.
+    with httpx.Client(http2=True, trust_env=False) as client:
         for _ in range(WARMUP_ROUNDS):
             client.get(TARGET_URL)
 
@@ -50,6 +53,7 @@ def bench_requests():
     import requests as req
 
     session = req.Session()
+    session.trust_env = False  # go direct, as lkrequest does
 
     for _ in range(WARMUP_ROUNDS):
         session.get(TARGET_URL)

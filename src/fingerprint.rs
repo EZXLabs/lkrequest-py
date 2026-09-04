@@ -118,6 +118,10 @@ impl PyExtType {
     const PRE_SHARED_KEY: u16 = tls_types::ext_type::PRE_SHARED_KEY;
     #[classattr]
     const ENCRYPTED_CLIENT_HELLO: u16 = tls_types::ext_type::ENCRYPTED_CLIENT_HELLO;
+    /// Chromium/BoringSSL's experimental trust anchor IDs extension (used from
+    /// Chrome 152 onwards).
+    #[classattr]
+    const TRUST_ANCHOR_IDS: u16 = tls_types::ext_type::TRUST_ANCHOR_IDS;
 }
 
 // ============================================================
@@ -133,8 +137,14 @@ pub struct PyExtensionSpec {
 #[pymethods]
 impl PyExtensionSpec {
     #[new]
-    #[pyo3(signature = (extension_type, *, source="auto", raw_data=None))]
-    fn new(extension_type: u16, source: &str, raw_data: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (extension_type, *, source="auto", raw_data=None, trust_anchor_ids=None, shuffle=false))]
+    fn new(
+        extension_type: u16,
+        source: &str,
+        raw_data: Option<&str>,
+        trust_anchor_ids: Option<Vec<String>>,
+        shuffle: bool,
+    ) -> PyResult<Self> {
         let ext_source = match source {
             "auto" => ExtensionSource::Auto,
             "grease" => ExtensionSource::Grease,
@@ -148,9 +158,17 @@ impl PyExtensionSpec {
                     data: data.to_string(),
                 }
             }
+            "trust_anchor_ids" => {
+                let ids = trust_anchor_ids.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "trust_anchor_ids (list of hex strings) is required when source='trust_anchor_ids'",
+                    )
+                })?;
+                ExtensionSource::TrustAnchorIds { ids, shuffle }
+            }
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown source: '{}'. Use: auto, grease, raw_bytes",
+                    "Unknown source: '{}'. Use: auto, grease, raw_bytes, trust_anchor_ids",
                     source
                 )))
             }
@@ -174,6 +192,26 @@ impl PyExtensionSpec {
             ExtensionSource::Auto => "auto".to_string(),
             ExtensionSource::Grease => "grease".to_string(),
             ExtensionSource::RawBytes { .. } => "raw_bytes".to_string(),
+            ExtensionSource::TrustAnchorIds { .. } => "trust_anchor_ids".to_string(),
+        }
+    }
+
+    /// The hex identifier list for a trust_anchor_ids source; None otherwise.
+    #[getter]
+    fn trust_anchor_ids(&self) -> Option<Vec<String>> {
+        match &self.inner.source {
+            ExtensionSource::TrustAnchorIds { ids, .. } => Some(ids.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether a trust_anchor_ids source reshuffles on every ClientHello;
+    /// None for other sources.
+    #[getter]
+    fn shuffle(&self) -> Option<bool> {
+        match &self.inner.source {
+            ExtensionSource::TrustAnchorIds { shuffle, .. } => Some(*shuffle),
+            _ => None,
         }
     }
 
@@ -474,6 +512,14 @@ impl PyTlsProfile {
             inner: lktls::profile::presets::chrome_151(),
         }
     }
+    /// Chrome 152: the first Chromium profile that GREASEs `signature_algorithms`
+    /// and carries shuffled trust-anchor identifiers (extension `0xca34`).
+    #[staticmethod]
+    fn chrome_152() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_152(),
+        }
+    }
     /// Chrome 146 QUIC-TLS profile: the ClientHello Chrome sends *inside* QUIC,
     /// which differs from the TCP profile of the same version. Pass it to
     /// `Client(quic_fingerprint=...)`; HTTP/3 otherwise reuses the main TLS profile.
@@ -496,6 +542,13 @@ impl PyTlsProfile {
     fn chrome_151_quic() -> Self {
         PyTlsProfile {
             inner: lktls::profile::presets::chrome_151_quic(),
+        }
+    }
+    /// Chrome 152 QUIC-TLS profile (see `chrome_146_quic`).
+    #[staticmethod]
+    fn chrome_152_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_152_quic(),
         }
     }
     #[staticmethod]
@@ -1009,6 +1062,13 @@ impl PyH2Profile {
     fn chrome_151() -> Self {
         PyH2Profile {
             inner: lkh2::profile::chrome_151_h2(),
+        }
+    }
+    /// Chrome 152 H2 profile: retains Chrome 151's stable SETTINGS / window shape.
+    #[staticmethod]
+    fn chrome_152() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_152_h2(),
         }
     }
     #[staticmethod]

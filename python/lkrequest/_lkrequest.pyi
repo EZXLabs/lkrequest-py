@@ -97,6 +97,60 @@ class SessionResumptionConfig:
     @property
     def max_tickets_per_host(self) -> Optional[int]: ...
 
+class H2DataFramePolicy:
+    """How outbound HTTP/2 DATA payloads are capped; pass to ``Client(h2_data_frame_policy=...)``."""
+
+    BROWSER_DEFAULT: H2DataFramePolicy
+    PEER_MAX_FRAME_SIZE: H2DataFramePolicy
+    @staticmethod
+    def fixed_payload(max_payload: int) -> H2DataFramePolicy:
+        """Cap each DATA payload to ``max_payload`` bytes; raises ValueError if not positive."""
+
+    @staticmethod
+    def socket_write_aligned(max_write_size: int) -> H2DataFramePolicy:
+        """Reserve the 9-byte frame header inside ``max_write_size``; raises ValueError if <= 9."""
+
+class TlsSessionResumptionPolicy:
+    """Whether TLS 1.3 session tickets are cached and offered as PSKs.
+
+    Distinct from ``SessionResumptionConfig``, which is a TLS-profile setting that
+    decides which resumption modes the ClientHello *advertises* (fingerprint shape).
+    """
+
+    BROWSER_DEFAULT: TlsSessionResumptionPolicy
+    DISABLED: TlsSessionResumptionPolicy
+    @staticmethod
+    def enabled(max_tickets_per_server: int) -> TlsSessionResumptionPolicy:
+        """Enable resumption with an explicit ticket capacity; raises ValueError if not positive."""
+
+class TlsSessionCachePartitionPolicy:
+    """Browser-style partitioning of the TLS/QUIC session-ticket cache.
+
+    Browser presets already carry the matching policy (Chromium for Chrome,
+    Firefox for Firefox, Unpartitioned for Safari); set it explicitly only when
+    building a client by hand.
+    """
+
+    UNPARTITIONED: TlsSessionCachePartitionPolicy
+    TOP_LEVEL_SITE: TlsSessionCachePartitionPolicy
+    TOP_LEVEL_AND_FRAME_SITE: TlsSessionCachePartitionPolicy
+    CHROMIUM: TlsSessionCachePartitionPolicy
+    FIREFOX: TlsSessionCachePartitionPolicy
+
+class NetworkPartitionContext:
+    """Browsing context used to derive a session-cache partition key.
+
+    Both sites must be canonical schemeful sites (``https://example.com``), not
+    arbitrary document URLs.
+    """
+
+    def __init__(self, top_level_site: str, frame_site: str) -> None: ...
+    def nonce(self, nonce: str) -> NetworkPartitionContext:
+        """Return a copy with a transient partition nonce attached."""
+
+    def browser_context(self, context: str) -> NetworkPartitionContext:
+        """Return a copy with an opaque browser context (e.g. Firefox OriginAttributes) attached."""
+
 class AcceptEncoding:
     """Content encodings to advertise; combine with ``|`` (e.g. ``AcceptEncoding.GZIP | AcceptEncoding.BR``)."""
 
@@ -342,6 +396,9 @@ class QuicProfile:
     @staticmethod
     def chrome_151() -> QuicProfile:
         """Chrome 151 QUIC fingerprint preset (no ML-DSA signature algorithms)."""
+    @staticmethod
+    def chrome_152() -> QuicProfile:
+        """Chrome 152 QUIC fingerprint preset (drops the obsolete ``google_initial_rtt`` transport parameter)."""
     @staticmethod
     def from_json(json_str: str) -> QuicProfile:
         """Build a QuicProfile from a JSON string."""
@@ -1253,6 +1310,12 @@ class Client:
         quic_fingerprint: Optional[str | TlsProfile] = None,
         quic_profile: Optional[str | QuicProfile] = None,
         randomize: Optional[Randomize] = None,
+        h2_data_frame_policy: Optional[H2DataFramePolicy] = None,
+        require_close_notify: Optional[bool] = None,
+        tls_session_resumption_policy: Optional[TlsSessionResumptionPolicy] = None,
+        tls_session_cache_partition_policy: Optional[
+            TlsSessionCachePartitionPolicy
+        ] = None,
     ) -> None:
         """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options."""
     @staticmethod
@@ -1281,6 +1344,9 @@ class Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def chrome_151() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_152() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_133() -> Client:
@@ -1323,6 +1389,7 @@ class Client:
         https_only: bool = False,
         hsts: Optional[Hsts] = None,
         base_url: Optional[str] = None,
+        network_partition_context: Optional[NetworkPartitionContext] = None,
     ) -> Session:
         """Create a new session, optionally overriding proxy, retry, protocol, and hook settings.
 
@@ -1333,6 +1400,13 @@ class Client:
         """
     def fingerprint_info(self) -> dict[str, Any]:
         """Return a dict describing the client's active TLS/HTTP2/TCP fingerprint."""
+    @property
+    def require_close_notify(self) -> bool:
+        """Whether a bare socket EOF without TLS ``close_notify`` is treated as an error."""
+
+    @property
+    def tls_session_resumption_policy(self) -> TlsSessionResumptionPolicy:
+        """The TLS session-ticket resumption policy in effect for this client."""
     def randomize_fingerprint(
         self,
         *,
@@ -1387,6 +1461,12 @@ class BlockingClient:
         quic_fingerprint: Optional[str | TlsProfile] = None,
         quic_profile: Optional[str | QuicProfile] = None,
         randomize: Optional[Randomize] = None,
+        h2_data_frame_policy: Optional[H2DataFramePolicy] = None,
+        require_close_notify: Optional[bool] = None,
+        tls_session_resumption_policy: Optional[TlsSessionResumptionPolicy] = None,
+        tls_session_cache_partition_policy: Optional[
+            TlsSessionCachePartitionPolicy
+        ] = None,
     ) -> None:
         """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options."""
     @staticmethod
@@ -1415,6 +1495,9 @@ class BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def chrome_151() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_152() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_133() -> BlockingClient:
@@ -1457,6 +1540,7 @@ class BlockingClient:
         https_only: bool = False,
         hsts: Optional[Hsts] = None,
         base_url: Optional[str] = None,
+        network_partition_context: Optional[NetworkPartitionContext] = None,
     ) -> BlockingSession:
         """Create a new session, optionally overriding proxy, retry, protocol, and hook settings.
 
@@ -1467,6 +1551,13 @@ class BlockingClient:
         """
     def fingerprint_info(self) -> dict[str, Any]:
         """Return a dict describing the client's active TLS/HTTP2/TCP fingerprint."""
+    @property
+    def require_close_notify(self) -> bool:
+        """Whether a bare socket EOF without TLS ``close_notify`` is treated as an error."""
+
+    @property
+    def tls_session_resumption_policy(self) -> TlsSessionResumptionPolicy:
+        """The TLS session-ticket resumption policy in effect for this client."""
     def randomize_fingerprint(
         self,
         *,
@@ -1585,6 +1676,7 @@ class ExtType:
     COOKIE: int
     PRE_SHARED_KEY: int
     ENCRYPTED_CLIENT_HELLO: int
+    TRUST_ANCHOR_IDS: int
 
 class ExtensionSpec:
     """Specification of a single TLS extension within a ``TlsProfile``."""
@@ -1595,11 +1687,20 @@ class ExtensionSpec:
         *,
         source: str = "auto",
         raw_data: Optional[str] = None,
+        trust_anchor_ids: Optional[list[str]] = None,
+        shuffle: bool = False,
     ) -> None: ...
     @property
     def extension_type(self) -> int: ...
     @property
     def source(self) -> str: ...
+    @property
+    def trust_anchor_ids(self) -> Optional[list[str]]:
+        """Hex trust-anchor identifiers when ``source='trust_anchor_ids'``, else None."""
+
+    @property
+    def shuffle(self) -> Optional[bool]:
+        """Whether the identifiers are shuffled per ClientHello, else None."""
 
 class GreaseConfig:
     """Controls which TLS ClientHello fields receive GREASE values."""
@@ -1691,6 +1792,9 @@ class TlsProfile:
     def chrome_151() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
     @staticmethod
+    def chrome_152() -> TlsProfile:
+        """Chrome 152: first Chromium preset that GREASEs ``signature_algorithms`` and carries shuffled trust-anchor IDs."""
+    @staticmethod
     def chrome_146_quic() -> TlsProfile:
         """Chrome 146 QUIC-TLS preset (the ClientHello sent inside QUIC), for ``Client(quic_fingerprint=...)``."""
     @staticmethod
@@ -1699,6 +1803,9 @@ class TlsProfile:
     @staticmethod
     def chrome_151_quic() -> TlsProfile:
         """Chrome 151 QUIC-TLS preset: Chrome 150's QUIC ClientHello without the three ML-DSA signature algorithms."""
+    @staticmethod
+    def chrome_152_quic() -> TlsProfile:
+        """Chrome 152 QUIC-TLS preset, for ``Client(quic_fingerprint=...)``."""
     @staticmethod
     def firefox_133() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
@@ -1839,6 +1946,9 @@ class H2Profile:
     @staticmethod
     def chrome_151() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
+    @staticmethod
+    def chrome_152() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (retains Chrome 151's shape)."""
     @staticmethod
     def firefox_133() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""

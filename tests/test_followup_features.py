@@ -23,6 +23,7 @@ NEW_CHROME_PRESETS = [
     "chrome_149",
     "chrome_150",
     "chrome_151",
+    "chrome_152",
 ]
 
 
@@ -67,11 +68,55 @@ class TestNewPresets:
             == lkrequest.H2Profile.chrome_150().to_json()
         )
 
+    def test_chrome_152_is_the_only_preset_that_greases_signature_algorithms(self):
+        # Python mirror of upstream's `chrome_152_is_first_chromium_profile_with_
+        # signature_algorithm_grease`. GREASE placement is a fingerprint-visible
+        # difference, so a preset silently gaining/losing it must fail here.
+        greased = {
+            name
+            for name in NEW_CHROME_PRESETS + ["chrome_131", "chrome_144"]
+            if json.loads(getattr(lkrequest.TlsProfile, name)().to_json())["grease"][
+                "signature_algorithms"
+            ]
+        }
+        assert greased == {"chrome_152"}
+
+    def test_chrome_152_carries_trust_anchor_ids(self):
+        # Python mirror of upstream's `chrome_152_adds_capture_verified_trust_
+        # anchor_ids`: Chrome 152 is the first preset to send extension 0xca34,
+        # whose payload the binding must expose as a shuffled id list.
+        specs = {
+            name: [
+                e
+                for e in json.loads(getattr(lkrequest.TlsProfile, name)().to_json())[
+                    "extensions"
+                ]
+                if e["extension_type"] == lkrequest.ExtType.TRUST_ANCHOR_IDS
+            ]
+            for name in ("chrome_151", "chrome_152")
+        }
+        assert specs["chrome_151"] == []
+        assert len(specs["chrome_152"]) == 1
+        source = specs["chrome_152"][0]["source"]
+        assert source["type"] == "trust_anchor_ids"
+        assert source["shuffle"] is True
+        assert len(source["ids"]) > 1
+        # Every id must be a hex string the extension can actually serialize.
+        assert all(bytes.fromhex(i) for i in source["ids"])
+
+    def test_chrome_152_h2_is_unchanged_from_chrome_151(self):
+        # Upstream ships Chrome 152 with Chrome 151's H2 shape verbatim; if a
+        # future capture diverges this must be a deliberate, reviewed change.
+        assert (
+            lkrequest.H2Profile.chrome_152().to_json()
+            == lkrequest.H2Profile.chrome_151().to_json()
+        )
+
     def test_quic_tls_presets_differ_from_their_tcp_counterparts(self):
         # The QUIC-TLS presets are the ClientHello Chrome sends inside QUIC; they
         # are plain TLS profiles (no quic-h3 feature needed) and must not be
         # confused with the TCP profile of the same version.
-        for name in ("chrome_146", "chrome_150", "chrome_151"):
+        for name in ("chrome_146", "chrome_150", "chrome_151", "chrome_152"):
             tcp = json.loads(getattr(lkrequest.TlsProfile, name)().to_json())
             quic = json.loads(getattr(lkrequest.TlsProfile, f"{name}_quic")().to_json())
             assert quic["name"] == f"{tcp['name']} QUIC"
@@ -125,6 +170,7 @@ class TestNewPresets:
             "chrome_149",
             "chrome_150",
             "chrome_151",
+            "chrome_152",
             "firefox_133",
             "firefox_147",
             "safari_18",
@@ -305,6 +351,223 @@ class TestQuicSurface:
         # profile is reachable only through `Client.chrome_151()`, so the
         # difference is not observable on QuicProfile itself.
         assert profiles["chrome_151"] == profiles["chrome_150"]
+
+    def test_chrome_152_quic_drops_google_initial_rtt(self):
+        # Unlike Chrome 151 (identical to 150), Chrome 152 is the first preset
+        # whose QUIC transport parameters actually differ: it stops sending the
+        # obsolete Google-private `initial_rtt` parameter (0x3127 / 12583).
+        if not hasattr(lkrequest, "QuicProfile"):
+            pytest.skip("built without the quic-h3 feature")
+        google_initial_rtt = 0x3127
+        params = {
+            name: json.loads(getattr(lkrequest.QuicProfile, name)().to_json())[
+                "transport_params"
+            ]
+            for name in ("chrome_151", "chrome_152")
+        }
+        for name, present in (("chrome_151", True), ("chrome_152", False)):
+            ids = {p[0] for p in params[name]["extra_transport_parameters"]}
+            assert (google_initial_rtt in ids) is present
+            assert (
+                google_initial_rtt in params[name]["transport_parameter_order"]
+            ) is present
+
+
+# ==========================================================================
+# Browser network session policies (upstream `network_partition`)
+# ==========================================================================
+
+
+class TestNetworkSessionPolicies:
+    """TLS ticket resumption / cache partitioning / browsing context.
+
+    Construction and client-wiring only — the partition key itself is derived
+    inside the Rust core and has no Python-visible surface.
+    """
+
+    def test_resumption_policy_variants(self):
+        browser_default = lkrequest.TlsSessionResumptionPolicy.BROWSER_DEFAULT
+        assert browser_default == lkrequest.TlsSessionResumptionPolicy.BROWSER_DEFAULT
+        assert browser_default != lkrequest.TlsSessionResumptionPolicy.DISABLED
+        assert lkrequest.TlsSessionResumptionPolicy.enabled(
+            2
+        ) == lkrequest.TlsSessionResumptionPolicy.enabled(2)
+        assert lkrequest.TlsSessionResumptionPolicy.enabled(
+            2
+        ) != lkrequest.TlsSessionResumptionPolicy.enabled(3)
+
+    def test_resumption_policy_rejects_zero_tickets(self):
+        # Upstream asserts on zero inside ClientBuilder, which would surface as a
+        # panic; the binding must reject it up front with a clean ValueError.
+        with pytest.raises(ValueError, match="greater than zero"):
+            lkrequest.TlsSessionResumptionPolicy.enabled(0)
+
+    def test_client_reports_its_resumption_policy(self):
+        assert (
+            lkrequest.Client().tls_session_resumption_policy
+            == lkrequest.TlsSessionResumptionPolicy.BROWSER_DEFAULT
+        )
+        client = lkrequest.Client(
+            tls_session_resumption_policy=lkrequest.TlsSessionResumptionPolicy.enabled(
+                5
+            )
+        )
+        assert (
+            client.tls_session_resumption_policy
+            == lkrequest.TlsSessionResumptionPolicy.enabled(5)
+        )
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "UNPARTITIONED",
+            "TOP_LEVEL_SITE",
+            "TOP_LEVEL_AND_FRAME_SITE",
+            "CHROMIUM",
+            "FIREFOX",
+        ],
+    )
+    def test_partition_policy_accepted_by_client(self, name):
+        policy = getattr(lkrequest.TlsSessionCachePartitionPolicy, name)
+        assert name in repr(policy)
+        assert "Client" in repr(
+            lkrequest.Client(tls_session_cache_partition_policy=policy)
+        )
+
+    def test_partition_context_builders_do_not_mutate(self):
+        base = lkrequest.NetworkPartitionContext(
+            "https://top.example", "https://frame.example"
+        )
+        with_nonce = base.nonce("n1")
+        with_both = with_nonce.browser_context("ctx")
+        assert base != with_nonce
+        assert with_nonce != with_both
+        assert base == lkrequest.NetworkPartitionContext(
+            "https://top.example", "https://frame.example"
+        )
+
+    def test_session_accepts_partition_context(self):
+        context = lkrequest.NetworkPartitionContext(
+            "https://top.example", "https://frame.example"
+        ).browser_context("ctx")
+        session = lkrequest.Client.chrome_152().session(
+            network_partition_context=context
+        )
+        assert "Session" in repr(session)
+
+    def test_require_close_notify_defaults_off_and_is_settable(self):
+        assert lkrequest.Client().require_close_notify is False
+        assert lkrequest.Client(require_close_notify=True).require_close_notify is True
+
+
+class TestH2DataFramePolicy:
+    def test_variants_and_equality(self):
+        assert (
+            lkrequest.H2DataFramePolicy.BROWSER_DEFAULT
+            != lkrequest.H2DataFramePolicy.PEER_MAX_FRAME_SIZE
+        )
+        assert lkrequest.H2DataFramePolicy.fixed_payload(
+            1024
+        ) == lkrequest.H2DataFramePolicy.fixed_payload(1024)
+        assert lkrequest.H2DataFramePolicy.socket_write_aligned(
+            4096
+        ) != lkrequest.H2DataFramePolicy.fixed_payload(4096)
+
+    @pytest.mark.parametrize(
+        ("factory", "bad_value", "message"),
+        [
+            ("fixed_payload", 0, "greater than zero"),
+            ("socket_write_aligned", 9, "9-byte"),
+        ],
+    )
+    def test_rejects_values_upstream_would_panic_on(self, factory, bad_value, message):
+        with pytest.raises(ValueError, match=message):
+            getattr(lkrequest.H2DataFramePolicy, factory)(bad_value)
+
+    def test_accepted_by_client(self):
+        for policy in (
+            lkrequest.H2DataFramePolicy.BROWSER_DEFAULT,
+            lkrequest.H2DataFramePolicy.PEER_MAX_FRAME_SIZE,
+            lkrequest.H2DataFramePolicy.fixed_payload(8192),
+            lkrequest.H2DataFramePolicy.socket_write_aligned(16384),
+        ):
+            assert "Client" in repr(lkrequest.Client(h2_data_frame_policy=policy))
+
+
+class TestTrustAnchorIdsExtensionSpec:
+    def test_round_trips_ids_and_shuffle(self):
+        spec = lkrequest.ExtensionSpec(
+            lkrequest.ExtType.TRUST_ANCHOR_IDS,
+            source="trust_anchor_ids",
+            trust_anchor_ids=["aabb", "ccdd"],
+            shuffle=True,
+        )
+        assert spec.extension_type == lkrequest.ExtType.TRUST_ANCHOR_IDS
+        assert spec.source == "trust_anchor_ids"
+        assert spec.trust_anchor_ids == ["aabb", "ccdd"]
+        assert spec.shuffle is True
+
+    def test_ids_are_required_for_that_source(self):
+        with pytest.raises(ValueError, match="trust_anchor_ids"):
+            lkrequest.ExtensionSpec(
+                lkrequest.ExtType.TRUST_ANCHOR_IDS, source="trust_anchor_ids"
+            )
+
+    def test_other_sources_report_none(self):
+        spec = lkrequest.ExtensionSpec(lkrequest.ExtType.SNI)
+        assert spec.source == "auto"
+        assert spec.trust_anchor_ids is None
+        assert spec.shuffle is None
+
+
+# ==========================================================================
+# Cookie-jar regressions carried over from the upstream RFC-compliance batch
+# ==========================================================================
+
+
+class TestCookiePrefixesAndSecureChannel:
+    """`__Secure-` / `__Host-` prefixes and Secure-over-plaintext rejection.
+
+    Exercised through `set_cookie_raw`, which feeds the same jar path a real
+    `Set-Cookie` header takes, so these need no server.
+    """
+
+    @staticmethod
+    def _jar(url, headers):
+        session = lkrequest.Client.chrome_152().session()
+        for header in headers:
+            session.set_cookie_raw(url, header)
+        return dict(session.get_cookies(url))
+
+    @pytest.mark.parametrize(
+        ("header", "accepted"),
+        [
+            ("__Secure-ok=1; Secure", True),
+            ("__Secure-bad=1", False),  # prefix requires the Secure attribute
+            ("__Host-ok=1; Secure; Path=/", True),
+            ("__Host-nosecure=1; Path=/", False),
+            ("__Host-domain=1; Secure; Path=/; Domain=example.com", False),
+            ("__Host-subpath=1; Secure; Path=/sub", False),
+        ],
+    )
+    def test_cookie_name_prefixes_are_enforced(self, header, accepted):
+        name = header.split("=", 1)[0]
+        jar = self._jar("https://example.com/", ["control=1", header])
+        assert jar.get("control") == "1", "control cookie must always be stored"
+        assert (name in jar) is accepted
+
+    def test_secure_cookie_is_ignored_over_plaintext(self):
+        jar = self._jar(
+            "http://example.com/", ["plain=1", "secure-over-http=1; Secure"]
+        )
+        assert jar == {"plain": "1"}
+
+    def test_secure_cookie_from_https_is_not_sent_over_http(self):
+        session = lkrequest.Client.chrome_152().session()
+        session.set_cookie_raw("https://example.com/", "s=1; Secure")
+        session.set_cookie_raw("https://example.com/", "p=1")
+        assert dict(session.get_cookies("https://example.com/")) == {"s": "1", "p": "1"}
+        assert dict(session.get_cookies("http://example.com/")) == {"p": "1"}
 
 
 # ==========================================================================

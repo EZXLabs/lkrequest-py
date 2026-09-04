@@ -26,6 +26,11 @@ from lkrequest._lkrequest import (
     PoolStats,
     SessionPoolStats,
     SessionResumptionConfig,
+    H2DataFramePolicy,
+    # Browser network session policies
+    TlsSessionResumptionPolicy,
+    TlsSessionCachePartitionPolicy,
+    NetworkPartitionContext,
     # Multipart
     Multipart,
     Part,
@@ -141,6 +146,11 @@ __all__ = [
     "PoolStats",
     "SessionPoolStats",
     "SessionResumptionConfig",
+    "H2DataFramePolicy",
+    # Browser network session policies
+    "TlsSessionResumptionPolicy",
+    "TlsSessionCachePartitionPolicy",
+    "NetworkPartitionContext",
     # Multipart
     "Multipart",
     "Part",

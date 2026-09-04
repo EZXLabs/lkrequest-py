@@ -44,8 +44,8 @@ fn resolve_h2_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkh2::profile::H2Prof
 }
 
 /// Resolve a QUIC profile from a preset name (`"chrome"` / `"chrome_146"` /
-/// `"chrome_150"` / `"chrome_151"`) or a `QuicProfile` object. Requires the `quic-h3` feature;
-/// without it any value is rejected with a clear error.
+/// `"chrome_150"` / `"chrome_151"` / `"chrome_152"`) or a `QuicProfile` object. Requires the
+/// `quic-h3` feature; without it any value is rejected with a clear error.
 #[cfg(feature = "quic-h3")]
 fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProfile> {
     if let Ok(s) = obj.extract::<String>() {
@@ -54,8 +54,9 @@ fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProf
             "chrome_146" => Ok(lkrequest::lkh3::chrome_146_quic()),
             "chrome_150" => Ok(lkrequest::lkh3::chrome_150_quic()),
             "chrome_151" => Ok(lkrequest::lkh3::chrome_151_quic()),
+            "chrome_152" => Ok(lkrequest::lkh3::chrome_152_quic()),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151",
+                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152",
                 s
             ))),
         }
@@ -115,15 +116,30 @@ fn apply_middlewares_to_session(
     builder
 }
 
+/// Resolve a DNS resolver preset name. The three `*_https` (DNS-over-HTTPS)
+/// presets sit behind upstream's `doh` feature; the published wheel always
+/// enables it (see `pyproject.toml`), so user-visible behaviour is unchanged.
+/// A reduced-feature build rejects those three names with an actionable error
+/// rather than a vague "Unknown DNS config".
 fn resolve_dns_config(name: &str) -> PyResult<lkrequest::dns::DnsConfig> {
     match name {
         "system" => Ok(lkrequest::dns::DnsConfig::System),
         "google" => Ok(lkrequest::dns::DnsConfig::Google),
-        "google_https" => Ok(lkrequest::dns::DnsConfig::GoogleHttps),
         "cloudflare" => Ok(lkrequest::dns::DnsConfig::Cloudflare),
-        "cloudflare_https" => Ok(lkrequest::dns::DnsConfig::CloudflareHttps),
         "quad9" => Ok(lkrequest::dns::DnsConfig::Quad9),
+        #[cfg(feature = "doh")]
+        "google_https" => Ok(lkrequest::dns::DnsConfig::GoogleHttps),
+        #[cfg(feature = "doh")]
+        "cloudflare_https" => Ok(lkrequest::dns::DnsConfig::CloudflareHttps),
+        #[cfg(feature = "doh")]
         "quad9_https" => Ok(lkrequest::dns::DnsConfig::Quad9Https),
+        #[cfg(not(feature = "doh"))]
+        "google_https" | "cloudflare_https" | "quad9_https" => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "DNS config '{}' requires building lkrequest-py with the 'doh' feature: maturin develop --features doh",
+                name
+            )))
+        }
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Unknown DNS config: '{}'. Available: system, google, google_https, cloudflare, cloudflare_https, quad9, quad9_https",
             name
@@ -179,6 +195,10 @@ struct ClientConfig {
     quic_fingerprint: Option<lktls::profile::TlsProfile>,
     quic_profile: Option<lkrequest::QuicProfile>,
     randomize: Option<lkrequest::Randomize>,
+    h2_data_frame_policy: Option<lkrequest::H2DataFramePolicy>,
+    require_close_notify: Option<bool>,
+    tls_session_resumption_policy: Option<lkrequest::TlsSessionResumptionPolicy>,
+    tls_session_cache_partition_policy: Option<lkrequest::TlsSessionCachePartitionPolicy>,
 }
 
 fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
@@ -224,6 +244,10 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         quic_fingerprint,
         quic_profile,
         randomize,
+        h2_data_frame_policy,
+        require_close_notify,
+        tls_session_resumption_policy,
+        tls_session_cache_partition_policy,
     } = cfg;
 
     let mut builder = lkrequest::Client::builder();
@@ -417,6 +441,18 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
     if let Some(policy) = randomize {
         builder = builder.randomize(policy);
     }
+    if let Some(policy) = h2_data_frame_policy {
+        builder = builder.h2_data_frame_policy(policy);
+    }
+    if let Some(require) = require_close_notify {
+        builder = builder.require_close_notify(require);
+    }
+    if let Some(policy) = tls_session_resumption_policy {
+        builder = builder.tls_session_resumption_policy(policy);
+    }
+    if let Some(policy) = tls_session_cache_partition_policy {
+        builder = builder.tls_session_cache_partition_policy(policy);
+    }
 
     Ok(builder.build())
 }
@@ -495,6 +531,10 @@ impl PyClient {
         quic_fingerprint=None,
         quic_profile=None,
         randomize=None,
+        h2_data_frame_policy=None,
+        require_close_notify=None,
+        tls_session_resumption_policy=None,
+        tls_session_cache_partition_policy=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -539,6 +579,14 @@ impl PyClient {
         quic_fingerprint: Option<Bound<'py, PyAny>>,
         quic_profile: Option<Bound<'py, PyAny>>,
         randomize: Option<PyRandomize>,
+        h2_data_frame_policy: Option<crate::types::PyH2DataFramePolicy>,
+        require_close_notify: Option<bool>,
+        tls_session_resumption_policy: Option<
+            crate::network_partition::PyTlsSessionResumptionPolicy,
+        >,
+        tls_session_cache_partition_policy: Option<
+            crate::network_partition::PyTlsSessionCachePartitionPolicy,
+        >,
     ) -> PyResult<Self> {
         let tls = tls_profile.as_ref().map(resolve_tls_from_any).transpose()?;
         let h2 = h2_profile.as_ref().map(resolve_h2_from_any).transpose()?;
@@ -596,6 +644,10 @@ impl PyClient {
             quic_fingerprint: quic_fp,
             quic_profile: quic,
             randomize: randomize.map(|r| r.inner),
+            h2_data_frame_policy: h2_data_frame_policy.map(|p| p.inner),
+            require_close_notify,
+            tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
+            tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
         })?;
         tracing::info!(tls = %client.tls_profile().name, "Client created");
         Ok(PyClient { inner: client })
@@ -692,6 +744,16 @@ impl PyClient {
     }
 
     #[staticmethod]
+    fn chrome_152() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_152(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         PyClient {
             inner: build_preset_client(
@@ -731,7 +793,7 @@ impl PyClient {
         }
     }
 
-    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None))]
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
     fn session<'py>(
         &self,
         _py: Python<'py>,
@@ -759,6 +821,7 @@ impl PyClient {
         https_only: bool,
         hsts: Option<PyHsts>,
         base_url: Option<String>,
+        network_partition_context: Option<crate::network_partition::PyNetworkPartitionContext>,
     ) -> PyResult<PySession> {
         let mut builder = self.inner.session();
         if let Some(p) = proxy {
@@ -829,6 +892,9 @@ impl PyClient {
         if let Some(policy) = hsts {
             builder = policy.apply(builder);
         }
+        if let Some(ctx) = network_partition_context {
+            builder = builder.network_partition_context(ctx.inner);
+        }
         let hooks = EventHooks::default();
         if let Some(cb) = on_request {
             hooks
@@ -859,6 +925,24 @@ impl PyClient {
         let tcp_ja4t = self.inner.tcp_fingerprint().and_then(|f| f.to_ja4t());
         dict.set_item("tcp_ja4t", tcp_ja4t)?;
         Ok(dict)
+    }
+
+    /// Whether the peer must send a TLS `close_notify` before closing. When
+    /// True, a bare socket EOF is treated as an error rather than a clean end
+    /// of body. Defaults to False.
+    #[getter]
+    fn require_close_notify(&self) -> bool {
+        self.inner.require_close_notify()
+    }
+
+    /// The TLS session ticket resumption policy in effect for this client.
+    #[getter]
+    fn tls_session_resumption_policy(
+        &self,
+    ) -> crate::network_partition::PyTlsSessionResumptionPolicy {
+        crate::network_partition::PyTlsSessionResumptionPolicy {
+            inner: self.inner.tls_session_resumption_policy(),
+        }
     }
 
     /// Return a copy of this client with TLS-extension randomization enabled.
@@ -965,6 +1049,10 @@ impl PyBlockingClient {
         quic_fingerprint=None,
         quic_profile=None,
         randomize=None,
+        h2_data_frame_policy=None,
+        require_close_notify=None,
+        tls_session_resumption_policy=None,
+        tls_session_cache_partition_policy=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -1009,6 +1097,14 @@ impl PyBlockingClient {
         quic_fingerprint: Option<Bound<'py, PyAny>>,
         quic_profile: Option<Bound<'py, PyAny>>,
         randomize: Option<PyRandomize>,
+        h2_data_frame_policy: Option<crate::types::PyH2DataFramePolicy>,
+        require_close_notify: Option<bool>,
+        tls_session_resumption_policy: Option<
+            crate::network_partition::PyTlsSessionResumptionPolicy,
+        >,
+        tls_session_cache_partition_policy: Option<
+            crate::network_partition::PyTlsSessionCachePartitionPolicy,
+        >,
     ) -> PyResult<Self> {
         let tls = tls_profile.as_ref().map(resolve_tls_from_any).transpose()?;
         let h2 = h2_profile.as_ref().map(resolve_h2_from_any).transpose()?;
@@ -1066,6 +1162,10 @@ impl PyBlockingClient {
             quic_fingerprint: quic_fp,
             quic_profile: quic,
             randomize: randomize.map(|r| r.inner),
+            h2_data_frame_policy: h2_data_frame_policy.map(|p| p.inner),
+            require_close_notify,
+            tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
+            tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
         })?;
         Ok(PyBlockingClient { inner: client })
     }
@@ -1161,6 +1261,16 @@ impl PyBlockingClient {
     }
 
     #[staticmethod]
+    fn chrome_152() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_152(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         PyBlockingClient {
             inner: build_preset_client(
@@ -1200,7 +1310,7 @@ impl PyBlockingClient {
         }
     }
 
-    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None))]
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
     fn session<'py>(
         &self,
         _py: Python<'py>,
@@ -1228,6 +1338,7 @@ impl PyBlockingClient {
         https_only: bool,
         hsts: Option<PyHsts>,
         base_url: Option<String>,
+        network_partition_context: Option<crate::network_partition::PyNetworkPartitionContext>,
     ) -> PyResult<PyBlockingSession> {
         let mut builder = self.inner.session();
         if let Some(p) = proxy {
@@ -1298,6 +1409,9 @@ impl PyBlockingClient {
         if let Some(policy) = hsts {
             builder = policy.apply(builder);
         }
+        if let Some(ctx) = network_partition_context {
+            builder = builder.network_partition_context(ctx.inner);
+        }
         let hooks = EventHooks::default();
         if let Some(cb) = on_request {
             hooks
@@ -1328,6 +1442,24 @@ impl PyBlockingClient {
         let tcp_ja4t = self.inner.tcp_fingerprint().and_then(|f| f.to_ja4t());
         dict.set_item("tcp_ja4t", tcp_ja4t)?;
         Ok(dict)
+    }
+
+    /// Whether the peer must send a TLS `close_notify` before closing. When
+    /// True, a bare socket EOF is treated as an error rather than a clean end
+    /// of body. Defaults to False.
+    #[getter]
+    fn require_close_notify(&self) -> bool {
+        self.inner.require_close_notify()
+    }
+
+    /// The TLS session ticket resumption policy in effect for this client.
+    #[getter]
+    fn tls_session_resumption_policy(
+        &self,
+    ) -> crate::network_partition::PyTlsSessionResumptionPolicy {
+        crate::network_partition::PyTlsSessionResumptionPolicy {
+            inner: self.inner.tls_session_resumption_policy(),
+        }
     }
 
     /// Return a copy of this client with TLS-extension randomization enabled.

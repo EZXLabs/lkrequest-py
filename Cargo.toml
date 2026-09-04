@@ -1,6 +1,6 @@
 [package]
 name = "lkrequest-py"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -57,6 +57,11 @@ telemetry = ["lkrequest/telemetry"]
 # enabled by accident against allowlist targets (where it fails instantly).
 # Build with: maturin develop --features synthetic-fp
 synthetic-fp = ["lkrequest/synthetic-fp"]
+# DNS-over-HTTPS resolvers. Upstream moved `DnsConfig::{Google,Cloudflare,Quad9}Https`
+# behind its own `doh` feature, so without this the `dns="*_https"` presets do not
+# exist. Kept in the default wheel build (see pyproject.toml) so those values keep
+# working exactly as before.
+doh = ["lkrequest/doh"]
 
 [lints.clippy]
 unwrap_used = "warn"

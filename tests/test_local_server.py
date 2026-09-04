@@ -6,6 +6,8 @@ to misbehave on cue stand up their own raw socket server instead.
 """
 
 import asyncio
+import json
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -42,6 +44,178 @@ def test_ca_cert_pem_is_accepted(server_url, server_ca):
     )
     resp = client.session().get(f"{server_url}/get")
     assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("status", "followed"),
+    [
+        (300, False),  # Multiple Choices — no single target to follow
+        (301, True),
+        (302, True),
+        (303, True),
+        (304, False),  # Not Modified — a cache response, not a redirect
+        (305, False),  # Use Proxy — deprecated, must never be honoured
+        (306, False),  # unused/reserved
+        (307, True),
+        (308, True),
+    ],
+)
+def test_only_real_redirect_statuses_are_followed(server_url, status, followed):
+    # Upstream `do not treat 304/300/305/306 as redirects`: those carry a
+    # Location header here, so a client that keys off "3xx + Location" would
+    # wrongly follow them and hide the original status from the caller.
+    client = BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    resp = client.session().get(
+        f"{server_url}/redirect-to?url=/get&status_code={status}"
+    )
+    if followed:
+        assert resp.status_code == 200
+        assert resp.url.endswith("/get")
+    else:
+        assert resp.status_code == status
+        assert "/redirect-to" in resp.url
+
+
+# ---------------------------------------------------------------------------
+# WebSocket handshake (RFC 6455 §4.1 / §5.5)
+# ---------------------------------------------------------------------------
+#
+# These run against the local `/ws-echo` endpoint rather than the public
+# echo.websocket.org tests in test_client.py, which are skipped unless
+# LKREQUEST_WS_LIVE=1 — so before this the whole upgrade path was unexercised
+# in CI. Upstream now *enforces* the §4.1 response checks that previously only
+# logged a warning, which uncovered that `Sec-WebSocket-Accept` was being
+# computed with a GUID that is not the one §1.3 specifies. Completing a
+# handshake against a conforming server is what pins both.
+
+
+def test_ws_handshake_and_echo_blocking(ws_server_url):
+    client = BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    ws = client.session().ws_connect(f"{ws_server_url}/ws-echo")
+    try:
+        ws.send_text("hello")
+        echo = ws.recv()
+        assert echo.is_text()
+        assert echo == lkrequest.WsMessage.text("hello")
+
+        ws.send_binary(b"\x01\x02\x03")
+        binary_echo = ws.recv()
+        assert binary_echo.is_binary()
+        assert binary_echo == lkrequest.WsMessage.binary(b"\x01\x02\x03")
+    finally:
+        ws.close()
+
+
+@pytest.mark.asyncio
+async def test_ws_handshake_and_echo_async(ws_server_url):
+    client = lkrequest.Client(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    ws = await client.session().ws_connect(f"{ws_server_url}/ws-echo")
+    try:
+        await ws.send_text("hello async")
+        echo = await ws.recv()
+        assert echo == lkrequest.WsMessage.text("hello async")
+    finally:
+        await ws.close()
+
+
+def test_ws_upgrade_rejects_a_non_websocket_endpoint(ws_server_url):
+    # A 101 is the only acceptable status: an ordinary HTTP endpoint answering
+    # an Upgrade request must fail the connection, not hand back a stream.
+    client = BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    with pytest.raises(lkrequest.RequestError, match="WebSocket upgrade failed"):
+        client.session().ws_connect(f"{ws_server_url}/get")
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        999,  # below the assigned range
+        1004,  # reserved, no defined meaning
+        1005,  # "no status code present" — MUST NOT be sent
+        1006,  # "closed abnormally" — MUST NOT be sent
+        1015,  # "TLS handshake failure" — MUST NOT be sent
+        2000,  # unassigned
+        5000,  # outside every defined range
+    ],
+)
+def test_ws_close_rejects_codes_that_may_not_go_on_the_wire(ws_server_url, code):
+    client = BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    ws = client.session().ws_connect(f"{ws_server_url}/ws-echo")
+    try:
+        with pytest.raises(lkrequest.RequestError):
+            ws.close(code)
+        # Rejected before anything reached the wire, so the connection is still
+        # usable and a legal code still closes it.
+        ws.send_text("still open")
+        assert ws.recv().is_text()
+    finally:
+        ws.close(1000)
+
+
+def _ws_handshake_seen_by_server(ws_server_url, probe):
+    """Ask `/ws-echo` what request line and Host header it actually received."""
+    client = BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    ws = client.session().ws_connect(f"{ws_server_url}/ws-echo")
+    try:
+        ws.send_text(probe)
+        return json.loads(ws.recv().data)
+    finally:
+        ws.close()
+
+
+@pytest.mark.xfail(
+    reason="upstream ws_upgrade_h1 sends absolute-form; see "
+    "docs/UPSTREAM-WS-REQUEST-TARGET.md",
+    strict=True,
+)
+def test_ws_upgrade_uses_an_origin_form_request_target(
+    ws_server_url, ws_handshake_probe
+):
+    # RFC 9112 §3.2.2: a client sends absolute-form only to a proxy; to an
+    # origin server the target MUST be origin-form. Upstream builds the request
+    # URI as `https://{host}{path}`, so the whole URI goes out as the target and
+    # any server that routes on the path (here hypercorn) misroutes the upgrade.
+    seen = _ws_handshake_seen_by_server(ws_server_url, ws_handshake_probe)
+    assert seen["raw_path"] == "/ws-echo"
+
+
+@pytest.mark.xfail(
+    reason="upstream ws_upgrade_h1 drops the port from Host; see "
+    "docs/UPSTREAM-WS-REQUEST-TARGET.md",
+    strict=True,
+)
+def test_ws_upgrade_host_header_carries_the_port(ws_server_url, ws_handshake_probe):
+    # RFC 9110 §7.2: Host carries the port whenever it is not the scheme
+    # default. Upstream reuses the bare hostname as the authority, so a
+    # non-443 wss:// endpoint is addressed as if it were on 443 — invisible
+    # against public servers, wrong against anything vhosted on another port.
+    port = urlsplit(ws_server_url).port
+    seen = _ws_handshake_seen_by_server(ws_server_url, ws_handshake_probe)
+    assert seen["host"] == f"127.0.0.1:{port}"
+
+
+def test_ws_close_reason_must_fit_in_a_control_frame(ws_server_url):
+    # RFC 6455 §5.5 caps a control frame payload at 125 bytes, 2 of which the
+    # status code takes — so 123 bytes of reason is the limit.
+    client = BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    ws = client.session().ws_connect(f"{ws_server_url}/ws-echo")
+    with pytest.raises(lkrequest.RequestError):
+        ws.close(1000, "x" * 124)
+    ws.close(1000, "x" * 123)
 
 
 def test_tls_verification_is_enforced(server_url):

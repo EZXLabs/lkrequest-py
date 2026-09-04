@@ -30,9 +30,11 @@ Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性�
 - **ECH** — Encrypted Client Hello 支持，包括 TLS/QUIC HelloRetryRequest 处理
 - **请求优先级** — `RequestPriority`（RFC 9218 urgency/incremental），`session.get(url, priority=...)`
 - **协议策略** — `ProtocolPolicy` / `HttpIntent` 控制 H2/H3 选择、获取与回退（client / session / 请求级）
-- **会话恢复控制** — `SessionResumptionConfig` 控制 TLS1.3 PSK / TLS1.2 ticket 恢复
+- **会话恢复控制** — `SessionResumptionConfig` 控制 TLS1.3 PSK / TLS1.2 ticket 恢复（指纹形态层）；`Client(tls_session_resumption_policy=..., tls_session_cache_partition_policy=...)` 控制 ticket 是否**存储**以及缓存如何分键，`session(network_partition_context=NetworkPartitionContext(top_level_site, frame_site))` 复现浏览器的按站点分区行为
+- **H2 DATA 分帧** — `Client(h2_data_frame_policy=H2DataFramePolicy.BROWSER_DEFAULT / PEER_MAX_FRAME_SIZE / fixed_payload(n) / socket_write_aligned(n))` 选择请求体如何切分为 DATA 帧
+- **TLS close_notify** — `Client(require_close_notify=True)` 拒绝未收到 TLS close_notify 警报就被截断的响应体
 - **请求级协议覆盖** — `preferred_http_version` / `idempotency`（0-RTT 重放安全声明）
-- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
+- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151/152 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
 - **合成指纹（高级）** — 可选 feature（`maturin develop --features synthetic-fp`）：`Client(randomize=Randomize.recombine())` 为每个 session 合成一个跨层（TLS+H2+H3）唯一身份；`Randomize.full()` 进一步对 H2/QUIC 取语料外数值；`Layers` 掩码（如 `Randomize.recombine_layers(Layers.TLS | Layers.H2)`）限定合成层。合成指纹不匹配任何真实浏览器，仅用于黑名单（negative-model）目标，对白名单会立即失败
 
 ## 安装
@@ -673,6 +675,7 @@ except lkrequest.RequestError as e:
 | `Client.chrome_149()` | Chrome 149 | Chrome 149 | Chrome |
 | `Client.chrome_150()` | Chrome 150 | Chrome 150 | Chrome |
 | `Client.chrome_151()` | Chrome 151 | Chrome 151 | Chrome |
+| `Client.chrome_152()` | Chrome 152 | Chrome 152 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
@@ -696,6 +699,9 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | 资源限制 / 抗 DoS |
 | `max_pending_h2_requests` | 限制等待 HTTP/2 流槽位的排队请求数（默认不限）|
 | `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | 容错选项 |
+| `h2_data_frame_policy` | 请求体如何切分为 HTTP/2 DATA 帧（`H2DataFramePolicy`） |
+| `require_close_notify` | 拒绝未收到 TLS close_notify 就被截断的响应体（默认 `False`） |
+| `tls_session_resumption_policy` / `tls_session_cache_partition_policy` | TLS ticket 是否存储，以及 ticket 缓存如何分键 |
 | `middleware` | 中间件列表 |
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | 证书配置 |
 | `ech_config` | ECH 配置 |
@@ -705,7 +711,7 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 
 | 方法 | 说明 |
 |------|------|
-| `session(...)` | 创建会话 |
+| `session(...)` | 创建会话（`network_partition_context=...` 按站点分区 TLS ticket 缓存） |
 | `fingerprint_info()` | 返回指纹信息 dict |
 | `randomize_fingerprint(shuffle_extensions=True)` | 返回指纹随机化后的新 Client |
 

@@ -1,5 +1,4 @@
-httpx
+httpx[http2]
 aiohttp
 requests
 pytest-benchmark
-tracemalloc

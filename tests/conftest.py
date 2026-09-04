@@ -15,9 +15,11 @@ from __future__ import annotations
 import asyncio
 import datetime
 import ipaddress
+import json
 import socket
 import threading
 import time
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -128,6 +130,81 @@ def _with_early_hints(inner):
     return app
 
 
+#: Text frame that makes `/ws-echo` reply with JSON describing the handshake
+#: request it received, instead of echoing. Exposed as the `ws_handshake_probe`
+#: fixture.
+_WS_HANDSHAKE_PROBE = "__handshake__"
+
+
+def _with_websocket_echo(inner):
+    """Add a `/ws-echo` WebSocket endpoint that echoes every frame it receives.
+
+    httpbin has no WebSocket route, so without this the only coverage for
+    `session.ws_connect(...)` is the live wss://echo.websocket.org test, which
+    is skipped by default. That matters more than it looks: the client fails
+    the connection unless the server's `Sec-WebSocket-Accept` matches
+    base64(SHA1(key + RFC 6455 GUID)), so a conforming server is what pins the
+    handshake. Hypercorn computes the token per spec, which is exactly the
+    property under test — a client-side GUID or validation regression cannot
+    complete a handshake against it.
+
+    The route match runs on `urlsplit(...).path` because upstream sends the
+    upgrade in absolute-form, so the whole URI arrives as the ASGI `path`. That
+    defect is pinned separately by the xfail tests in test_local_server.py and
+    written up in docs/UPSTREAM-WS-REQUEST-TARGET.md; normalising here keeps it
+    from blocking the handshake coverage above.
+
+    Sending `_WS_HANDSHAKE_PROBE` gets back JSON describing the request line and
+    Host header the server saw, which is how those xfail tests observe them.
+
+    Anything that is not a WebSocket scope is delegated untouched.
+    """
+
+    async def app(scope, receive, send):
+        if scope["type"] != "websocket":
+            await inner(scope, receive, send)
+            return
+
+        message = await receive()
+        if message["type"] != "websocket.connect":
+            return
+        if urlsplit(scope.get("path", "")).path != "/ws-echo":
+            await send({"type": "websocket.close", "code": 1000})
+            return
+
+        await send({"type": "websocket.accept"})
+        while True:
+            message = await receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if message["type"] != "websocket.receive":
+                continue
+            text = message.get("text")
+            if text == _WS_HANDSHAKE_PROBE:
+                host = next(
+                    (v for k, v in scope.get("headers", []) if k == b"host"), b""
+                )
+                await send(
+                    {
+                        "type": "websocket.send",
+                        "text": json.dumps(
+                            {
+                                "raw_path": scope.get("raw_path", b"").decode(
+                                    "latin-1"
+                                ),
+                                "host": host.decode("latin-1"),
+                            }
+                        ),
+                    }
+                )
+            elif text is not None:
+                await send({"type": "websocket.send", "text": text})
+            elif message.get("bytes") is not None:
+                await send({"type": "websocket.send", "bytes": message["bytes"]})
+
+    return app
+
+
 def _start_server(cert_file, key_file, ca_pem, *, with_quic: bool) -> _ServerHandle:
     """Start a hypercorn httpbin server in a background thread.
 
@@ -142,7 +219,7 @@ def _start_server(cert_file, key_file, ca_pem, *, with_quic: bool) -> _ServerHan
     from hypercorn.config import Config
 
     port = _free_port()
-    asgi_app = _with_early_hints(WsgiToAsgi(flask_app))
+    asgi_app = _with_websocket_echo(_with_early_hints(WsgiToAsgi(flask_app)))
 
     config = Config()
     config.bind = [f"127.0.0.1:{port}"]
@@ -217,6 +294,18 @@ def server_url(_server) -> str:
 def server_ca(_server) -> bytes:
     """PEM bytes of the server's self-signed cert (for pinning via ca_cert_pem)."""
     return _server.ca_pem
+
+
+@pytest.fixture(scope="session")
+def ws_server_url(_server) -> str:
+    """`wss://` base URL of the same server; `/ws-echo` is the echo endpoint."""
+    return f"wss://127.0.0.1:{_server.port}"
+
+
+@pytest.fixture(scope="session")
+def ws_handshake_probe() -> str:
+    """Text frame that makes `/ws-echo` describe the handshake it received."""
+    return _WS_HANDSHAKE_PROBE
 
 
 @pytest.fixture(scope="session")

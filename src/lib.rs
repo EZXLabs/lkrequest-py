@@ -21,6 +21,7 @@ mod hsts;
 mod metrics;
 mod middleware;
 mod multipart;
+mod network_partition;
 mod priority;
 mod protocol;
 mod proxy;
@@ -58,6 +59,13 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyPoolStats>()?;
     m.add_class::<types::PySessionPoolStats>()?;
     m.add_class::<types::PySessionResumptionConfig>()?;
+    m.add_class::<types::PyH2DataFramePolicy>()?;
+
+    // Browser-style network session policies (ticket resumption / cache
+    // partitioning / browsing context)
+    m.add_class::<network_partition::PyTlsSessionResumptionPolicy>()?;
+    m.add_class::<network_partition::PyTlsSessionCachePartitionPolicy>()?;
+    m.add_class::<network_partition::PyNetworkPartitionContext>()?;
 
     // Multipart
     m.add_class::<multipart::PyMultipart>()?;
