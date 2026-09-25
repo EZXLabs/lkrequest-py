@@ -14,6 +14,7 @@ from lkrequest._lkrequest import (
     StreamingResponse,
     HeaderMap,
     RedirectRecord,
+    Cookie,
     # Blocking API
     BlockingStreamingResponse,
     BlockingClient,
@@ -91,6 +92,7 @@ from lkrequest._lkrequest import (
     TimeoutError as LkTimeoutError,
     TooManyRedirectsError,
     ResourceLimitError,
+    JsonDecodeError,
     # Functions
     set_log_level,
     enable_metrics,
@@ -107,6 +109,13 @@ from lkrequest._lkrequest import (
 # warning for this conditional import.
 try:
     from lkrequest._lkrequest import QuicProfile as QuicProfile
+except ImportError:
+    pass
+
+# MasqueConfig (the MASQUE proxy's outer-hop configuration) is only present when
+# built with the `masque` feature (maturin develop --features masque).
+try:
+    from lkrequest._lkrequest import MasqueConfig as MasqueConfig
 except ImportError:
     pass
 
@@ -134,6 +143,7 @@ __all__ = [
     "StreamingResponse",
     "HeaderMap",
     "RedirectRecord",
+    "Cookie",
     # Blocking API
     "BlockingClient",
     "BlockingSession",
@@ -211,6 +221,7 @@ __all__ = [
     "LkTimeoutError",
     "TooManyRedirectsError",
     "ResourceLimitError",
+    "JsonDecodeError",
     # Functions
     "set_log_level",
     "enable_metrics",
@@ -224,8 +235,9 @@ __all__ = [
 # Feature-gated symbols: only export the ones that were actually importable so
 # that `from lkrequest import *` does not fail on a build without the feature.
 # - QuicProfile requires the `quic-h3` build feature
+# - MasqueConfig requires the `masque` build feature
 # - Layers / NegotiabilityFloor require the `synthetic-fp` build feature
-for _optional_name in ("QuicProfile", "Layers", "NegotiabilityFloor"):
+for _optional_name in ("QuicProfile", "MasqueConfig", "Layers", "NegotiabilityFloor"):
     if _optional_name in globals():
         __all__.append(_optional_name)
 del _optional_name

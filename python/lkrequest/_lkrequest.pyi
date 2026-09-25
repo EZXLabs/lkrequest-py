@@ -1,6 +1,21 @@
 """Type stubs for the lkrequest native extension module."""
 
-from typing import Any, AsyncIterator, Callable, Iterable, Iterator, Optional
+import json
+from typing import (
+    Any,
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Iterator,
+    Optional,
+    Protocol,
+)
+
+class _SupportsRead(Protocol):
+    """A binary file-like object, as accepted by ``body_stream``."""
+
+    def read(self, size: int = ..., /) -> bytes: ...
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -29,6 +44,14 @@ class TooManyRedirectsError(RequestError):
 
 class ResourceLimitError(RequestError):
     """Raised when a configured resource limit (e.g. body size) is exceeded."""
+
+class JsonDecodeError(json.JSONDecodeError, RequestError):
+    """Raised by ``Response.json()`` when the body is not valid JSON.
+
+    Subclasses both ``RequestError`` and ``json.JSONDecodeError``, so either
+    ``except`` catches it, and it carries the stdlib exception's ``msg``,
+    ``doc``, ``pos``, ``lineno`` and ``colno``.
+    """
 
 # ---------------------------------------------------------------------------
 # Configuration types
@@ -400,6 +423,23 @@ class QuicProfile:
     def chrome_152() -> QuicProfile:
         """Chrome 152 QUIC fingerprint preset (drops the obsolete ``google_initial_rtt`` transport parameter)."""
     @staticmethod
+    def chrome_153() -> QuicProfile:
+        """Chrome 153 QUIC fingerprint preset.
+
+        Like the other captured Chromium profiles it follows Chromium's own
+        GREASE generation rules, so the reserved H3 SETTINGS, the reserved
+        transport parameters and the Initial packet layout are re-randomized per
+        connection rather than fixed.
+        """
+    @staticmethod
+    def chrome_154() -> QuicProfile:
+        """Chrome 154 QUIC fingerprint preset, identical to Chrome 153.
+
+        The public capture verified QUIC through the Initial flight; the H3
+        SETTINGS and request priority carry over from Chrome 153's completed
+        navigation, since that capture path never received a QUIC response.
+        """
+    @staticmethod
     def from_json(json_str: str) -> QuicProfile:
         """Build a QuicProfile from a JSON string."""
     def to_json(self) -> str:
@@ -408,6 +448,59 @@ class QuicProfile:
         """Validate the profile, raising on inconsistent settings."""
     @property
     def connection_id_length(self) -> int: ...
+
+# ---------------------------------------------------------------------------
+# MASQUE (only available when built with the `masque` feature)
+# ---------------------------------------------------------------------------
+
+class MasqueConfig:
+    """The hop to a MASQUE (RFC 9298 CONNECT-UDP) proxy: the outer HTTP/3 connection tunnels ride on.
+
+    **Experimental** upstream and in this binding: this class, the
+    ``masque=`` / ``tunnel_probe=`` parameters and the behaviour of
+    ``masque://`` routes may change in any release without a deprecation
+    period. Pass it as ``Client(masque=...)`` and, to probe MASQUE proxies in a
+    pool, as ``HealthCheckConfig(masque=...)``.
+
+    Trust is configured here separately from the client's ``verify`` /
+    ``ca_cert*`` options, and neither inherits from the other. ``ca_cert`` is a
+    PEM file path and ``ca_cert_pem`` PEM bytes; a bundle that is malformed or
+    holds no certificate raises ``ValueError``. ``verify=False`` skips outer
+    certificate verification entirely and is for development only: anything
+    answering on the proxy's address then sees every tunnel's target.
+
+    ``tunnel_idle_timeout`` (seconds; ``None`` never retires an idle tunnel)
+    and ``max_idle_tunnels`` (``0`` removes the cap) bound how many tunnels the
+    proxy is asked to keep open.
+
+    The outer connection is not a browser fingerprint; the tunneled connection
+    to the origin still is.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_name: Optional[str] = None,
+        ca_cert: Optional[str] = None,
+        ca_cert_pem: Optional[bytes] = None,
+        use_native_certs: bool = True,
+        verify: bool = True,
+        tunnel_idle_timeout: Optional[float] = 120.0,
+        max_idle_tunnels: int = 256,
+    ) -> None: ...
+    @property
+    def server_name(self) -> Optional[str]: ...
+    @property
+    def use_native_certs(self) -> bool: ...
+    @property
+    def verify(self) -> bool: ...
+    @property
+    def ca_cert_count(self) -> int:
+        """Number of extra trust anchors loaded from ``ca_cert`` / ``ca_cert_pem``."""
+    @property
+    def tunnel_idle_timeout(self) -> Optional[float]: ...
+    @property
+    def max_idle_tunnels(self) -> int: ...
 
 # ---------------------------------------------------------------------------
 # Middleware
@@ -436,7 +529,13 @@ class ProxyConfig:
     """Immutable single-proxy or ordered multi-hop proxy-chain configuration."""
 
     def __init__(self, url: str) -> None:
-        """Parse a single HTTP CONNECT, SOCKS5, or SOCKS5H proxy URL."""
+        """Parse a single HTTP CONNECT, SOCKS5, SOCKS5H or (with the ``masque`` feature) MASQUE proxy URL.
+
+        A ``masque://`` proxy carries HTTP/3 only: HTTP/1.1 and HTTP/2 requests
+        through it raise ``ProxyError``, and a failed tunnel never falls back to
+        a direct connection, even with ``proxy_fallback_direct``. It cannot be
+        a hop in a proxy chain.
+        """
     @staticmethod
     def parse(url: str) -> ProxyConfig:
         """Parse a single proxy URL."""
@@ -445,6 +544,27 @@ class ProxyConfig:
         """Build an ordered proxy chain from client-facing hop to final hop."""
     def through(self, hops: Iterable[str | ProxyConfig]) -> ProxyConfig:
         """Return a new config with the supplied upstream hops prepended."""
+    def with_user_pass(self, username: str, password: str) -> ProxyConfig:
+        """Return a new config authenticating this hop with a username and password.
+
+        Replaces any credential already set, including one from the URL.
+        """
+    def with_http_auth(self, scheme: str, credentials: str) -> ProxyConfig:
+        """Return a new config authenticating this hop with a static HTTP credential.
+
+        ``credentials`` is sent as-is after ``scheme`` (``Bearer``,
+        ``Preshared``, ...), so it must already be encoded. Replaces any
+        credential already set. Raises ``ValueError`` on a SOCKS5 proxy, which
+        has no header to carry it in.
+        """
+    def with_auth_header(self, header: str) -> ProxyConfig:
+        """Return a new config that sends the credential in ``header``.
+
+        ``"proxy-authorization"`` (the default) or ``"authorization"``, case
+        insensitive; anything else raises ``ValueError``. Some MASQUE deployments read
+        ``Authorization`` instead; RFC 9298 does not specify proxy
+        authentication, so there is no single right answer.
+        """
     def hop_count(self) -> int:
         """Return the total number of proxy hops."""
     def identity(self) -> str:
@@ -473,7 +593,16 @@ class HealthCheckConfig:
         timeout: float = 5.0,
         target_host: str = "www.google.com",
         target_port: int = 443,
-    ) -> None: ...
+        tunnel_probe: bool = False,
+        masque: Optional[MasqueConfig] = None,
+    ) -> None:
+        """A plain check only proves a TCP connect, which says nothing about a
+        MASQUE proxy, so MASQUE proxies are skipped by default: neither credited
+        nor blacklisted. ``tunnel_probe=True`` opens a real CONNECT-UDP tunnel to
+        the target instead, verifying the proxy against ``masque``, which is
+        then required (``ValueError`` otherwise). Both need the ``masque``
+        feature.
+        """
 
 class ProxyPool:
     """Pool of proxies with rotation, bad-proxy cooldown, and optional health checks."""
@@ -526,6 +655,47 @@ class RedirectRecord:
     @property
     def headers(self) -> HeaderMap: ...
 
+class Cookie:
+    """A cookie from a session's jar, with the attributes that decide when it is sent.
+
+    Returned by ``get_cookies_with_attrs()`` and ``get_all_cookies()``. Unlike
+    the ``(name, value)`` pairs from ``get_cookies()``, this distinguishes two
+    cookies that share a name at different paths, and carries what a browser
+    context or an on-disk jar needs.
+
+    Hashable and comparable, so two jars can be diffed with set operations.
+    """
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> str: ...
+    @property
+    def domain(self) -> Optional[str]:
+        """The domain the cookie is scoped to."""
+    @property
+    def host_only(self) -> bool:
+        """True when only :attr:`domain` itself matches, because no ``Domain``
+        attribute was sent; False when subdomains match too."""
+    @property
+    def path(self) -> str:
+        """The effective path: the ``Path`` attribute, or the default path
+        derived from the request URI when the server sent none."""
+    @property
+    def secure(self) -> bool: ...
+    @property
+    def http_only(self) -> bool: ...
+    @property
+    def same_site(self) -> Optional[str]:
+        """``"Strict"``, ``"Lax"`` or ``"None"``, or ``None`` when unset."""
+    @property
+    def expires(self) -> Optional[int]:
+        """Expiry as a Unix timestamp in whole seconds, or ``None`` for a
+        session cookie. Pass to ``datetime.fromtimestamp()`` for a datetime."""
+    @property
+    def is_persistent(self) -> bool:
+        """True when the cookie has an expiry, and so is worth persisting."""
+
 class Response:
     """A completed HTTP response with status, headers, body, cookies, and diagnostics."""
 
@@ -552,7 +722,7 @@ class Response:
         """Cookies set by this response."""
     @property
     def encoding(self) -> Optional[str]:
-        """The detected character encoding, if any."""
+        """The charset declared in ``Content-Type``, if any."""
     @property
     def elapsed(self) -> float:
         """Total request duration in seconds."""
@@ -571,10 +741,29 @@ class Response:
     @property
     def was_redirected(self) -> bool:
         """True if the request went through one or more redirects."""
-    def text(self) -> str:
-        """Decode and return the body as text (cached after first call)."""
+    def text(self, encoding: Optional[str] = None) -> str:
+        """Decode and return the body as text.
+
+        Uses the charset declared in ``Content-Type`` (see :attr:`encoding`),
+        resolved against the WHATWG Encoding Standard as a browser would, and
+        falls back to UTF-8 when none is declared or the label is unusable.
+
+        Pass ``encoding`` to override it. That argument is looked up in Python's
+        own codec registry, so Python spellings work (``latin-1``,
+        ``utf-8-sig``, ``cp936``); an unknown codec raises ``LookupError``,
+        as ``bytes.decode`` would.
+
+        Malformed bytes become U+FFFD rather than raising — use :attr:`content`
+        when the exact bytes matter. A leading BOM is stripped, and one that
+        contradicts the declared charset is believed over it, as a browser would.
+
+        Cached after the first call, except when ``encoding`` is given.
+        """
     def json(self) -> Any:
-        """Parse and return the body as JSON (cached after first call)."""
+        """Parse and return the body as JSON (cached after first call).
+
+        Raises ``JsonDecodeError`` if the body is not valid JSON.
+        """
     def error_for_status(self) -> None:
         """Raise ``HttpStatusError`` if the status code is 4xx or 5xx."""
     def __len__(self) -> int: ...
@@ -595,8 +784,15 @@ class StreamingResponse:
         """Read the next decompressed body chunk, or ``None`` at end of stream."""
     async def bytes(self) -> bytes:
         """Read the entire remaining body into bytes."""
-    async def text(self) -> str:
-        """Read the entire remaining body and decode it as text."""
+    async def text(self, encoding: Optional[str] = None) -> str:
+        """Read the entire remaining body and decode it as text.
+
+        Decoded exactly like ``Response.text()``: the charset ``Content-Type``
+        declares (UTF-8 when there is none), or the codec named by
+        ``encoding``, which is looked up in Python's codec registry. Bytes
+        that cannot be decoded become U+FFFD instead of raising, and an unknown
+        ``encoding`` raises ``LookupError``.
+        """
     def __aiter__(self) -> AsyncIterator[bytes]: ...
     async def __anext__(self) -> bytes: ...
 
@@ -615,8 +811,15 @@ class BlockingStreamingResponse:
         """Read the next decompressed body chunk, or ``None`` at end of stream."""
     def bytes(self) -> bytes:
         """Read the entire remaining body into bytes."""
-    def text(self) -> str:
-        """Read the entire remaining body and decode it as text."""
+    def text(self, encoding: Optional[str] = None) -> str:
+        """Read the entire remaining body and decode it as text.
+
+        Decoded exactly like ``Response.text()``: the charset ``Content-Type``
+        declares (UTF-8 when there is none), or the codec named by
+        ``encoding``, which is looked up in Python's codec registry. Bytes
+        that cannot be decoded become U+FFFD instead of raising, and an unknown
+        ``encoding`` raises ``LookupError``.
+        """
     def __iter__(self) -> Iterator[bytes]: ...
     def __next__(self) -> bytes: ...
 
@@ -736,6 +939,10 @@ class Session:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[
+            _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
+        ] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -765,6 +972,10 @@ class Session:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[
+            _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
+        ] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -793,6 +1004,10 @@ class Session:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[
+            _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
+        ] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -820,6 +1035,10 @@ class Session:
         json: Optional[Any] = None,
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
+        body_stream: Optional[
+            _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
+        ] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -867,6 +1086,10 @@ class Session:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[
+            _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
+        ] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -933,13 +1156,43 @@ class Session:
     def set_cookie_raw(self, url: str, set_cookie_header: str) -> None:
         """Set a cookie by parsing a raw ``Set-Cookie`` header value."""
     def get_cookie(self, url: str, name: str) -> Optional[str]:
-        """Return the value of a cookie for the URL, or ``None`` if absent."""
+        """Return the value of a cookie for the URL, or ``None`` if absent.
+
+        With the same name set at several paths this is the longest-path match,
+        which is the one a browser lists first.
+        """
     def get_cookies(self, url: str) -> list[tuple[str, str]]:
-        """Return all (name, value) cookies applicable to the URL."""
+        """Return all (name, value) cookies applicable to the URL.
+
+        In the order they would be sent: longer paths first, then older cookies
+        first, as Chrome orders the ``Cookie`` header. The same name may appear
+        more than once when it is set at different paths or domains.
+        """
+    def get_cookies_with_attrs(self, url: str) -> list[Cookie]:
+        """Like :meth:`get_cookies`, but each cookie keeps its attributes.
+
+        Use this when a name and a value are not enough: to tell apart two
+        cookies sharing a name at different paths, to hand the jar to a browser
+        context, or to find out why a cookie the jar holds was not sent.
+        """
+    def get_all_cookies(self) -> list[Cookie]:
+        """Every unexpired cookie in the jar, across all domains.
+
+        :meth:`get_cookies_with_attrs` answers "what would be sent to this
+        URL"; this answers "what does this session hold", which is the question
+        to ask when persisting a jar.
+
+        Cookies come back oldest first. Chrome orders the ``Cookie`` header by
+        path length and then by creation time, so setting these into a fresh
+        session in this order reproduces the same ``Cookie`` headers.
+        """
     def get_cookie_values(self, url: str, name: str) -> list[str]:
-        """Return all values for a cookie name applicable to the URL."""
+        """Return all values for a cookie name applicable to the URL, longest path first."""
     def cookie_header(self, url: str) -> Optional[str]:
-        """Return the ``Cookie`` header that would be sent for the URL."""
+        """Return the ``Cookie`` header that would be sent for the URL, verbatim.
+
+        ``None`` when no cookie matches.
+        """
     def remove_cookie(self, url: str, name: str) -> None:
         """Remove a cookie from the jar."""
     def clear_cookies(self) -> None:
@@ -961,6 +1214,10 @@ class Session:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[
+            _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
+        ] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -1017,6 +1274,8 @@ class BlockingSession:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -1046,6 +1305,8 @@ class BlockingSession:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -1074,6 +1335,8 @@ class BlockingSession:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -1101,6 +1364,8 @@ class BlockingSession:
         json: Optional[Any] = None,
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
+        body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -1148,6 +1413,8 @@ class BlockingSession:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -1211,14 +1478,46 @@ class BlockingSession:
         http_only: bool = False,
     ) -> None:
         """Set a cookie with explicit path/domain/secure/http_only attributes."""
+    def set_cookie_raw(self, url: str, set_cookie_header: str) -> None:
+        """Set a cookie by parsing a raw ``Set-Cookie`` header value."""
     def get_cookie(self, url: str, name: str) -> Optional[str]:
-        """Return the value of a cookie for the URL, or ``None`` if absent."""
+        """Return the value of a cookie for the URL, or ``None`` if absent.
+
+        With the same name set at several paths this is the longest-path match,
+        which is the one a browser lists first.
+        """
     def get_cookies(self, url: str) -> list[tuple[str, str]]:
-        """Return all (name, value) cookies applicable to the URL."""
+        """Return all (name, value) cookies applicable to the URL.
+
+        In the order they would be sent: longer paths first, then older cookies
+        first, as Chrome orders the ``Cookie`` header. The same name may appear
+        more than once when it is set at different paths or domains.
+        """
+    def get_cookies_with_attrs(self, url: str) -> list[Cookie]:
+        """Like :meth:`get_cookies`, but each cookie keeps its attributes.
+
+        Use this when a name and a value are not enough: to tell apart two
+        cookies sharing a name at different paths, to hand the jar to a browser
+        context, or to find out why a cookie the jar holds was not sent.
+        """
+    def get_all_cookies(self) -> list[Cookie]:
+        """Every unexpired cookie in the jar, across all domains.
+
+        :meth:`get_cookies_with_attrs` answers "what would be sent to this
+        URL"; this answers "what does this session hold", which is the question
+        to ask when persisting a jar.
+
+        Cookies come back oldest first. Chrome orders the ``Cookie`` header by
+        path length and then by creation time, so setting these into a fresh
+        session in this order reproduces the same ``Cookie`` headers.
+        """
     def get_cookie_values(self, url: str, name: str) -> list[str]:
-        """Return all values for a cookie name applicable to the URL."""
+        """Return all values for a cookie name applicable to the URL, longest path first."""
     def cookie_header(self, url: str) -> Optional[str]:
-        """Return the ``Cookie`` header that would be sent for the URL."""
+        """Return the ``Cookie`` header that would be sent for the URL, verbatim.
+
+        ``None`` when no cookie matches.
+        """
     def remove_cookie(self, url: str, name: str) -> None:
         """Remove a cookie from the jar."""
     def clear_cookies(self) -> None:
@@ -1240,6 +1539,8 @@ class BlockingSession:
         data: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         body: Optional[bytes] = None,
         multipart: Optional[Multipart] = None,
+        body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
+        content_length: Optional[int] = None,
         cookies: Optional[dict[str, str]] = None,
         cookie_override: Optional[dict[str, str]] = None,
         timeout: Optional[float] = None,
@@ -1284,6 +1585,7 @@ class Client:
         max_response_body_size: Optional[int] = None,
         max_connections_per_session: Optional[int] = None,
         max_pending_h2_requests: Optional[int] = None,
+        h2_dispatch_batch_size: Optional[int] = None,
         quic_connect_timeout: Optional[float] = None,
         max_header_count: Optional[int] = None,
         max_header_size: Optional[int] = None,
@@ -1301,6 +1603,8 @@ class Client:
         use_native_certs: bool = False,
         ech_config: Optional[bytes] = None,
         dns: Optional[str] = None,
+        ip_family: Optional[str] = None,
+        connect_to: Optional[dict[str, str]] = None,
         system_dns_cache_ttl: Optional[float] = None,
         system_dns_cache_max_entries: Optional[int] = None,
         keylog: Optional[str] = None,
@@ -1316,8 +1620,41 @@ class Client:
         tls_session_cache_partition_policy: Optional[
             TlsSessionCachePartitionPolicy
         ] = None,
+        masque: Optional[MasqueConfig] = None,
     ) -> None:
-        """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options."""
+        """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options.
+
+        ``ip_family`` restricts which address family this client connects over:
+        ``"any"`` (the default) keeps the resolver's own order, which on a
+        dual-stack host puts IPv6 first; ``"ipv4"`` or ``"ipv6"`` drops every
+        other address, so a session cannot leave over two families and present
+        two source addresses to the target. It covers every address this
+        process picks — the target, a proxy's ingress, a SOCKS5 UDP relay, QUIC
+        — and ``"ipv6"`` also refuses IPv4-mapped addresses. An address outside
+        the family raises rather than falling back, not even to a direct
+        connection under ``proxy_fallback_direct=True``. An unknown value raises
+        ``ValueError``.
+
+        It does not reach a proxy that resolves the target itself: an HTTP
+        ``CONNECT`` proxy, ``socks5h`` or MASQUE handed a hostname dials it over
+        whichever family it likes. ``connect_to`` hands such a proxy an address
+        instead.
+
+        ``connect_to`` dials a fixed address for an origin, as
+        ``{"host:port": "ip:port"}`` (IPv6 in brackets on either side, e.g.
+        ``{"[::1]:8443": "127.0.0.1:8443"}``). The URL, TLS SNI and certificate
+        name, ``Host``, cookies and connection pooling keep the original host;
+        through an HTTP ``CONNECT`` proxy the ``CONNECT`` line carries the
+        address. It applies to direct, proxied and QUIC connections and takes
+        precedence over Alt-Svc / SVCB endpoints, never to the proxy's own
+        address. The mapping is fixed — nothing re-resolves or refreshes it. A
+        malformed entry, a zero port, the same origin listed twice, or an
+        address ``ip_family`` excludes raises ``ValueError``.
+
+        ``masque`` configures the hop to a ``masque://`` proxy (requires the
+        ``masque`` feature). It is independent of ``verify`` and ``ca_cert*``,
+        which only govern the tunneled connection to the origin.
+        """
     @staticmethod
     def chrome_131() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
@@ -1349,11 +1686,24 @@ class Client:
     def chrome_152() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
+    def chrome_153() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_154() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
     def firefox_133() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_147() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def firefox_156() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint.
+
+        TLS and HTTP/2 only: like the other Firefox presets it configures no
+        QUIC profile, so HTTP/3 is not attempted with Firefox's fingerprint.
+        """
     @staticmethod
     def safari_18() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
@@ -1401,6 +1751,10 @@ class Client:
     def fingerprint_info(self) -> dict[str, Any]:
         """Return a dict describing the client's active TLS/HTTP2/TCP fingerprint."""
     @property
+    def h2_dispatch_batch_size(self) -> int:
+        """Ready HTTP/2 requests coalesced into one driver write turn (default 1)."""
+
+    @property
     def require_close_notify(self) -> bool:
         """Whether a bare socket EOF without TLS ``close_notify`` is treated as an error."""
 
@@ -1435,6 +1789,7 @@ class BlockingClient:
         max_response_body_size: Optional[int] = None,
         max_connections_per_session: Optional[int] = None,
         max_pending_h2_requests: Optional[int] = None,
+        h2_dispatch_batch_size: Optional[int] = None,
         quic_connect_timeout: Optional[float] = None,
         max_header_count: Optional[int] = None,
         max_header_size: Optional[int] = None,
@@ -1452,6 +1807,8 @@ class BlockingClient:
         use_native_certs: bool = False,
         ech_config: Optional[bytes] = None,
         dns: Optional[str] = None,
+        ip_family: Optional[str] = None,
+        connect_to: Optional[dict[str, str]] = None,
         system_dns_cache_ttl: Optional[float] = None,
         system_dns_cache_max_entries: Optional[int] = None,
         keylog: Optional[str] = None,
@@ -1467,8 +1824,41 @@ class BlockingClient:
         tls_session_cache_partition_policy: Optional[
             TlsSessionCachePartitionPolicy
         ] = None,
+        masque: Optional[MasqueConfig] = None,
     ) -> None:
-        """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options."""
+        """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options.
+
+        ``ip_family`` restricts which address family this client connects over:
+        ``"any"`` (the default) keeps the resolver's own order, which on a
+        dual-stack host puts IPv6 first; ``"ipv4"`` or ``"ipv6"`` drops every
+        other address, so a session cannot leave over two families and present
+        two source addresses to the target. It covers every address this
+        process picks — the target, a proxy's ingress, a SOCKS5 UDP relay, QUIC
+        — and ``"ipv6"`` also refuses IPv4-mapped addresses. An address outside
+        the family raises rather than falling back, not even to a direct
+        connection under ``proxy_fallback_direct=True``. An unknown value raises
+        ``ValueError``.
+
+        It does not reach a proxy that resolves the target itself: an HTTP
+        ``CONNECT`` proxy, ``socks5h`` or MASQUE handed a hostname dials it over
+        whichever family it likes. ``connect_to`` hands such a proxy an address
+        instead.
+
+        ``connect_to`` dials a fixed address for an origin, as
+        ``{"host:port": "ip:port"}`` (IPv6 in brackets on either side, e.g.
+        ``{"[::1]:8443": "127.0.0.1:8443"}``). The URL, TLS SNI and certificate
+        name, ``Host``, cookies and connection pooling keep the original host;
+        through an HTTP ``CONNECT`` proxy the ``CONNECT`` line carries the
+        address. It applies to direct, proxied and QUIC connections and takes
+        precedence over Alt-Svc / SVCB endpoints, never to the proxy's own
+        address. The mapping is fixed — nothing re-resolves or refreshes it. A
+        malformed entry, a zero port, the same origin listed twice, or an
+        address ``ip_family`` excludes raises ``ValueError``.
+
+        ``masque`` configures the hop to a ``masque://`` proxy (requires the
+        ``masque`` feature). It is independent of ``verify`` and ``ca_cert*``,
+        which only govern the tunneled connection to the origin.
+        """
     @staticmethod
     def chrome_131() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
@@ -1500,11 +1890,24 @@ class BlockingClient:
     def chrome_152() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
+    def chrome_153() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_154() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
     def firefox_133() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_147() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def firefox_156() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint.
+
+        TLS and HTTP/2 only: like the other Firefox presets it configures no
+        QUIC profile, so HTTP/3 is not attempted with Firefox's fingerprint.
+        """
     @staticmethod
     def safari_18() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
@@ -1551,6 +1954,10 @@ class BlockingClient:
         """
     def fingerprint_info(self) -> dict[str, Any]:
         """Return a dict describing the client's active TLS/HTTP2/TCP fingerprint."""
+    @property
+    def h2_dispatch_batch_size(self) -> int:
+        """Ready HTTP/2 requests coalesced into one driver write turn (default 1)."""
+
     @property
     def require_close_notify(self) -> bool:
         """Whether a bare socket EOF without TLS ``close_notify`` is treated as an error."""
@@ -1795,6 +2202,12 @@ class TlsProfile:
     def chrome_152() -> TlsProfile:
         """Chrome 152: first Chromium preset that GREASEs ``signature_algorithms`` and carries shuffled trust-anchor IDs."""
     @staticmethod
+    def chrome_153() -> TlsProfile:
+        """Chrome 153: Chrome 152's shape with the shuffled trust-anchor list narrowed from 32 identifiers to 28."""
+    @staticmethod
+    def chrome_154() -> TlsProfile:
+        """Chrome 154: the capture kept Chrome 153's TLS shape; only the profile name differs."""
+    @staticmethod
     def chrome_146_quic() -> TlsProfile:
         """Chrome 146 QUIC-TLS preset (the ClientHello sent inside QUIC), for ``Client(quic_fingerprint=...)``."""
     @staticmethod
@@ -1807,11 +2220,20 @@ class TlsProfile:
     def chrome_152_quic() -> TlsProfile:
         """Chrome 152 QUIC-TLS preset, for ``Client(quic_fingerprint=...)``."""
     @staticmethod
+    def chrome_153_quic() -> TlsProfile:
+        """Chrome 153 QUIC-TLS preset: keeps the nine classic signature algorithms (no ML-DSA) and sends no TLS GREASE slots."""
+    @staticmethod
+    def chrome_154_quic() -> TlsProfile:
+        """Chrome 154 QUIC-TLS preset: Chrome 153's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
+    @staticmethod
     def firefox_133() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
     @staticmethod
     def firefox_147() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
+    @staticmethod
+    def firefox_156() -> TlsProfile:
+        """Firefox 156: drops two ECDSA CBC suites and both FFDHE groups from Firefox 147; ECH GREASE uses AES-128-GCM with a fixed 240-byte payload."""
     @staticmethod
     def safari_18() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
@@ -1950,11 +2372,20 @@ class H2Profile:
     def chrome_152() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version (retains Chrome 151's shape)."""
     @staticmethod
+    def chrome_153() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (the Chrome 153 capture reproduced Chrome 152's shape)."""
+    @staticmethod
+    def chrome_154() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 153)."""
+    @staticmethod
     def firefox_133() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
     @staticmethod
     def firefox_147() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
+    @staticmethod
+    def firefox_156() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (unchanged from Firefox 147)."""
     @staticmethod
     def safari_18() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""

@@ -44,8 +44,10 @@ fn resolve_h2_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkh2::profile::H2Prof
 }
 
 /// Resolve a QUIC profile from a preset name (`"chrome"` / `"chrome_146"` /
-/// `"chrome_150"` / `"chrome_151"` / `"chrome_152"`) or a `QuicProfile` object. Requires the
-/// `quic-h3` feature; without it any value is rejected with a clear error.
+/// `"chrome_150"` / `"chrome_151"` / `"chrome_152"` / `"chrome_153"` /
+/// `"chrome_154"`) or a
+/// `QuicProfile` object. Requires the `quic-h3` feature; without it any value is
+/// rejected with a clear error.
 #[cfg(feature = "quic-h3")]
 fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProfile> {
     if let Ok(s) = obj.extract::<String>() {
@@ -55,8 +57,10 @@ fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProf
             "chrome_150" => Ok(lkrequest::lkh3::chrome_150_quic()),
             "chrome_151" => Ok(lkrequest::lkh3::chrome_151_quic()),
             "chrome_152" => Ok(lkrequest::lkh3::chrome_152_quic()),
+            "chrome_153" => Ok(lkrequest::lkh3::chrome_153_quic()),
+            "chrome_154" => Ok(lkrequest::lkh3::chrome_154_quic()),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152",
+                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154",
                 s
             ))),
         }
@@ -169,6 +173,7 @@ struct ClientConfig {
     max_response_body_size: Option<usize>,
     max_connections_per_session: Option<usize>,
     max_pending_h2_requests: Option<usize>,
+    h2_dispatch_batch_size: Option<usize>,
     quic_connect_timeout: Option<f64>,
     max_header_count: Option<usize>,
     max_header_size: Option<usize>,
@@ -186,6 +191,8 @@ struct ClientConfig {
     use_native_certs: bool,
     ech_config: Option<Vec<u8>>,
     dns: Option<String>,
+    ip_family: Option<String>,
+    connect_to: Option<HashMap<String, String>>,
     system_dns_cache_ttl: Option<f64>,
     system_dns_cache_max_entries: Option<usize>,
     keylog: Option<String>,
@@ -199,6 +206,7 @@ struct ClientConfig {
     require_close_notify: Option<bool>,
     tls_session_resumption_policy: Option<lkrequest::TlsSessionResumptionPolicy>,
     tls_session_cache_partition_policy: Option<lkrequest::TlsSessionCachePartitionPolicy>,
+    masque: Option<crate::masque::OuterConfig>,
 }
 
 fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
@@ -218,6 +226,7 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         max_response_body_size,
         max_connections_per_session,
         max_pending_h2_requests,
+        h2_dispatch_batch_size,
         quic_connect_timeout,
         max_header_count,
         max_header_size,
@@ -235,6 +244,8 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         use_native_certs,
         ech_config,
         dns,
+        ip_family,
+        connect_to,
         system_dns_cache_ttl,
         system_dns_cache_max_entries,
         keylog,
@@ -248,6 +259,7 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         require_close_notify,
         tls_session_resumption_policy,
         tls_session_cache_partition_policy,
+        masque,
     } = cfg;
 
     let mut builder = lkrequest::Client::builder();
@@ -352,6 +364,17 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         }
         builder = builder.max_pending_h2_requests(n);
     }
+    // Upstream asserts this is non-zero too. The default of 1 sends each ready
+    // request in its own write turn, which is the fingerprint-safe shape; a
+    // larger batch coalesces them and is observable on the wire.
+    if let Some(n) = h2_dispatch_batch_size {
+        if n == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "h2_dispatch_batch_size must be greater than 0 (omit it for the default of 1)",
+            ));
+        }
+        builder = builder.h2_dispatch_batch_size(n);
+    }
     if let Some(v) = h2_fallback_h1 {
         builder = builder.h2_fallback_h1(v);
     }
@@ -409,10 +432,21 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
             cache = cache.with_max_entries(n);
         }
         builder = builder.system_dns_cache(cache);
+    } else if let Some(ref dns_name) = dns {
+        builder = builder.dns(resolve_dns_config(dns_name)?);
     }
-    if let Some(ref dns_name) = dns {
-        let config = resolve_dns_config(dns_name)?;
-        builder = builder.dns(config);
+    // Upstream applies the family policy to whichever resolver ends up
+    // configured, so it composes with both options above regardless of order.
+    let ip_family = ip_family
+        .as_deref()
+        .map(crate::dns::parse_ip_family)
+        .transpose()?
+        .unwrap_or_default();
+    builder = builder.ip_family(ip_family);
+    if let Some(entries) = connect_to {
+        for entry in crate::dns::parse_connect_to(entries, ip_family)? {
+            builder = builder.connect_to(&entry.host, entry.port, entry.address);
+        }
     }
     if let Some(ref path) = keylog {
         let callback = lkrequest::keylog_to_file(path).map_err(|e| {
@@ -452,6 +486,9 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
     }
     if let Some(policy) = tls_session_cache_partition_policy {
         builder = builder.tls_session_cache_partition_policy(policy);
+    }
+    if let Some(config) = masque {
+        builder = crate::masque::apply_to_client(builder, config);
     }
 
     Ok(builder.build())
@@ -505,6 +542,7 @@ impl PyClient {
         max_response_body_size=None,
         max_connections_per_session=None,
         max_pending_h2_requests=None,
+        h2_dispatch_batch_size=None,
         quic_connect_timeout=None,
         max_header_count=None,
         max_header_size=None,
@@ -522,6 +560,8 @@ impl PyClient {
         use_native_certs=false,
         ech_config=None,
         dns=None,
+        ip_family=None,
+        connect_to=None,
         system_dns_cache_ttl=None,
         system_dns_cache_max_entries=None,
         keylog=None,
@@ -535,6 +575,7 @@ impl PyClient {
         require_close_notify=None,
         tls_session_resumption_policy=None,
         tls_session_cache_partition_policy=None,
+        masque=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -553,6 +594,7 @@ impl PyClient {
         max_response_body_size: Option<usize>,
         max_connections_per_session: Option<usize>,
         max_pending_h2_requests: Option<usize>,
+        h2_dispatch_batch_size: Option<usize>,
         quic_connect_timeout: Option<f64>,
         max_header_count: Option<usize>,
         max_header_size: Option<usize>,
@@ -570,6 +612,8 @@ impl PyClient {
         use_native_certs: bool,
         ech_config: Option<Vec<u8>>,
         dns: Option<String>,
+        ip_family: Option<String>,
+        connect_to: Option<HashMap<String, String>>,
         system_dns_cache_ttl: Option<f64>,
         system_dns_cache_max_entries: Option<usize>,
         keylog: Option<String>,
@@ -587,7 +631,9 @@ impl PyClient {
         tls_session_cache_partition_policy: Option<
             crate::network_partition::PyTlsSessionCachePartitionPolicy,
         >,
+        masque: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
+        let masque = crate::masque::resolve(masque.as_ref())?;
         let tls = tls_profile.as_ref().map(resolve_tls_from_any).transpose()?;
         let h2 = h2_profile.as_ref().map(resolve_h2_from_any).transpose()?;
         let tcp = tcp_fingerprint
@@ -618,6 +664,7 @@ impl PyClient {
             max_response_body_size,
             max_connections_per_session,
             max_pending_h2_requests,
+            h2_dispatch_batch_size,
             quic_connect_timeout,
             max_header_count,
             max_header_size,
@@ -635,6 +682,8 @@ impl PyClient {
             use_native_certs,
             ech_config,
             dns,
+            ip_family,
+            connect_to,
             system_dns_cache_ttl,
             system_dns_cache_max_entries,
             keylog,
@@ -648,6 +697,7 @@ impl PyClient {
             require_close_notify,
             tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
             tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
+            masque,
         })?;
         tracing::info!(tls = %client.tls_profile().name, "Client created");
         Ok(PyClient { inner: client })
@@ -754,6 +804,26 @@ impl PyClient {
     }
 
     #[staticmethod]
+    fn chrome_153() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_153(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_154() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_154(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         PyClient {
             inner: build_preset_client(
@@ -768,6 +838,16 @@ impl PyClient {
         PyClient {
             inner: build_preset_client(
                 lkrequest::preset::firefox_147(),
+                lkrequest::TcpFingerprint::firefox(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn firefox_156() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::firefox_156(),
                 lkrequest::TcpFingerprint::firefox(),
             ),
         }
@@ -935,6 +1015,16 @@ impl PyClient {
         self.inner.require_close_notify()
     }
 
+    /// How many ready HTTP/2 requests are coalesced into one driver write turn.
+    ///
+    /// Readable because it changes the bytes on the wire: the default of 1
+    /// gives each request its own write, while a larger batch packs several
+    /// into one, which is observable.
+    #[getter]
+    fn h2_dispatch_batch_size(&self) -> usize {
+        self.inner.h2_dispatch_batch_size()
+    }
+
     /// The TLS session ticket resumption policy in effect for this client.
     #[getter]
     fn tls_session_resumption_policy(
@@ -1023,6 +1113,7 @@ impl PyBlockingClient {
         max_response_body_size=None,
         max_connections_per_session=None,
         max_pending_h2_requests=None,
+        h2_dispatch_batch_size=None,
         quic_connect_timeout=None,
         max_header_count=None,
         max_header_size=None,
@@ -1040,6 +1131,8 @@ impl PyBlockingClient {
         use_native_certs=false,
         ech_config=None,
         dns=None,
+        ip_family=None,
+        connect_to=None,
         system_dns_cache_ttl=None,
         system_dns_cache_max_entries=None,
         keylog=None,
@@ -1053,6 +1146,7 @@ impl PyBlockingClient {
         require_close_notify=None,
         tls_session_resumption_policy=None,
         tls_session_cache_partition_policy=None,
+        masque=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new<'py>(
@@ -1071,6 +1165,7 @@ impl PyBlockingClient {
         max_response_body_size: Option<usize>,
         max_connections_per_session: Option<usize>,
         max_pending_h2_requests: Option<usize>,
+        h2_dispatch_batch_size: Option<usize>,
         quic_connect_timeout: Option<f64>,
         max_header_count: Option<usize>,
         max_header_size: Option<usize>,
@@ -1088,6 +1183,8 @@ impl PyBlockingClient {
         use_native_certs: bool,
         ech_config: Option<Vec<u8>>,
         dns: Option<String>,
+        ip_family: Option<String>,
+        connect_to: Option<HashMap<String, String>>,
         system_dns_cache_ttl: Option<f64>,
         system_dns_cache_max_entries: Option<usize>,
         keylog: Option<String>,
@@ -1105,7 +1202,9 @@ impl PyBlockingClient {
         tls_session_cache_partition_policy: Option<
             crate::network_partition::PyTlsSessionCachePartitionPolicy,
         >,
+        masque: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
+        let masque = crate::masque::resolve(masque.as_ref())?;
         let tls = tls_profile.as_ref().map(resolve_tls_from_any).transpose()?;
         let h2 = h2_profile.as_ref().map(resolve_h2_from_any).transpose()?;
         let tcp = tcp_fingerprint
@@ -1136,6 +1235,7 @@ impl PyBlockingClient {
             max_response_body_size,
             max_connections_per_session,
             max_pending_h2_requests,
+            h2_dispatch_batch_size,
             quic_connect_timeout,
             max_header_count,
             max_header_size,
@@ -1153,6 +1253,8 @@ impl PyBlockingClient {
             use_native_certs,
             ech_config,
             dns,
+            ip_family,
+            connect_to,
             system_dns_cache_ttl,
             system_dns_cache_max_entries,
             keylog,
@@ -1166,6 +1268,7 @@ impl PyBlockingClient {
             require_close_notify,
             tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
             tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
+            masque,
         })?;
         Ok(PyBlockingClient { inner: client })
     }
@@ -1271,6 +1374,26 @@ impl PyBlockingClient {
     }
 
     #[staticmethod]
+    fn chrome_153() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_153(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn chrome_154() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_154(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         PyBlockingClient {
             inner: build_preset_client(
@@ -1285,6 +1408,16 @@ impl PyBlockingClient {
         PyBlockingClient {
             inner: build_preset_client(
                 lkrequest::preset::firefox_147(),
+                lkrequest::TcpFingerprint::firefox(),
+            ),
+        }
+    }
+
+    #[staticmethod]
+    fn firefox_156() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::firefox_156(),
                 lkrequest::TcpFingerprint::firefox(),
             ),
         }
@@ -1450,6 +1583,16 @@ impl PyBlockingClient {
     #[getter]
     fn require_close_notify(&self) -> bool {
         self.inner.require_close_notify()
+    }
+
+    /// How many ready HTTP/2 requests are coalesced into one driver write turn.
+    ///
+    /// Readable because it changes the bytes on the wire: the default of 1
+    /// gives each request its own write, while a larger batch packs several
+    /// into one, which is observable.
+    #[getter]
+    fn h2_dispatch_batch_size(&self) -> usize {
+        self.inner.h2_dispatch_batch_size()
     }
 
     /// The TLS session ticket resumption policy in effect for this client.

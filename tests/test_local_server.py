@@ -6,8 +6,12 @@ to misbehave on cue stand up their own raw socket server instead.
 """
 
 import asyncio
+import hashlib
+import io
 import json
-from urllib.parse import urlsplit
+import socket
+import threading
+from urllib.parse import quote, urlsplit
 
 import pytest
 
@@ -76,6 +80,221 @@ def test_only_real_redirect_statuses_are_followed(server_url, status, followed):
     else:
         assert resp.status_code == status
         assert "/redirect-to" in resp.url
+
+
+# ---------------------------------------------------------------------------
+# Streaming uploads
+# ---------------------------------------------------------------------------
+#
+# All of these post to the ASGI `/upload-echo` endpoint rather than httpbin's
+# `/post`: httpbin is WSGI and cannot read a body without Content-Length, so an
+# unknown-length upload would look empty there and chunked HTTP/1.1 draws a
+# `501` out of Werkzeug. See the fixture for the details.
+
+PAYLOAD = b"streaming upload payload"
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _streaming_client():
+    return BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+
+
+def test_upload_from_a_file_like_object_with_known_length(server_url):
+    resp = (
+        _streaming_client()
+        .session()
+        .post(
+            f"{server_url}/upload-echo",
+            body_stream=io.BytesIO(PAYLOAD),
+            content_length=len(PAYLOAD),
+        )
+    )
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["length"] == len(PAYLOAD)
+    assert echo["sha256"] == _digest(PAYLOAD)
+    # An exact length is declared rather than framed as chunks.
+    assert echo["content_length"] == str(len(PAYLOAD))
+
+
+def test_upload_from_a_real_file_on_disk(server_url, tmp_path):
+    path = tmp_path / "upload.bin"
+    path.write_bytes(PAYLOAD)
+    with path.open("rb") as handle:
+        resp = (
+            _streaming_client()
+            .session()
+            .post(
+                f"{server_url}/upload-echo",
+                body_stream=handle,
+                content_length=path.stat().st_size,
+            )
+        )
+    assert resp.json()["sha256"] == _digest(PAYLOAD)
+
+
+def test_upload_from_a_generator_without_a_length(server_url):
+    chunks = [b"first-", b"second-", b"third"]
+
+    resp = (
+        _streaming_client()
+        .session()
+        .post(f"{server_url}/upload-echo", body_stream=(chunk for chunk in chunks))
+    )
+    echo = resp.json()
+    assert echo["sha256"] == _digest(b"".join(chunks))
+    # No length was supplied, so the transport picks the framing itself: HTTP/2
+    # DATA frames carry no Content-Length.
+    assert echo["content_length"] is None
+
+
+def test_upload_without_a_length_uses_chunked_on_http1(server_url):
+    chunks = [b"alpha", b"beta"]
+
+    resp = (
+        _streaming_client()
+        .session(http1_only=True)
+        .post(f"{server_url}/upload-echo", body_stream=iter(chunks))
+    )
+    echo = resp.json()
+    assert echo["sha256"] == _digest(b"".join(chunks))
+    assert echo["transfer_encoding"] == "chunked"
+
+
+@pytest.mark.asyncio
+async def test_upload_from_an_async_generator(server_url):
+    chunks = [b"async-", b"chunks"]
+
+    async def produce():
+        for chunk in chunks:
+            await asyncio.sleep(0)
+            yield chunk
+
+    client = lkrequest.Client(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    resp = await client.session().post(
+        f"{server_url}/upload-echo", body_stream=produce()
+    )
+    assert resp.json()["sha256"] == _digest(b"".join(chunks))
+
+
+@pytest.mark.asyncio
+async def test_upload_from_a_file_like_object_on_the_async_client(server_url):
+    client = lkrequest.Client(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    resp = await client.session().post(
+        f"{server_url}/upload-echo",
+        body_stream=io.BytesIO(PAYLOAD),
+        content_length=len(PAYLOAD),
+    )
+    assert resp.json()["sha256"] == _digest(PAYLOAD)
+
+
+def test_async_iterable_is_rejected_by_the_blocking_client(server_url):
+    # There is no event loop to await __anext__ on, so this has to fail at the
+    # call rather than hang or half-upload.
+    async def produce():
+        yield b"nope"
+
+    with pytest.raises(TypeError, match="running event loop"):
+        _streaming_client().session().post(
+            f"{server_url}/upload-echo", body_stream=produce()
+        )
+
+
+def test_declared_length_must_match_the_source(server_url):
+    # Upstream treats a supplied length as exact; a short source is an error
+    # rather than a silently truncated request.
+    with pytest.raises(lkrequest.RequestError):
+        _streaming_client().session().post(
+            f"{server_url}/upload-echo",
+            body_stream=io.BytesIO(b"short"),
+            content_length=999,
+        )
+
+
+def test_str_chunks_name_the_fix(server_url):
+    with pytest.raises(lkrequest.RequestError, match="binary mode"):
+        _streaming_client().session().post(
+            f"{server_url}/upload-echo", body_stream=iter(["not bytes"])
+        )
+
+
+def test_body_stream_is_exclusive_with_the_buffered_bodies(server_url):
+    with pytest.raises(ValueError, match="more than one of"):
+        _streaming_client().session().post(
+            f"{server_url}/upload-echo",
+            body=b"buffered",
+            body_stream=io.BytesIO(b"streamed"),
+        )
+
+
+def test_content_length_requires_body_stream(server_url):
+    with pytest.raises(ValueError, match="content_length requires body_stream"):
+        _streaming_client().session().post(
+            f"{server_url}/upload-echo", body=b"buffered", content_length=8
+        )
+
+
+def test_body_stream_rejects_an_unusable_source(server_url):
+    with pytest.raises(TypeError, match="body_stream must be"):
+        _streaming_client().session().post(
+            f"{server_url}/upload-echo", body_stream=object()
+        )
+
+
+# ---------------------------------------------------------------------------
+# Streaming responses share the buffered path's request handling
+# ---------------------------------------------------------------------------
+#
+# `send_streaming` used to skip request middleware and the session's HSTS
+# upgrade: only the buffered path ran them, so the same session behaved
+# differently depending on how the response was read.
+
+
+def test_send_streaming_runs_request_middleware(server_url):
+    def inject(request):
+        request["headers"]["X-Injected"] = "yes"
+        return request
+
+    client = BlockingClient(
+        tls_profile="chrome_152",
+        h2_profile="chrome_152",
+        verify=False,
+        middleware=[lkrequest.Middleware("inject", on_request=inject)],
+    )
+    session = client.session()
+
+    buffered = session.get(f"{server_url}/get").json()
+    streamed = json.loads(session.send_streaming("GET", f"{server_url}/get").bytes())
+
+    assert buffered["headers"]["X-Injected"] == "yes"
+    assert streamed["headers"]["X-Injected"] == "yes"
+
+
+def test_send_streaming_applies_the_hsts_upgrade(server_url):
+    # Addressed by hostname rather than 127.0.0.1 on purpose: HSTS is never
+    # applied to an IP literal, so an IP would upgrade nothing and the test
+    # would pass for the wrong reason. The fixture's cert covers `localhost`.
+    port = urlsplit(server_url).port
+    plain = f"http://localhost:{port}/get"
+
+    client = BlockingClient(
+        tls_profile="chrome_152", h2_profile="chrome_152", verify=False
+    )
+    session = client.session(hsts=lkrequest.Hsts.static_(["localhost"]))
+
+    # Without the upgrade this speaks plain HTTP to a TLS port and fails.
+    assert session.get(plain).url.startswith("https://")
+    streamed = json.loads(session.send_streaming("GET", plain).bytes())
+    assert streamed["url"].startswith("https://")
 
 
 # ---------------------------------------------------------------------------
@@ -239,13 +458,38 @@ def test_verify_false_still_connects(server_url):
     not hasattr(lkrequest, "QuicProfile"),
     reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
 )
-@pytest.mark.xfail(
-    reason="lkrequest's QUIC stack does not complete a handshake against the "
-    "hypercorn/aioquic test server (handshake times out). The H3 client path "
-    "is exercised (it emits an H3-specific error), but full wire interop with "
-    "this server is unverified — validate against a production H3 server "
-    "(e.g. Caddy) or a public H3 endpoint.",
-    strict=False,
+def test_h3_fallback_still_reuses_the_pooled_h2_connection(server_url):
+    # The local server listens on TCP only, so the HTTP/3 attempt cannot
+    # succeed and every request falls back to HTTP/2 — the exact shape in which
+    # upstream used to lose the pool: `Http3WithFallback` only ever looked for a
+    # pooled H3 connection, so the H2 connection the fallback had just created
+    # and pooled was invisible and each request re-dialled TCP + TLS.
+    #
+    # `diagnostics` reports None for a phase that did not happen, so a reused
+    # connection is one with no TCP and no TLS timing. See
+    # docs/UPSTREAM-H3-FALLBACK-POOL.md for the original defect report.
+    client = BlockingClient(
+        tls_profile="chrome_152",
+        h2_profile="chrome_152",
+        quic_profile="chrome_152",
+        verify=False,
+    )
+    session = client.session(http3_with_fallback=True)
+
+    first = session.get(f"{server_url}/get")
+    assert first.version == lkrequest.HttpVersion.H2
+    assert first.diagnostics["tls_ms"] is not None, "first request must dial"
+
+    for _ in range(2):
+        resp = session.get(f"{server_url}/get")
+        assert resp.version == lkrequest.HttpVersion.H2
+        assert resp.diagnostics["tcp_ms"] is None
+        assert resp.diagnostics["tls_ms"] is None
+
+
+@pytest.mark.skipif(
+    not hasattr(lkrequest, "QuicProfile"),
+    reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
 )
 def test_h3_get(h3_server_url):
     # The dedicated H3 server serves HTTP/3 on its UDP port via aioquic. With
@@ -259,6 +503,59 @@ def test_h3_get(h3_server_url):
     resp = client.session(http3_only=True).get(f"{h3_server_url}/get", timeout=5.0)
     assert resp.status_code == 200
     assert "headers" in resp.json()
+
+
+@pytest.mark.skipif(
+    not hasattr(lkrequest, "QuicProfile"),
+    reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
+)
+@pytest.mark.parametrize("preset", ["chrome", "chrome_146", "chrome_153", "chrome_154"])
+def test_h3_connection_survives_the_qpack_dynamic_table(h3_server_url, preset):
+    # The Chrome QUIC presets advertise a 64 KiB QPACK dynamic table, as Chrome
+    # does, and the test server's encoder (aioquic, on ls-qpack) takes them up
+    # on it from the second response on. The client used to decode static
+    # references only, so the connection died with QPACK_DECOMPRESSION_FAILED
+    # at the second request and HTTP/3 connections could not be reused.
+    session = BlockingClient(quic_profile=preset, verify=False).session(http3_only=True)
+    for _ in range(4):
+        resp = session.get(f"{h3_server_url}/get", timeout=5.0)
+        assert resp.status_code == 200
+        assert resp.version == lkrequest.HttpVersion.H3
+
+
+@pytest.mark.skipif(
+    not hasattr(lkrequest, "QuicProfile"),
+    reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
+)
+async def test_h3_concurrent_responses_share_the_qpack_dynamic_table(h3_server_url):
+    # Every response on the connection decodes against the one dynamic table,
+    # and a response may reference entries whose inserts are still in flight
+    # on the encoder stream.
+    session = lkrequest.Client(quic_profile="chrome_154", verify=False).session(
+        http3_only=True
+    )
+    await session.get(f"{h3_server_url}/get", timeout=5.0)
+    responses = await asyncio.gather(
+        *(session.get(f"{h3_server_url}/get?n={i}", timeout=10.0) for i in range(30))
+    )
+    assert [(r.status_code, r.version) for r in responses] == [
+        (200, lkrequest.HttpVersion.H3)
+    ] * 30
+
+
+@pytest.mark.skipif(
+    not hasattr(lkrequest, "QuicProfile"),
+    reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
+)
+@pytest.mark.parametrize("family", ["any", "ipv6"])
+def test_h3_reaches_an_ipv6_target(h3_server_url_ipv6, family):
+    # The QUIC endpoint used to be bound to 0.0.0.0 only, so quinn refused every
+    # IPv6 destination before sending a packet: HTTP/3 to an IPv6 address always
+    # failed, and a dual-stack site whose AAAA sorted first never got HTTP/3.
+    client = BlockingClient(quic_profile="chrome_154", verify=False, ip_family=family)
+    resp = client.session(http3_only=True).get(f"{h3_server_url_ipv6}/get", timeout=5.0)
+    assert resp.status_code == 200
+    assert resp.version == lkrequest.HttpVersion.H3
 
 
 def test_extension_order_randomization_completes_request(server_url):
@@ -585,3 +882,520 @@ async def test_drain_true_implies_results_already_delivered():
                 assert f.result().status_code == 200
     finally:
         srv.close()
+
+
+# ---------------------------------------------------------------------------
+# Response.text() charset decoding (public issue #2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "sample"),
+    [
+        ("gbk", "中文测试"),
+        ("big5", "中文測試"),
+        ("shift_jis", "日本語テスト"),
+        ("euc-kr", "한국어 테스트"),
+    ],
+)
+def test_text_decodes_declared_charset(server_url, label, sample):
+    # The charset from Content-Type drives the decode. Before this worked,
+    # text() decoded UTF-8 unconditionally and any of these raised.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(
+        f"{server_url}/charset?label={label}&text={quote(sample)}"
+    )
+    assert resp.encoding == label
+    assert resp.text() == sample
+    # The body really is in the legacy charset, not UTF-8 that happened to work:
+    # these encodings are more compact than UTF-8 for CJK.
+    assert resp.content == sample.encode(label)
+    assert len(resp.content) != len(sample.encode("utf-8"))
+
+
+def test_text_without_declared_charset_does_not_raise(server_url):
+    # A server that declares no charset leaves undecodable bytes. text() must
+    # still return something: this is the exact case that used to raise
+    # `TypeError: function takes exactly 5 arguments (1 given)`, because the
+    # error path built a UnicodeDecodeError with one argument instead of five.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/charset?label=gbk&declare=0")
+    assert resp.encoding is None
+    text = resp.text()
+    assert "�" in text, "undecodable bytes should become U+FFFD"
+    # ...and the caller can still recover the real text.
+    assert resp.text(encoding="gbk") == "中文测试"
+
+
+def test_text_encoding_argument_overrides_a_wrong_declaration(server_url):
+    # A server that states the wrong charset is common enough that requests
+    # makes `.encoding` writable for it; here the override is an argument.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/charset?label=gbk&declare=iso-8859-1")
+    assert resp.encoding == "iso-8859-1"
+    assert resp.text() != "中文测试"
+    assert resp.text(encoding="gbk") == "中文测试"
+
+
+def test_text_rejects_an_unknown_encoding_argument(server_url):
+    # An unknown codec from the caller is a mistake worth raising, unlike an
+    # unusable label from the server, which falls back to UTF-8. LookupError is
+    # what bytes.decode raises for the same mistake.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/charset?label=gbk")
+    with pytest.raises(LookupError):
+        resp.text(encoding="definitely-not-a-charset")
+
+
+@pytest.mark.parametrize(
+    "label", ["latin-1", "utf-8-sig", "cp936", "euc_kr", "utf-16-le", "cp437"]
+)
+def test_text_accepts_python_codec_spellings(server_url, label):
+    # These are ordinary Python codec names that the WHATWG label set does not
+    # list. Resolving `encoding=` against Python's registry instead is what
+    # keeps `text(encoding="latin-1")` — the obvious thing to write — working.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/charset?label=gbk")
+    assert isinstance(resp.text(encoding=label), str)
+
+
+def test_text_falls_back_to_utf8_for_an_unknown_declared_charset(server_url):
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/charset?label=utf-8&declare=x-made-up")
+    assert resp.encoding == "x-made-up"
+    assert resp.text() == "中文测试"
+
+
+def test_text_honours_and_strips_a_utf8_bom(server_url):
+    # A BOM overrides the declared charset and is removed, per the WHATWG
+    # Encoding Standard. Leaving it in would also break json() on the
+    # BOM-prefixed bodies some servers emit.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/charset?label=utf-8&declare=gbk&bom=1")
+    assert resp.content.startswith(b"\xef\xbb\xbf")
+    assert resp.text() == "中文测试"
+
+
+def test_text_bom_stripping_lets_json_parse(server_url):
+    # A BOM left in place would make json.loads reject an otherwise fine body.
+    body = quote(json.dumps({"ok": True}))
+    client = BlockingClient(verify=False)
+    resp = client.session().get(
+        f"{server_url}/charset?label=utf-8&declare=utf-8&bom=1&text={body}"
+    )
+    assert resp.json() == {"ok": True}
+
+
+def test_text_caches_the_declared_decode_but_not_an_override(server_url):
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/charset?label=gbk")
+    # An override must neither read nor fill the cache, or one odd call would
+    # poison every later text() on the same response.
+    assert resp.text(encoding="iso-8859-1") != "中文测试"
+    assert resp.text() == "中文测试"
+    assert resp.text(encoding="iso-8859-1") != "中文测试"
+    assert resp.text() == "中文测试"
+
+
+# ---------------------------------------------------------------------------
+# StreamingResponse.text() decodes like Response.text() (public issue #2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "sample"),
+    [("gbk", "中文测试"), ("big5", "中文測試"), ("shift_jis", "日本語テスト")],
+)
+def test_streaming_text_decodes_declared_charset(server_url, label, sample):
+    # The streaming text() used to decode strict UTF-8 whatever the header
+    # said, so the same GBK page that Response.text() handles raised here.
+    session = BlockingClient(verify=False).session()
+    stream = session.send_streaming(
+        "GET", f"{server_url}/charset?label={label}&text={quote(sample)}"
+    )
+    assert stream.text() == sample
+
+
+async def test_async_streaming_text_decodes_declared_charset(server_url):
+    session = lkrequest.Client(verify=False).session()
+    stream = await session.send_streaming("GET", f"{server_url}/charset?label=gbk")
+    assert await stream.text() == "中文测试"
+
+
+def test_streaming_text_encoding_argument_overrides_the_header(server_url):
+    session = BlockingClient(verify=False).session()
+    url = f"{server_url}/charset?label=gbk&declare=0"
+    assert "�" in session.send_streaming("GET", url).text()
+    assert session.send_streaming("GET", url).text(encoding="gbk") == "中文测试"
+
+
+async def test_async_streaming_text_encoding_argument(server_url):
+    session = lkrequest.Client(verify=False).session()
+    stream = await session.send_streaming(
+        "GET", f"{server_url}/charset?label=gbk&declare=0"
+    )
+    assert await stream.text(encoding="gbk") == "中文测试"
+
+
+def test_streaming_text_is_lossy_rather_than_raising(server_url):
+    # Undecodable bytes become U+FFFD, as with Response.text(); before, a body
+    # that was not valid UTF-8 raised RequestError and the text was lost.
+    session = BlockingClient(verify=False).session()
+    stream = session.send_streaming("GET", f"{server_url}/charset?label=gbk&declare=0")
+    assert "�" in stream.text()
+
+
+def test_streaming_text_rejects_an_unknown_encoding_argument(server_url):
+    session = BlockingClient(verify=False).session()
+    stream = session.send_streaming("GET", f"{server_url}/charset?label=gbk")
+    with pytest.raises(LookupError):
+        stream.text(encoding="definitely-not-a-charset")
+
+
+def test_streaming_text_honours_and_strips_a_utf8_bom(server_url):
+    session = BlockingClient(verify=False).session()
+    stream = session.send_streaming(
+        "GET", f"{server_url}/charset?label=utf-8&declare=gbk&bom=1"
+    )
+    assert stream.text() == "中文测试"
+
+
+def test_streaming_text_still_consumes_the_stream(server_url):
+    session = BlockingClient(verify=False).session()
+    stream = session.send_streaming("GET", f"{server_url}/charset?label=gbk")
+    stream.text()
+    with pytest.raises(RuntimeError, match="already consumed"):
+        stream.text()
+
+
+# ---------------------------------------------------------------------------
+# Response.json() error type (public issue #5)
+# ---------------------------------------------------------------------------
+
+
+def test_json_decode_failure_is_a_request_error(server_url):
+    # The whole point: `except lkrequest.RequestError` used to miss this,
+    # because json.loads' own exception escaped unwrapped.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/html")
+    with pytest.raises(lkrequest.RequestError) as caught:
+        resp.json()
+    assert isinstance(caught.value, lkrequest.JsonDecodeError)
+
+
+def test_json_decode_failure_is_still_a_stdlib_json_error(server_url):
+    # Callers who wrote `except json.JSONDecodeError` as a workaround while the
+    # exception leaked must keep working; that is why the class has two bases.
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/html")
+    with pytest.raises(json.JSONDecodeError) as caught:
+        resp.json()
+    assert isinstance(caught.value, lkrequest.RequestError)
+
+
+def test_json_decode_failure_keeps_the_position_fields(server_url):
+    client = BlockingClient(verify=False)
+    resp = client.session().get(f"{server_url}/html")
+    with pytest.raises(lkrequest.JsonDecodeError) as caught:
+        resp.json()
+    error = caught.value
+    assert error.doc == resp.text()
+    assert isinstance(error.pos, int)
+    assert error.msg
+    assert error.lineno >= 1
+    assert error.colno >= 1
+
+
+def test_json_decode_failure_survives_the_async_client(server_url):
+    async def run():
+        session = lkrequest.Client(verify=False).session()
+        resp = await session.get(f"{server_url}/html")
+        with pytest.raises(lkrequest.JsonDecodeError):
+            resp.json()
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# ip_family — address-family selection (public issue #6)
+# ---------------------------------------------------------------------------
+#
+# The local server binds 127.0.0.1 only, while `localhost` resolves to both
+# 127.0.0.1 and ::1 on a dual-stack machine. That makes `localhost` a real
+# dual-stack target reachable offline: asking for one family and observing which
+# address was attempted is what proves the filter is doing anything at all.
+
+
+def _localhost_families() -> set:
+    return {info[4][0] for info in socket.getaddrinfo("localhost", 80)}
+
+
+dual_stack_localhost = pytest.mark.skipif(
+    "::1" not in _localhost_families() or "127.0.0.1" not in _localhost_families(),
+    reason="localhost is not dual-stack here, so family selection is unobservable",
+)
+
+
+def _localhost_url(server_url: str) -> str:
+    return server_url.replace("127.0.0.1", "localhost")
+
+
+@pytest.mark.parametrize("family", [None, "any", "ipv4"])
+def test_ip_family_allowing_ipv4_connects_over_ipv4(server_url, family):
+    # The default and an explicit "any" must keep working, and "ipv4" must pick
+    # the v4 address of a dual-stack name.
+    kwargs = {} if family is None else {"ip_family": family}
+    resp = BlockingClient(verify=False, **kwargs).session().get(f"{server_url}/get")
+    assert resp.status_code == 200
+    assert resp.diagnostics["remote_addr"].startswith("127.0.0.1:")
+
+
+@dual_stack_localhost
+def test_ip_family_ipv4_selects_the_v4_address_of_a_dual_stack_name(server_url):
+    resp = (
+        BlockingClient(verify=False, ip_family="ipv4")
+        .session()
+        .get(f"{_localhost_url(server_url)}/get")
+    )
+    assert resp.status_code == 200
+    assert resp.diagnostics["remote_addr"].startswith("127.0.0.1:")
+
+
+@dual_stack_localhost
+def test_ip_family_ipv6_selects_the_v6_address_of_a_dual_stack_name(server_url):
+    # The server listens on 127.0.0.1 only, so choosing ::1 must fail to
+    # connect. That failure is the evidence: with "any" the same URL succeeds
+    # over 127.0.0.1, so only the family filter can account for the difference.
+    session = BlockingClient(verify=False, ip_family="ipv6").session()
+    with pytest.raises(lkrequest.RequestError):
+        session.get(f"{_localhost_url(server_url)}/get")
+
+    control = BlockingClient(verify=False, ip_family="any").session()
+    assert control.get(f"{_localhost_url(server_url)}/get").status_code == 200
+
+
+def test_ip_family_excluding_every_address_names_the_setting(server_url):
+    # A host that resolves only to the excluded family must say so. Reporting a
+    # bare "no addresses" here would read like a DNS outage and hide the cause.
+    session = BlockingClient(verify=False, ip_family="ipv6").session()
+    with pytest.raises(lkrequest.LkConnectionError) as caught:
+        session.get(f"{server_url}/get")
+    message = str(caught.value)
+    assert "ip_family" in message, message
+    assert "IPv6 policy" in message, message
+    assert "127.0.0.1" in message, message
+
+
+@pytest.mark.asyncio
+async def test_ip_family_applies_to_the_async_client_too(server_url):
+    client = lkrequest.Client(verify=False, ip_family="ipv4")
+    resp = await client.session().get(f"{server_url}/get")
+    assert resp.status_code == 200
+    assert resp.diagnostics["remote_addr"].startswith("127.0.0.1:")
+
+
+def test_ip_family_leaves_https_record_discovery_intact(server_url):
+    # Upstream's family policy wraps the resolver, and DnsResolver::lookup_https
+    # has a default implementation returning None. Forgetting to forward it would silently
+    # report that no host has an HTTPS record, which disables ECH and HTTP/3
+    # discovery without any error. A DoH resolver is the one that answers those
+    # queries, so pair it with the filter and check the client still builds and
+    # requests normally.
+    client = BlockingClient(verify=False, dns="cloudflare_https", ip_family="ipv4")
+    assert client.session().get(f"{server_url}/get").status_code == 200
+
+
+def _closed_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_ip_family_covers_the_proxy_ingress_without_falling_back_direct(server_url):
+    # The policy also covers the address this process dials to reach a proxy.
+    # An unreachable proxy normally falls back to a direct connection under
+    # proxy_fallback_direct=True — the control shows it would succeed here —
+    # but a policy rejection must not: falling back would leave from exactly the
+    # kind of address the caller excluded, through a route they did not choose.
+    port = _closed_port()
+    control = BlockingClient(verify=False, proxy_fallback_direct=True).session(
+        proxy=f"http://127.0.0.1:{port}"
+    )
+    assert control.get(f"{server_url}/get").status_code == 200
+
+    session = BlockingClient(
+        verify=False, ip_family="ipv4", proxy_fallback_direct=True
+    ).session(proxy=f"http://[::1]:{port}")
+    with pytest.raises(lkrequest.ProxyError, match="IPv4 policy"):
+        session.get(f"{server_url}/get")
+
+
+def test_ip_family_ipv6_refuses_ipv4_mapped_addresses(server_url):
+    # ::ffff:127.0.0.1 is an IPv6 literal that carries IPv4 traffic; letting it
+    # through would defeat "ipv6" without the caller noticing.
+    port = urlsplit(server_url).port
+    session = BlockingClient(verify=False, ip_family="ipv6").session()
+    with pytest.raises(lkrequest.LkConnectionError, match="IPv6 policy"):
+        session.get(f"https://[::ffff:127.0.0.1]:{port}/get")
+
+
+# ---------------------------------------------------------------------------
+# connect_to — dialing a fixed address under the original name
+# ---------------------------------------------------------------------------
+#
+# `connect-to.test` resolves nowhere, so a request to it can only succeed if the
+# mapping is what got dialed; the local server's echo of the Host header shows
+# the name the request was made under.
+
+
+class _TunnelingConnectProxy:
+    """An HTTP CONNECT proxy that records each request line and tunnels it."""
+
+    def __init__(self) -> None:
+        self.request_lines: list[str] = []
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self._listener.getsockname()[1]}"
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self) -> None:
+        while True:
+            try:
+                client, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    def _handle(self, client: socket.socket) -> None:
+        with client:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            request_line = head.split(b"\r\n", 1)[0].decode()
+            self.request_lines.append(request_line)
+            host, port = request_line.split()[1].rsplit(":", 1)
+            with socket.create_connection((host.strip("[]"), int(port))) as upstream:
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                pump = threading.Thread(
+                    target=self._pump, args=(upstream, client), daemon=True
+                )
+                pump.start()
+                self._pump(client, upstream)
+                pump.join(5)
+
+    @staticmethod
+    def _pump(source: socket.socket, sink: socket.socket) -> None:
+        try:
+            while data := source.recv(65536):
+                sink.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                sink.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self._listener.close()
+
+
+def test_connect_to_dials_the_mapped_address_under_the_original_name(server_url):
+    port = urlsplit(server_url).port
+    url = f"https://connect-to.test:{port}/get"
+    with pytest.raises(lkrequest.RequestError):
+        BlockingClient(verify=False).session().get(url, timeout=5.0)
+
+    client = BlockingClient(
+        verify=False, connect_to={f"connect-to.test:{port}": f"127.0.0.1:{port}"}
+    )
+    resp = client.session().get(url, timeout=5.0)
+    assert resp.status_code == 200
+    assert resp.json()["headers"]["Host"] == f"connect-to.test:{port}"
+    assert resp.diagnostics["remote_addr"] == f"127.0.0.1:{port}"
+
+
+def test_connect_to_hands_an_http_connect_proxy_the_address(server_url):
+    # The case ip_family cannot reach: an HTTP CONNECT proxy handed a hostname
+    # resolves it itself and picks the family. Given the mapping, the CONNECT
+    # line carries the address instead, while TLS and Host keep the name.
+    port = urlsplit(server_url).port
+    proxy = _TunnelingConnectProxy()
+    try:
+        client = BlockingClient(
+            verify=False,
+            ip_family="ipv4",
+            connect_to={f"connect-to.test:{port}": f"127.0.0.1:{port}"},
+        )
+        resp = client.session(proxy=proxy.url).get(
+            f"https://connect-to.test:{port}/get", timeout=5.0
+        )
+    finally:
+        proxy.close()
+    assert resp.status_code == 200
+    assert resp.json()["headers"]["Host"] == f"connect-to.test:{port}"
+    assert proxy.request_lines == [f"CONNECT 127.0.0.1:{port} HTTP/1.1"]
+
+
+def test_connect_to_leaves_other_origins_alone(server_url):
+    port = urlsplit(server_url).port
+    client = BlockingClient(
+        verify=False, connect_to={f"127.0.0.1:{port + 1}": "192.0.2.1:9"}
+    )
+    assert client.session().get(f"{server_url}/get", timeout=5.0).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ({"example.com": "192.0.2.1:443"}, "has no port"),
+        ({"example.com:0": "192.0.2.1:443"}, "invalid port"),
+        ({"::1:443": "192.0.2.1:443"}, "unbracketed IPv6 host"),
+        ({"exa mple.com:443": "192.0.2.1:443"}, "invalid host"),
+        ({"example.com:443": "192.0.2.1"}, 'must be "ip:port"'),
+        ({"example.com:443": "192.0.2.1:0"}, "non-zero port"),
+        (
+            {"Example.com:443": "192.0.2.1:443", "example.com:443": "192.0.2.2:443"},
+            "more than once",
+        ),
+    ],
+)
+def test_connect_to_rejects_malformed_entries(entries, message):
+    # Upstream panics on a bad host or a zero port; each must be a ValueError.
+    with pytest.raises(ValueError, match=message):
+        BlockingClient(connect_to=entries)
+
+
+@pytest.mark.parametrize(
+    ("family", "address"),
+    [
+        ("ipv4", "[2001:db8::1]:443"),
+        ("ipv6", "192.0.2.1:443"),
+        ("ipv6", "[::ffff:192.0.2.1]:443"),
+    ],
+)
+def test_connect_to_must_fit_ip_family(family, address):
+    # Both arrive in one call, so the contradiction is refused up front rather
+    # than surfacing as a connection error on the first request.
+    with pytest.raises(ValueError, match=f'ip_family="{family}" excludes'):
+        lkrequest.Client(ip_family=family, connect_to={"example.com:443": address})
+
+
+@pytest.mark.skipif(
+    not hasattr(lkrequest, "QuicProfile"),
+    reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
+)
+def test_connect_to_applies_to_http3(h3_server_url):
+    port = urlsplit(h3_server_url).port
+    client = BlockingClient(
+        quic_profile="chrome_154",
+        verify=False,
+        connect_to={f"connect-to.test:{port}": f"127.0.0.1:{port}"},
+    )
+    resp = client.session(http3_only=True).get(
+        f"https://connect-to.test:{port}/get", timeout=5.0
+    )
+    assert resp.status_code == 200
+    assert resp.version == lkrequest.HttpVersion.H3

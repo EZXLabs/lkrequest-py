@@ -14,7 +14,7 @@ A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for
 - **WebSocket** — wss:// connections with consistent fingerprinting
 - **Streaming responses** — `send_streaming()` receives large files chunk by chunk
 - **Cookie management** — Automatic cookie jar, with manual management, attribute setting, and overrides
-- **Proxy support** — HTTP CONNECT / SOCKS5 proxies, authentication, and ordered multi-hop chains; QUIC/H3 works over all-SOCKS5 chains
+- **Proxy support** — HTTP CONNECT / SOCKS5 proxies, authentication (username/password or a static HTTP credential such as `Bearer`), and ordered multi-hop chains; QUIC/H3 works over all-SOCKS5 chains
 - **Proxy pool & session pool** — Built-in proxy rotation, bad-proxy marking, and session management
 - **Multipart** — File upload support
 - **Retry strategies** — Exponential backoff / fixed interval / custom callable retries
@@ -32,9 +32,11 @@ A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for
 - **Protocol policy** — `ProtocolPolicy` / `HttpIntent` control H2/H3 selection, acquisition, and fallback (client / session / request level)
 - **Session resumption control** — `SessionResumptionConfig` controls TLS1.3 PSK / TLS1.2 ticket resumption (fingerprint shape); `Client(tls_session_resumption_policy=..., tls_session_cache_partition_policy=...)` controls whether tickets are *stored* and how the cache is keyed, and `session(network_partition_context=NetworkPartitionContext(top_level_site, frame_site))` reproduces the browser's per-site partitioning
 - **H2 DATA framing** — `Client(h2_data_frame_policy=H2DataFramePolicy.BROWSER_DEFAULT / PEER_MAX_FRAME_SIZE / fixed_payload(n) / socket_write_aligned(n))` chooses how request bodies are split into DATA frames
+- **Streaming uploads** — `session.post(url, body_stream=..., content_length=...)` uploads without buffering the body: a file-like object (`read(n)`), any iterable of `bytes`, or — on the async client — an async iterable. Omit `content_length` for an unknown-length body (chunked on HTTP/1.1, DATA frames on HTTP/2 and HTTP/3). The source is single-use, so it cannot be replayed for an automatic retry, a protocol fallback, or a redirect that must preserve the body
 - **TLS close_notify** — `Client(require_close_notify=True)` rejects a response whose body was truncated without a TLS close_notify alert
 - **Request-level protocol override** — `preferred_http_version` / `idempotency` (0-RTT replay-safety declaration)
-- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151/152 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
+- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151/152/153/154 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
+- **MASQUE proxies (experimental)** — Optional feature (`maturin develop --features masque`, implies `quic-h3`): `session(proxy="masque://proxy:443", http3_only=True)` carries the QUIC connection to the target over an RFC 9298 CONNECT-UDP tunnel; `Client(masque=MasqueConfig(...))` configures trust for the hop to the proxy, independently of `verify`; `HealthCheckConfig(tunnel_probe=True, masque=...)` probes MASQUE proxies in a pool with a real tunnel
 - **Synthetic fingerprints (advanced)** — Optional feature (`maturin develop --features synthetic-fp`): `Client(randomize=Randomize.recombine())` synthesizes a cross-layer (TLS+H2+H3) unique identity per session; `Randomize.full()` additionally draws out-of-corpus values for H2/QUIC; the `Layers` mask (e.g. `Randomize.recombine_layers(Layers.TLS | Layers.H2)`) restricts which layers are synthesized. Synthetic fingerprints match no real browser and are only for blocklist (negative-model) targets — against an allowlist they fail instantly
 
 ## Installation
@@ -238,6 +240,7 @@ session.set_cookie_with_attrs(
     "https://example.com", "secure_token", "xyz",
     path="/api", domain="example.com", secure=True, http_only=True,
 )
+session.set_cookie_raw("https://example.com", "sid=abc; Path=/; Secure; SameSite=Lax")
 
 # Remove and clear
 session.remove_cookie("https://example.com", "token")
@@ -247,6 +250,25 @@ session.clear_cookies()
 resp = session.get(url, cookie_override={"token": "override_value"})
 ```
 
+Reading attributes back — `get_cookies()` returns `(name, value)` pairs, which
+cannot tell two cookies sharing a name at different paths apart:
+
+```python
+for cookie in session.get_cookies_with_attrs("https://example.com/api"):
+    print(cookie.name, cookie.value, cookie.path, cookie.domain,
+          cookie.secure, cookie.http_only, cookie.same_site, cookie.expires)
+
+# The whole jar, across every domain — what to persist or hand to a browser
+for cookie in session.get_all_cookies():
+    if cookie.is_persistent:       # has an expiry; a session cookie has none
+        save(cookie)
+```
+
+`Cookie` is hashable, so two jars can be diffed with set operations.
+`get_all_cookies()` lists cookies oldest first, and the `Cookie` header follows
+Chrome's order — longer paths first, then older cookies first — so setting a
+saved jar back into a fresh session reproduces the same headers on the wire.
+
 ### Multipart file upload
 
 ```python
@@ -255,6 +277,42 @@ mp.text("title", "File upload")
 mp.file("document", "report.pdf", "application/pdf", pdf_bytes)
 resp = session.post("https://example.com/upload", multipart=mp)
 ```
+
+### Streaming uploads
+
+Upload without holding the whole body in memory. Pass `content_length` when the
+exact size is known; omit it for an unknown-length body.
+
+```python
+# A file on disk, exact length known
+with open("archive.zip", "rb") as f:
+    resp = await session.post(
+        "https://example.com/upload",
+        body_stream=f,
+        content_length=os.path.getsize("archive.zip"),
+    )
+
+# A generator of chunks, unknown length (chunked on HTTP/1.1, DATA frames on H2/H3)
+def chunks():
+    for block in blocks:
+        yield block
+
+resp = await session.post("https://example.com/upload", body_stream=chunks())
+
+# An async iterable — forward another response without buffering it
+async def relay():
+    stream = await session.send_streaming("GET", src)
+    async for chunk in stream:
+        yield chunk
+
+resp = await session.post(dst, body_stream=relay())
+```
+
+A supplied `content_length` is exact: a source that ends short or runs long
+fails the request. The source is single-use, so an automatic retry, a protocol
+fallback, or a redirect that must preserve the body cannot replay it — recreate
+the source and send again. The blocking client accepts a file-like object or a
+synchronous iterable; an async iterable needs the async client.
 
 ### Streaming responses
 
@@ -342,6 +400,57 @@ proxy = await pool.acquire()
 TCP-based HTTP supports mixed HTTP CONNECT and SOCKS5 hops. QUIC/HTTP3 requires
 every hop in the chain to be SOCKS5; a chain containing an HTTP hop falls back
 to H2 when `http3_with_fallback=True`.
+
+Credentials other than a URL's `user:pass` are set on a `ProxyConfig`; each
+setter returns a new config:
+
+```python
+proxy = (
+    lkrequest.ProxyConfig("http://gateway:8080")
+    .with_http_auth("Bearer", "token")      # sent as-is after the scheme
+    .with_auth_header("authorization")      # default: "proxy-authorization"
+)
+proxy = lkrequest.ProxyConfig("http://gateway:8080").with_user_pass("user", "pass")
+```
+
+### MASQUE proxy (experimental)
+
+> **Experimental.** MASQUE support is experimental upstream and in this binding.
+> `MasqueConfig`, the `masque=` / `tunnel_probe=` parameters and how `masque://`
+> routes behave may change in any release without a deprecation period, and
+> interoperability has so far been checked only against test proxies, not
+> against independent production MASQUE deployments. Pin the version if you
+> depend on it.
+
+Requires the `masque` feature. A `masque://` proxy (port 443 by default) carries
+the QUIC connection to the target inside an RFC 9298 CONNECT-UDP tunnel, over an
+HTTP/3 connection to the proxy. The target is named in the tunnel request, so
+DNS is resolved proxy-side, as with `socks5h`.
+
+```python
+masque = lkrequest.MasqueConfig(
+    ca_cert="proxy-ca.pem",      # or ca_cert_pem=b"...", server_name="proxy.example"
+    tunnel_idle_timeout=120.0,   # None: never retire an idle tunnel
+    max_idle_tunnels=256,        # 0: no cap
+)
+client = lkrequest.Client(quic_profile="chrome_153", masque=masque)
+session = client.session(proxy="masque://proxy.example:443", http3_only=True)
+
+# Probe MASQUE proxies in a pool with a real CONNECT-UDP tunnel. Without
+# tunnel_probe they are skipped by the health check (a TCP connect proves nothing).
+health = lkrequest.HealthCheckConfig(tunnel_probe=True, masque=masque)
+```
+
+- Trust for the hop to the proxy is configured only in `MasqueConfig`: the
+  client's `verify` / `ca_cert*` govern the origin and are never inherited.
+  `MasqueConfig(verify=False)` is for development only — anything answering on
+  the proxy's address then sees every tunnel's target.
+- UDP only: HTTP/1.1 and HTTP/2 requests through a MASQUE proxy raise
+  `ProxyError`, and a failed tunnel never falls back to a direct connection,
+  even with `proxy_fallback_direct=True`. A MASQUE proxy cannot be a chain hop.
+- The connection to the proxy is not a browser fingerprint; the tunneled
+  connection to the origin is. DNS-discovered ECH configs and H3 hints are not
+  available on a MASQUE route (an explicit `ech_config` still applies).
 
 ### Session pool
 
@@ -624,6 +733,50 @@ client = lkrequest.Client(use_native_certs=True)             # system certificat
 client = lkrequest.Client(ech_config=ech_bytes)              # ECH support
 ```
 
+### Address family
+
+On a dual-stack host the OS resolver orders IPv6 first, so a target with an AAAA
+record is reached over IPv6 whenever IPv6 works. `ip_family` pins it, which
+matters when a session must present one source address to the target rather than
+leaving over two different families:
+
+```python
+client = lkrequest.Client(ip_family="ipv4")   # never IPv6
+client = lkrequest.Client(ip_family="ipv6")   # never IPv4
+client = lkrequest.Client(ip_family="any")    # resolver's own order (default)
+```
+
+An address outside the family raises rather than falling back — not even to a
+direct connection under `proxy_fallback_direct=True` — so the setting cannot be
+defeated silently. `"ipv6"` also refuses IPv4-mapped addresses
+(`::ffff:a.b.c.d`). The setting covers every address **this process** picks:
+
+| Case | With `ip_family="ipv4"` |
+|---|---|
+| Direct connection | IPv4 only; a host with no A record fails |
+| The proxy's own address, a SOCKS5 UDP relay | IPv4 only |
+| `socks5://` target (resolved locally) | IPv4 only |
+| HTTP `CONNECT`, `socks5h://` or MASQUE, hostname target | resolved by the proxy, which may still dial IPv6 |
+| The resolver's own DNS / DoH queries | not restricted |
+
+To choose what a proxy dials, map the origin to an address with `connect_to`:
+
+```python
+client = lkrequest.Client(
+    ip_family="ipv4",
+    connect_to={"example.com:443": "192.0.2.1:443"},  # IPv6 as "[2001:db8::1]:443"
+)
+session = client.session(proxy="http://proxy.example:8080")
+# The proxy receives `CONNECT 192.0.2.1:443`; TLS SNI, certificate checks,
+# the Host header and cookies still use example.com.
+```
+
+The mapping is fixed — nothing re-resolves or refreshes it. It applies to direct,
+proxied and HTTP/3 connections alike, ahead of Alt-Svc / SVCB endpoints, and
+never to the proxy's own address. It pins the target the proxy dials, not the
+proxy provider's public egress address; behind a proxy `diagnostics["remote_addr"]`
+is the proxy's address, so check the egress with the target's own echo.
+
 ### Zero-copy Response
 
 ```python
@@ -633,6 +786,34 @@ mv = memoryview(resp)       # zero-copy access to body
 text = resp.text()          # cached after first decode
 data = resp.json()          # cached after first parse
 ```
+
+### Text decoding
+
+`text()` decodes with the charset from `Content-Type`, falling back to UTF-8
+when the response declares none. Malformed bytes become U+FFFD instead of
+raising, so a single bad byte never costs you the whole body — reach for
+`content` when the exact bytes matter.
+
+```python
+resp = session.get("https://example.com")   # Content-Type: text/html; charset=gbk
+resp.encoding                               # 'gbk'
+resp.text()                                 # decoded as GBK
+
+resp.text(encoding="latin-1")               # override a missing or wrong charset
+```
+
+A charset from the header is resolved the way a browser resolves it, against
+the WHATWG Encoding Standard. An `encoding=` argument goes to Python's codec
+registry instead, so Python spellings the web standard does not list
+(`latin-1`, `utf-8-sig`, `cp936`) work as written.
+
+A leading BOM is stripped, and a BOM that contradicts the declared charset is
+believed over it — again the browser rule. So a `charset=gbk` response whose
+body opens with a UTF-8 BOM decodes as UTF-8, and `text()` never hands back the
+invisible U+FEFF that breaks `json.loads` and `startswith`.
+
+A streaming response's `text()` decodes the same way and takes the same
+`encoding=` argument (`await stream.text(encoding="gbk")` on the async client).
 
 ### Logging
 
@@ -677,12 +858,19 @@ except lkrequest.RequestError as e:
 | `Client.chrome_150()` | Chrome 150 | Chrome 150 | Chrome |
 | `Client.chrome_151()` | Chrome 151 | Chrome 151 | Chrome |
 | `Client.chrome_152()` | Chrome 152 | Chrome 152 | Chrome |
+| `Client.chrome_153()` | Chrome 153 | Chrome 153 | Chrome |
+| `Client.chrome_154()` | Chrome 154 | Chrome 154 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
+| `Client.firefox_156()` | Firefox 156 | Firefox 156 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
 | `Client.safari_26()` | Safari 26 | Safari 26 | Safari |
 
 TCP fingerprints are OS-specific: `chrome_win` / `chrome_linux` / `chrome_macos` / `firefox_win` / `firefox_linux` / `firefox_macos` / `safari`
+
+Only the Chrome presets carry a QUIC / HTTP3 fingerprint (with the `quic-h3` feature). The Firefox and Safari presets turn HTTP/3 off, and building with `quic-h3` does not change that.
+
+A preset sets the header **order**, not header values: a request from `Client.chrome_154()` carries no `User-Agent`, `Accept` or other browser headers unless you set them, through `default_headers=` or per request.
 
 ## API Reference
 
@@ -700,6 +888,7 @@ TCP fingerprints are OS-specific: `chrome_win` / `chrome_linux` / `chrome_macos`
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | Resource limits / DoS protection |
 | `max_pending_h2_requests` | Cap HTTP/2 requests queued for a remote stream slot (default: unbounded) |
 | `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | Fault-tolerance options |
+| `h2_dispatch_batch_size` | Ready HTTP/2 requests coalesced into one driver write turn (default: 1) |
 | `h2_data_frame_policy` | How request bodies are split into HTTP/2 DATA frames (`H2DataFramePolicy`) |
 | `require_close_notify` | Reject a body truncated without a TLS close_notify alert (default: `False`) |
 | `tls_session_resumption_policy` / `tls_session_cache_partition_policy` | Whether TLS tickets are stored, and how the ticket cache is keyed |
@@ -707,8 +896,11 @@ TCP fingerprints are OS-specific: `chrome_win` / `chrome_linux` / `chrome_macos`
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | Certificate configuration |
 | `ech_config` | ECH configuration |
 | `dns` | Custom DNS |
+| `ip_family` | Restrict connections to one address family: `"any"` (default), `"ipv4"`, `"ipv6"` |
+| `connect_to` | Dial a fixed address for an origin, `{"host:port": "ip:port"}`; TLS, `Host` and cookies keep the original name |
 | `system_dns_cache_ttl` / `system_dns_cache_max_entries` | Cache successful OS-resolver lookups for `ttl` seconds (TTL `0` disables caching but keeps in-flight coalescing; cannot be combined with `dns`) |
 | `keylog` | TLS key log file path |
+| `masque` | `MasqueConfig` for the hop to a `masque://` proxy (requires the `masque` feature) |
 
 | Method | Description |
 |------|------|
@@ -739,7 +931,8 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `pool_stats()` | Connection pool stats (`PoolStats`) |
 | `on_request(callback)` / `on_response(callback)` | Register event hooks |
 | `set_cookie()` / `set_cookie_with_attrs()` / `set_cookie_raw()` | Set cookies |
-| `get_cookie()` / `get_cookies()` / `get_cookie_values()` / `cookie_header()` | Read cookies |
+| `get_cookie()` / `get_cookies()` / `get_cookie_values()` / `cookie_header()` | Read cookie names and values |
+| `get_cookies_with_attrs()` / `get_all_cookies()` | Read cookies as `Cookie` objects, with attributes |
 | `remove_cookie()` / `clear_cookies()` | Remove cookies |
 
 ### Response
@@ -754,10 +947,10 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `headers_list` | Response headers list (`list[tuple[str, str]]`) |
 | `content` | Raw bytes |
 | `content_length` | Content-Length |
-| `text()` | UTF-8 text (cached) |
-| `json()` | Parse JSON (cached) |
+| `text(encoding=None)` | Decoded text, using the declared charset (cached) |
+| `json()` | Parse JSON (cached); raises `JsonDecodeError` |
 | `cookies` | Response cookies |
-| `encoding` | Character encoding |
+| `encoding` | Charset declared in `Content-Type` |
 | `elapsed` | Request duration (seconds) |
 | `diagnostics` | Per-phase timing dict: `dns_ms`/`tcp_ms`/`tls_ms`/`ttfb_ms`/`total_ms` + `remote_addr`/`protocol`/`cipher_suite` (None for phases not measured) |
 | `was_redirected` | Whether it went through a redirect |
@@ -816,6 +1009,7 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `LkTimeoutError` | Timeout |
 | `TooManyRedirectsError` | Too many redirects |
 | `ResourceLimitError` | Resource limit exceeded |
+| `JsonDecodeError` | `json()` got a body that is not JSON (also a `json.JSONDecodeError`) |
 
 ## Examples
 
@@ -840,11 +1034,13 @@ The `examples/` directory contains complete examples for every feature:
 | `custom_fingerprint.py` | Fully custom TlsProfile / H2Profile / TcpFingerprint |
 | `fingerprint_validation.py` | validate_fingerprint_consistency |
 | `streaming_response.py` | StreamingResponse chunked / full reads |
+| `streaming_upload.py` | body_stream file-like / generator / async iterable, content_length |
 | `connection_prewarming.py` | preconnect / preconnect_many / prefetch |
 | `metrics.py` | enable_metrics / snapshot / prometheus_text |
 | `timeout_config.py` | Timeout configuration, ResourceLimits |
 | `accept_encoding.py` | AcceptEncoding control, no_decompress |
 | `certificate_config.py` | CA cert PEM/DER/file, verify, ECH |
+| `ip_family.py` | `ip_family=` address-family selection, offline and against a live dual-stack host |
 | `logging_config.py` | set_log_level, filter directives |
 | `error_handling.py` | All exception types, general error-handling patterns |
 | `pool_stats.py` | PoolStats connection pool statistics |

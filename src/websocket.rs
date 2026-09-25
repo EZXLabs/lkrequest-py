@@ -15,8 +15,12 @@ type WsStream = hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>;
 // WsMessage
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "WsMessage", eq)]
-#[derive(Clone, PartialEq)]
+// `hash` alongside `eq` because `eq` on its own makes CPython set
+// `__hash__ = None`, leaving the type unusable as a dict key or set member.
+// `frozen` is required by `hash` and holds here: a message is built once, by a
+// constructor or by the receive path, and only ever read afterwards.
+#[pyclass(name = "WsMessage", eq, hash, frozen)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum PyWsMessage {
     Text { data: String },
     Binary { data: Vec<u8> },

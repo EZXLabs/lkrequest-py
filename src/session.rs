@@ -16,6 +16,102 @@ use crate::types::{serialize_json, validated_duration, PyAcceptEncoding, StrPair
 use crate::websocket::{PyBlockingWsConnection, PyWsConnection};
 
 // ---------------------------------------------------------------------------
+// Cookie — a jar entry with its attributes
+// ---------------------------------------------------------------------------
+
+/// A cookie from the session's jar, with the attributes that decide when it is
+/// sent.
+///
+/// `hash` alongside `eq` deliberately: `eq` on its own would make CPython set
+/// `__hash__ = None`, and a cookie that cannot go in a set is a poor tool for
+/// diffing two jars.
+#[pyclass(name = "Cookie", frozen, eq, hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct PyCookie {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    value: String,
+    /// The domain the cookie is scoped to.
+    #[pyo3(get)]
+    domain: Option<String>,
+    /// True when the cookie matches `domain` exactly because the `Set-Cookie`
+    /// carried no `Domain`; false when a `Domain` was given and subdomains
+    /// match too.
+    #[pyo3(get)]
+    host_only: bool,
+    /// The effective path — the `Path` attribute, or the default path derived
+    /// from the request URI when the server sent none.
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    secure: bool,
+    #[pyo3(get)]
+    http_only: bool,
+    /// `"Strict"` / `"Lax"` / `"None"`, or `None` when unset.
+    #[pyo3(get)]
+    same_site: Option<String>,
+    /// Expiry as a Unix timestamp in whole seconds, or `None` for a session
+    /// cookie. Pass to `datetime.fromtimestamp()` for a datetime.
+    #[pyo3(get)]
+    expires: Option<i64>,
+}
+
+#[pymethods]
+impl PyCookie {
+    /// True when the cookie has an expiry, and so is worth persisting.
+    #[getter]
+    fn is_persistent(&self) -> bool {
+        self.expires.is_some()
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        // Every field goes through Python's own `repr()`, so strings are quoted
+        // and escaped the Python way and absent values read `None` rather than
+        // Rust's `Some("…")` / `true`.
+        Ok(format!(
+            "Cookie(name={}, value={}, domain={}, path={}, secure={}, \
+             http_only={}, same_site={}, expires={})",
+            py_repr(py, &self.name)?,
+            py_repr(py, &self.value)?,
+            py_repr(py, &self.domain)?,
+            py_repr(py, &self.path)?,
+            py_repr(py, self.secure)?,
+            py_repr(py, self.http_only)?,
+            py_repr(py, &self.same_site)?,
+            py_repr(py, self.expires)?,
+        ))
+    }
+}
+
+/// Python's `repr()` of a Rust value, via its Python conversion.
+fn py_repr<'py, T>(py: Python<'py>, value: T) -> PyResult<String>
+where
+    T: IntoPyObject<'py>,
+{
+    use pyo3::BoundObject;
+
+    let object = value.into_pyobject(py).map_err(Into::into)?;
+    Ok(object.into_bound().into_any().repr()?.to_string())
+}
+
+impl From<lkrequest::CookieInfo> for PyCookie {
+    fn from(c: lkrequest::CookieInfo) -> Self {
+        PyCookie {
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            host_only: c.host_only,
+            path: c.path,
+            secure: c.secure,
+            http_only: c.http_only,
+            same_site: c.same_site,
+            expires: c.expires_unix,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event Hooks
 // ---------------------------------------------------------------------------
 
@@ -105,6 +201,15 @@ struct RequestOpts {
     h3_header_order: Option<Vec<String>>,
     protocol_policy: Option<lkrequest::ProtocolPolicy>,
     http_intent: Option<lkrequest::HttpIntent>,
+    /// A streaming upload source. Rides in this bundle rather than alongside
+    /// `raw_body` because, unlike the buffered bodies, it is only accepted on
+    /// the methods that already take one — and it is classified before the
+    /// request is built, so a bad argument raises from the call.
+    body_stream: Option<crate::upload::UploadSource>,
+    /// Exact byte count for `body_stream`. `None` leaves framing to the
+    /// transport: chunked on HTTP/1.1, DATA frames with no `Content-Length`
+    /// on HTTP/2 and HTTP/3.
+    content_length: Option<u64>,
 }
 
 /// Apply a [`PreparedRequest`]'s options to a fresh `RequestBuilder` (method
@@ -206,6 +311,10 @@ fn apply_request_options(
         rb = rb.multipart(mp);
     } else if let Some(body) = req.raw_body {
         rb = rb.body(body);
+    } else if let Some(source) = req.opts.body_stream {
+        // Single-use by construction: upstream cannot replay it for an automatic
+        // retry, a protocol fallback, or a redirect that must preserve the body.
+        rb = rb.body_stream(source.into_stream(), req.opts.content_length);
     }
 
     Ok(rb)
@@ -275,14 +384,24 @@ fn validate_body_params(
     data: &Option<Vec<(String, String)>>,
     body: &Option<Vec<u8>>,
     multipart: &Option<lkrequest::multipart::Multipart>,
+    body_stream: &Option<crate::upload::UploadSource>,
+    content_length: Option<u64>,
 ) -> PyResult<()> {
     let count = json.is_some() as u8
         + data.is_some() as u8
         + body.is_some() as u8
-        + multipart.is_some() as u8;
+        + multipart.is_some() as u8
+        + body_stream.is_some() as u8;
     if count > 1 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot specify more than one of: json, data, body, multipart",
+            "Cannot specify more than one of: json, data, body, multipart, body_stream",
+        ));
+    }
+    // Every other body form knows its own size, so a length here would either be
+    // redundant or contradict the body — neither is worth guessing at.
+    if content_length.is_some() && body_stream.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "content_length requires body_stream",
         ));
     }
     Ok(())
@@ -365,7 +484,14 @@ impl PySession {
         let params = params.map(|p| p.0);
         let form_data = form_data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
-        validate_body_params(&json_body, &form_data, &raw_body, &multipart)?;
+        validate_body_params(
+            &json_body,
+            &form_data,
+            &raw_body,
+            &multipart,
+            &opts.body_stream,
+            opts.content_length,
+        )?;
         let session = self.inner.clone();
         let hooks = self.hooks.clone();
         let prepared = PreparedRequest {
@@ -448,11 +574,13 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: None,
+                content_length: None,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn post<'py>(
         &self,
         py: Python<'py>,
@@ -463,6 +591,8 @@ impl PySession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -481,6 +611,9 @@ impl PySession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_request(
             py,
@@ -509,11 +642,13 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn request<'py>(
         &self,
         py: Python<'py>,
@@ -525,6 +660,8 @@ impl PySession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -543,6 +680,9 @@ impl PySession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_request(
             py,
@@ -571,11 +711,13 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn put<'py>(
         &self,
         py: Python<'py>,
@@ -586,6 +728,8 @@ impl PySession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -604,6 +748,9 @@ impl PySession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_request(
             py,
@@ -632,11 +779,13 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn delete<'py>(
         &self,
         py: Python<'py>,
@@ -646,6 +795,8 @@ impl PySession {
         json: Option<Bound<'py, PyAny>>,
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -664,6 +815,9 @@ impl PySession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         self.make_request(
             py,
             "DELETE",
@@ -691,6 +845,8 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
@@ -738,12 +894,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: None,
+                content_length: None,
                 ..Default::default()
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn patch<'py>(
         &self,
         py: Python<'py>,
@@ -754,6 +912,8 @@ impl PySession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -772,6 +932,9 @@ impl PySession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_request(
             py,
@@ -800,6 +963,8 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
@@ -847,6 +1012,8 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: None,
+                content_length: None,
                 ..Default::default()
             },
         )
@@ -921,6 +1088,22 @@ impl PySession {
 
     fn get_cookies(&self, url: &str) -> Vec<(String, String)> {
         self.inner.get_cookies(url)
+    }
+
+    fn get_cookies_with_attrs(&self, url: &str) -> Vec<PyCookie> {
+        self.inner
+            .get_cookies_with_attrs(url)
+            .into_iter()
+            .map(PyCookie::from)
+            .collect()
+    }
+
+    fn get_all_cookies(&self) -> Vec<PyCookie> {
+        self.inner
+            .get_all_cookies()
+            .into_iter()
+            .map(PyCookie::from)
+            .collect()
     }
 
     fn remove_cookie(&self, url: &str, name: &str) {
@@ -1001,7 +1184,7 @@ impl PySession {
 
     // --- Streaming -----------------------------------------------------------
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, accept_encoding=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, accept_encoding=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     #[allow(clippy::too_many_arguments)]
     fn send_streaming<'py>(
         &self,
@@ -1014,6 +1197,8 @@ impl PySession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -1028,12 +1213,15 @@ impl PySession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         let headers = headers.map(|p| p.0);
         let params = params.map(|p| p.0);
         let data = data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
-        validate_body_params(&json_str, &data, &body, &mp)?;
+        validate_body_params(&json_str, &data, &body, &mp, &upload, content_length)?;
         let session = self.inner.clone();
         let prepared = PreparedRequest {
             method: method.to_string(),
@@ -1058,6 +1246,8 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
                 ..Default::default()
             },
         };
@@ -1131,7 +1321,14 @@ impl PyBlockingSession {
         let params = params.map(|p| p.0);
         let form_data = form_data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
-        validate_body_params(&json_body, &form_data, &raw_body, &multipart)?;
+        validate_body_params(
+            &json_body,
+            &form_data,
+            &raw_body,
+            &multipart,
+            &opts.body_stream,
+            opts.content_length,
+        )?;
         let session = self.inner.clone();
         let hooks = self.hooks.clone();
         let prepared = PreparedRequest {
@@ -1213,11 +1410,13 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: None,
+                content_length: None,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn post(
         &self,
         py: Python<'_>,
@@ -1228,6 +1427,8 @@ impl PyBlockingSession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -1246,6 +1447,9 @@ impl PyBlockingSession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_blocking_request(
             py,
@@ -1274,11 +1478,13 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn request(
         &self,
         py: Python<'_>,
@@ -1290,6 +1496,8 @@ impl PyBlockingSession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -1308,6 +1516,9 @@ impl PyBlockingSession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_blocking_request(
             py,
@@ -1336,11 +1547,13 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn put(
         &self,
         py: Python<'_>,
@@ -1351,6 +1564,8 @@ impl PyBlockingSession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -1369,6 +1584,9 @@ impl PyBlockingSession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_blocking_request(
             py,
@@ -1397,11 +1615,13 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn delete(
         &self,
         py: Python<'_>,
@@ -1411,6 +1631,8 @@ impl PyBlockingSession {
         json: Option<Bound<'_, PyAny>>,
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -1429,6 +1651,9 @@ impl PyBlockingSession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         self.make_blocking_request(
             py,
             "DELETE",
@@ -1456,6 +1681,8 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
@@ -1503,12 +1730,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: None,
+                content_length: None,
                 ..Default::default()
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn patch(
         &self,
         py: Python<'_>,
@@ -1519,6 +1748,8 @@ impl PyBlockingSession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -1537,6 +1768,9 @@ impl PyBlockingSession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         self.make_blocking_request(
             py,
@@ -1565,6 +1799,8 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
             },
         )
     }
@@ -1612,6 +1848,8 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: None,
+                content_length: None,
                 ..Default::default()
             },
         )
@@ -1678,12 +1916,32 @@ impl PyBlockingSession {
             .set_cookie_with_attrs(url, name, value, path, domain, secure, http_only);
     }
 
+    fn set_cookie_raw(&self, url: &str, set_cookie_header: &str) {
+        self.inner.set_cookie_raw(url, set_cookie_header);
+    }
+
     fn get_cookie(&self, url: &str, name: &str) -> Option<String> {
         self.inner.get_cookie(url, name)
     }
 
     fn get_cookies(&self, url: &str) -> Vec<(String, String)> {
         self.inner.get_cookies(url)
+    }
+
+    fn get_cookies_with_attrs(&self, url: &str) -> Vec<PyCookie> {
+        self.inner
+            .get_cookies_with_attrs(url)
+            .into_iter()
+            .map(PyCookie::from)
+            .collect()
+    }
+
+    fn get_all_cookies(&self) -> Vec<PyCookie> {
+        self.inner
+            .get_all_cookies()
+            .into_iter()
+            .map(PyCookie::from)
+            .collect()
     }
 
     fn get_cookie_values(&self, url: &str, name: &str) -> Vec<String> {
@@ -1770,7 +2028,7 @@ impl PyBlockingSession {
 
     // --- Streaming -----------------------------------------------------------
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, accept_encoding=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, accept_encoding=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     #[allow(clippy::too_many_arguments)]
     fn send_streaming(
         &self,
@@ -1783,6 +2041,8 @@ impl PyBlockingSession {
         data: Option<StrPairs>,
         body: Option<Vec<u8>>,
         multipart: Option<Py<PyMultipart>>,
+        body_stream: Option<Bound<'_, PyAny>>,
+        content_length: Option<u64>,
         cookies: Option<HashMap<String, String>>,
         cookie_override: Option<HashMap<String, String>>,
         timeout: Option<f64>,
@@ -1797,12 +2057,15 @@ impl PyBlockingSession {
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<crate::response::PyBlockingStreamingResponse> {
         let json_str = serialize_json(py, json)?;
+        let upload = body_stream
+            .map(|source| crate::upload::UploadSource::extract(&source))
+            .transpose()?;
         let mp = extract_multipart(py, multipart);
         let headers = headers.map(|p| p.0);
         let params = params.map(|p| p.0);
         let data = data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
-        validate_body_params(&json_str, &data, &body, &mp)?;
+        validate_body_params(&json_str, &data, &body, &mp, &upload, content_length)?;
         let session = self.inner.clone();
         let prepared = PreparedRequest {
             method: method.to_string(),
@@ -1827,6 +2090,8 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                body_stream: upload,
+                content_length,
                 ..Default::default()
             },
         };

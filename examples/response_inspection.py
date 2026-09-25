@@ -45,6 +45,17 @@ def main():
     data = resp.json()
     print(f"json() 结果类型: {type(data).__name__}")
 
+    # --- 字符集解码 ---
+    # text() 按 Content-Type 声明的 charset 解码, 未声明时回落 UTF-8。
+    print("\n=== 字符集解码 ===")
+    gbk = session.get("https://httpbin.org/encoding/utf8")
+    print(f"声明的 charset: {gbk.encoding}")
+    print(f"text() 前 40 字: {gbk.text()[:40]!r}")
+
+    # 服务器没声明或声明错了, 用 encoding= 覆盖。无法解码的字节转为 U+FFFD,
+    # 不会抛异常 —— 需要精确字节时用 content。
+    print(f"text(encoding='latin-1') 前 40 字: {gbk.text(encoding='latin-1')[:40]!r}")
+
     # --- memoryview (零拷贝, 仅 full-API wheel 支持) ---
     try:
         mv = memoryview(resp)

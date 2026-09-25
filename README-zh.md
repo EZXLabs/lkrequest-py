@@ -14,7 +14,7 @@ Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性�
 - **WebSocket** — 支持 wss:// 连接，保持指纹一致性
 - **流式响应** — `send_streaming()` 逐块接收大文件
 - **Cookie 管理** — 自动 Cookie Jar，支持手动管理、属性设置、覆盖
-- **代理支持** — HTTP CONNECT / SOCKS5 代理、认证和有序多跳代理链；全 SOCKS5 链支持 QUIC/H3
+- **代理支持** — HTTP CONNECT / SOCKS5 代理、认证（用户名密码，或 `Bearer` 等静态 HTTP 凭证）和有序多跳代理链；全 SOCKS5 链支持 QUIC/H3
 - **代理池 & 会话池** — 内置代理轮换、坏代理标记和会话管理
 - **Multipart** — 文件上传支持
 - **重试策略** — 指数退避 / 固定间隔 / 自定义 callable 重试
@@ -32,9 +32,11 @@ Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性�
 - **协议策略** — `ProtocolPolicy` / `HttpIntent` 控制 H2/H3 选择、获取与回退（client / session / 请求级）
 - **会话恢复控制** — `SessionResumptionConfig` 控制 TLS1.3 PSK / TLS1.2 ticket 恢复（指纹形态层）；`Client(tls_session_resumption_policy=..., tls_session_cache_partition_policy=...)` 控制 ticket 是否**存储**以及缓存如何分键，`session(network_partition_context=NetworkPartitionContext(top_level_site, frame_site))` 复现浏览器的按站点分区行为
 - **H2 DATA 分帧** — `Client(h2_data_frame_policy=H2DataFramePolicy.BROWSER_DEFAULT / PEER_MAX_FRAME_SIZE / fixed_payload(n) / socket_write_aligned(n))` 选择请求体如何切分为 DATA 帧
+- **流式上传** — `session.post(url, body_stream=..., content_length=...)` 不缓冲整个 body：可传 file-like 对象（`read(n)`）、任意 `bytes` 可迭代对象，异步客户端还可传异步可迭代对象。省略 `content_length` 即未知长度（HTTP/1.1 走 chunked，HTTP/2 / HTTP/3 走 DATA 帧）。源是**单次使用**的，因此无法用于自动重试、协议回落，或必须保留请求体的重定向
 - **TLS close_notify** — `Client(require_close_notify=True)` 拒绝未收到 TLS close_notify 警报就被截断的响应体
 - **请求级协议覆盖** — `preferred_http_version` / `idempotency`（0-RTT 重放安全声明）
-- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151/152 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
+- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151/152/153/154 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
+- **MASQUE 代理（实验性）** — 可选 feature（`maturin develop --features masque`，隐含 `quic-h3`）：`session(proxy="masque://proxy:443", http3_only=True)` 把到目标的 QUIC 连接放进 RFC 9298 CONNECT-UDP 隧道；`Client(masque=MasqueConfig(...))` 配置到代理这一跳的信任，与 `verify` 相互独立；`HealthCheckConfig(tunnel_probe=True, masque=...)` 用真实隧道探测代理池中的 MASQUE 代理
 - **合成指纹（高级）** — 可选 feature（`maturin develop --features synthetic-fp`）：`Client(randomize=Randomize.recombine())` 为每个 session 合成一个跨层（TLS+H2+H3）唯一身份；`Randomize.full()` 进一步对 H2/QUIC 取语料外数值；`Layers` 掩码（如 `Randomize.recombine_layers(Layers.TLS | Layers.H2)`）限定合成层。合成指纹不匹配任何真实浏览器，仅用于黑名单（negative-model）目标，对白名单会立即失败
 
 ## 安装
@@ -238,6 +240,7 @@ session.set_cookie_with_attrs(
     "https://example.com", "secure_token", "xyz",
     path="/api", domain="example.com", secure=True, http_only=True,
 )
+session.set_cookie_raw("https://example.com", "sid=abc; Path=/; Secure; SameSite=Lax")
 
 # 删除与清空
 session.remove_cookie("https://example.com", "token")
@@ -247,6 +250,23 @@ session.clear_cookies()
 resp = session.get(url, cookie_override={"token": "override_value"})
 ```
 
+读回属性 —— `get_cookies()` 返回的是 `(name, value)`，无法区分同名但 path 不同的两条 cookie：
+
+```python
+for cookie in session.get_cookies_with_attrs("https://example.com/api"):
+    print(cookie.name, cookie.value, cookie.path, cookie.domain,
+          cookie.secure, cookie.http_only, cookie.same_site, cookie.expires)
+
+# 整个 jar（跨所有域）—— 用于持久化，或交给浏览器
+for cookie in session.get_all_cookies():
+    if cookie.is_persistent:       # 有过期时间；会话 cookie 没有
+        save(cookie)
+```
+
+`Cookie` 可哈希，所以两个 jar 可以用集合运算做差。`get_all_cookies()` 按创建顺序从旧到新
+返回，而 `Cookie` 头按 Chrome 的规则排序（path 长的在前，同 path 下旧的在前），因此把存下来的
+jar 写回一个新 session，线上发出的 `Cookie` 头能逐字还原。
+
 ### Multipart 文件上传
 
 ```python
@@ -255,6 +275,39 @@ mp.text("title", "文件上传")
 mp.file("document", "report.pdf", "application/pdf", pdf_bytes)
 resp = session.post("https://example.com/upload", multipart=mp)
 ```
+
+### 流式上传
+
+上传时不把整个 body 留在内存里。已知精确大小时传 `content_length`，未知长度则省略。
+
+```python
+# 磁盘文件，已知精确长度
+with open("archive.zip", "rb") as f:
+    resp = await session.post(
+        "https://example.com/upload",
+        body_stream=f,
+        content_length=os.path.getsize("archive.zip"),
+    )
+
+# 分块生成器，未知长度（HTTP/1.1 走 chunked，H2/H3 走 DATA 帧）
+def chunks():
+    for block in blocks:
+        yield block
+
+resp = await session.post("https://example.com/upload", body_stream=chunks())
+
+# 异步可迭代对象 —— 不缓冲地转发另一个响应
+async def relay():
+    stream = await session.send_streaming("GET", src)
+    async for chunk in stream:
+        yield chunk
+
+resp = await session.post(dst, body_stream=relay())
+```
+
+传入的 `content_length` 是**精确值**：源提前结束或超出都会让请求失败。源是**单次使用**的，
+所以自动重试、协议回落，以及必须保留请求体的重定向都无法重放它 —— 需要重建源再发一次。
+阻塞客户端接受 file-like 对象或同步可迭代对象；异步可迭代对象只能用于异步客户端。
 
 ### 流式响应
 
@@ -341,6 +394,50 @@ proxy = await pool.acquire()
 
 基于 TCP 的 HTTP 支持混合使用 HTTP CONNECT 与 SOCKS5 跳。QUIC/HTTP3 要求链中
 每一跳都是 SOCKS5；链中含 HTTP 跳时，设置 `http3_with_fallback=True` 可回退 H2。
+
+URL 中 `user:pass` 以外的凭证在 `ProxyConfig` 上设置，每个 setter 都返回新对象：
+
+```python
+proxy = (
+    lkrequest.ProxyConfig("http://gateway:8080")
+    .with_http_auth("Bearer", "token")      # scheme 之后原样发送
+    .with_auth_header("authorization")      # 默认 "proxy-authorization"
+)
+proxy = lkrequest.ProxyConfig("http://gateway:8080").with_user_pass("user", "pass")
+```
+
+### MASQUE 代理（实验性）
+
+> **实验性功能。** MASQUE 支持在上游和本绑定中都处于实验阶段：`MasqueConfig`、
+> `masque=` / `tunnel_probe=` 参数以及 `masque://` 路由的行为，可能在任何版本中
+> 变更且不经过弃用期；互通性目前只在测试代理上验证过，尚未对独立的生产环境 MASQUE
+> 部署做过验证。如需依赖请固定版本。
+
+需要 `masque` feature。`masque://` 代理（默认端口 443）通过到代理的 HTTP/3 连接，
+把到目标的 QUIC 连接放进 RFC 9298 CONNECT-UDP 隧道。目标写在隧道请求里，所以 DNS
+在代理侧解析，与 `socks5h` 相同。
+
+```python
+masque = lkrequest.MasqueConfig(
+    ca_cert="proxy-ca.pem",      # 或 ca_cert_pem=b"...", server_name="proxy.example"
+    tunnel_idle_timeout=120.0,   # None：空闲隧道永不回收
+    max_idle_tunnels=256,        # 0：不设上限
+)
+client = lkrequest.Client(quic_profile="chrome_153", masque=masque)
+session = client.session(proxy="masque://proxy.example:443", http3_only=True)
+
+# 用真实 CONNECT-UDP 隧道探测代理池中的 MASQUE 代理。不开 tunnel_probe 时
+# 健康检查会跳过它们（TCP 连得上说明不了什么）。
+health = lkrequest.HealthCheckConfig(tunnel_probe=True, masque=masque)
+```
+
+- 到代理这一跳的信任只在 `MasqueConfig` 里配置：客户端的 `verify` / `ca_cert*`
+  只管到源站的连接，不会被继承。`MasqueConfig(verify=False)` 仅供开发调试——此时
+  任何在代理地址上应答的一方都能看到每条隧道的目标。
+- 只支持 UDP：经 MASQUE 代理的 HTTP/1.1、HTTP/2 请求会抛 `ProxyError`；隧道失败也
+  绝不回退直连，即便设置了 `proxy_fallback_direct=True`。MASQUE 代理不能作为链中的一跳。
+- 到代理的连接不是浏览器指纹，隧道内到源站的连接才是。MASQUE 路由上拿不到通过 DNS
+  发现的 ECH 配置与 H3 提示（显式传入的 `ech_config` 仍然生效）。
 
 ### 会话池
 
@@ -623,6 +720,47 @@ client = lkrequest.Client(use_native_certs=True)             # 系统证书
 client = lkrequest.Client(ech_config=ech_bytes)              # ECH 支持
 ```
 
+### 地址族
+
+双栈机器上操作系统解析器把 IPv6 排在前面，所以只要 IPv6 通，有 AAAA 记录的目标就会走
+IPv6。`ip_family` 用来钉住它 —— 当一个会话必须对目标呈现单一源地址、而不是从两个地址族
+分别出去时，这一点很关键：
+
+```python
+client = lkrequest.Client(ip_family="ipv4")   # 绝不走 IPv6
+client = lkrequest.Client(ip_family="ipv6")   # 绝不走 IPv4
+client = lkrequest.Client(ip_family="any")    # 解析器自己的顺序（默认）
+```
+
+不在该地址族内的地址会**报错**而不是回退 —— 即便设置了 `proxy_fallback_direct=True`
+也不会回退直连 —— 所以这个设置不会被静默绕过。`"ipv6"` 还会拒绝 IPv4-mapped 地址
+（`::ffff:a.b.c.d`）。它管的是**本进程自己**选定的所有地址：
+
+| 场景 | `ip_family="ipv4"` 时 |
+|---|---|
+| 直连 | 只走 IPv4；没有 A 记录的目标会失败 |
+| 代理自身的地址、SOCKS5 UDP relay | 只走 IPv4 |
+| `socks5://` 的目标（本地解析） | 只走 IPv4 |
+| HTTP `CONNECT`、`socks5h://`、MASQUE 且目标是域名 | 由代理解析，代理到目标仍可能走 IPv6 |
+| 解析器自身的 DNS / DoH 查询 | 不受限制 |
+
+要决定代理拨向哪个地址，用 `connect_to` 把源站映射到指定地址：
+
+```python
+client = lkrequest.Client(
+    ip_family="ipv4",
+    connect_to={"example.com:443": "192.0.2.1:443"},  # IPv6 写成 "[2001:db8::1]:443"
+)
+session = client.session(proxy="http://proxy.example:8080")
+# 代理收到的是 `CONNECT 192.0.2.1:443`；TLS SNI、证书校验、Host 头和 Cookie
+# 仍然使用 example.com。
+```
+
+映射是固定的，不会重新解析或刷新。它对直连、经代理和 HTTP/3 连接都生效，优先于
+Alt-Svc / SVCB 给出的端点，但不会替换代理自身的地址。它决定的是代理拨向的目标，
+不能保证代理供应商的公网出口地址；经代理时 `diagnostics["remote_addr"]` 是代理的地址，
+出口地址请用目标服务的回显来确认。
+
 ### 零拷贝 Response
 
 ```python
@@ -632,6 +770,30 @@ mv = memoryview(resp)       # 零拷贝访问 body
 text = resp.text()          # 首次解码后缓存
 data = resp.json()          # 首次解析后缓存
 ```
+
+### 文本解码
+
+`text()` 按 `Content-Type` 声明的 charset 解码，响应未声明时回落 UTF-8。无法解码的字节
+转为 U+FFFD 而不是抛异常，一个坏字节不会让你丢掉整个 body —— 需要精确字节时用 `content`。
+
+```python
+resp = session.get("https://example.com")   # Content-Type: text/html; charset=gbk
+resp.encoding                               # 'gbk'
+resp.text()                                 # 按 GBK 解码
+
+resp.text(encoding="latin-1")               # 覆盖缺失或错误的 charset 声明
+```
+
+header 里的 charset 按浏览器的方式解析，依据 WHATWG Encoding Standard。而 `encoding=`
+参数查的是 Python 自己的 codec 注册表，所以 Web 标准里没有的 Python 写法
+（`latin-1`、`utf-8-sig`、`cp936`）照写即可。
+
+开头的 BOM 会被剥离；BOM 与 header 声明冲突时以 BOM 为准 —— 同样是浏览器的规则。所以
+`charset=gbk` 但 body 以 UTF-8 BOM 开头的响应会按 UTF-8 解码，而 `text()` 也不会把那个
+看不见的 U+FEFF 交给你（它会让 `json.loads`、`startswith` 静默失效）。
+
+流式响应的 `text()` 解码方式完全相同，也接受同样的 `encoding=` 参数（异步客户端写作
+`await stream.text(encoding="gbk")`）。
 
 ### 日志
 
@@ -676,12 +838,19 @@ except lkrequest.RequestError as e:
 | `Client.chrome_150()` | Chrome 150 | Chrome 150 | Chrome |
 | `Client.chrome_151()` | Chrome 151 | Chrome 151 | Chrome |
 | `Client.chrome_152()` | Chrome 152 | Chrome 152 | Chrome |
+| `Client.chrome_153()` | Chrome 153 | Chrome 153 | Chrome |
+| `Client.chrome_154()` | Chrome 154 | Chrome 154 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
+| `Client.firefox_156()` | Firefox 156 | Firefox 156 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
 | `Client.safari_26()` | Safari 26 | Safari 26 | Safari |
 
 TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos` / `firefox_win` / `firefox_linux` / `firefox_macos` / `safari`
+
+只有 Chrome 预设带 QUIC / HTTP3 指纹（需开启 `quic-h3` feature）。Firefox 和 Safari 预设会关闭 HTTP/3，开启 `quic-h3` 构建也不会改变这一点。
+
+预设只设置请求头的**顺序**，不设置请求头的值：`Client.chrome_154()` 发出的请求不会自带 `User-Agent`、`Accept` 等浏览器请求头，需要自己通过 `default_headers=` 或逐个请求设置。
 
 ## API 参考
 
@@ -699,6 +868,7 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | 资源限制 / 抗 DoS |
 | `max_pending_h2_requests` | 限制等待 HTTP/2 流槽位的排队请求数（默认不限）|
 | `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | 容错选项 |
+| `h2_dispatch_batch_size` | 合并进同一次 driver 写轮次的就绪 HTTP/2 请求数（默认 1）|
 | `h2_data_frame_policy` | 请求体如何切分为 HTTP/2 DATA 帧（`H2DataFramePolicy`） |
 | `require_close_notify` | 拒绝未收到 TLS close_notify 就被截断的响应体（默认 `False`） |
 | `tls_session_resumption_policy` / `tls_session_cache_partition_policy` | TLS ticket 是否存储，以及 ticket 缓存如何分键 |
@@ -706,8 +876,11 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | 证书配置 |
 | `ech_config` | ECH 配置 |
 | `dns` | 自定义 DNS |
+| `ip_family` | 限定连接使用的地址族：`"any"`（默认）、`"ipv4"`、`"ipv6"` |
+| `connect_to` | 为源站指定固定的拨号地址，`{"host:port": "ip:port"}`；TLS、`Host` 和 Cookie 仍用原域名 |
 | `system_dns_cache_ttl` / `system_dns_cache_max_entries` | 缓存系统解析器的成功查询 `ttl` 秒（TTL `0` 关闭缓存但保留并发查询合并；不能与 `dns` 同时使用）|
 | `keylog` | TLS key log 文件路径 |
+| `masque` | 到 `masque://` 代理这一跳的 `MasqueConfig`（需要 `masque` feature） |
 
 | 方法 | 说明 |
 |------|------|
@@ -738,7 +911,8 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `pool_stats()` | 连接池统计 (`PoolStats`) |
 | `on_request(callback)` / `on_response(callback)` | 注册 Event Hook |
 | `set_cookie()` / `set_cookie_with_attrs()` / `set_cookie_raw()` | 设置 Cookie |
-| `get_cookie()` / `get_cookies()` / `get_cookie_values()` / `cookie_header()` | 读取 Cookie |
+| `get_cookie()` / `get_cookies()` / `get_cookie_values()` / `cookie_header()` | 读取 Cookie 名与值 |
+| `get_cookies_with_attrs()` / `get_all_cookies()` | 以 `Cookie` 对象读取，带完整属性 |
 | `remove_cookie()` / `clear_cookies()` | 删除 Cookie |
 
 ### Response
@@ -753,10 +927,10 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `headers_list` | 响应头列表 (`list[tuple[str, str]]`) |
 | `content` | 原始字节 |
 | `content_length` | Content-Length |
-| `text()` | UTF-8 文本（带缓存） |
-| `json()` | 解析 JSON（带缓存） |
+| `text(encoding=None)` | 按声明的 charset 解码文本（带缓存） |
+| `json()` | 解析 JSON（带缓存）；失败抛 `JsonDecodeError` |
 | `cookies` | 响应 Cookie |
-| `encoding` | 字符编码 |
+| `encoding` | `Content-Type` 中声明的 charset |
 | `elapsed` | 请求耗时 (秒) |
 | `diagnostics` | 分阶段计时 dict：`dns_ms`/`tcp_ms`/`tls_ms`/`ttfb_ms`/`total_ms` + `remote_addr`/`protocol`/`cipher_suite`（未测阶段为 None） |
 | `was_redirected` | 是否经过重定向 |
@@ -815,6 +989,7 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `LkTimeoutError` | 超时 |
 | `TooManyRedirectsError` | 重定向过多 |
 | `ResourceLimitError` | 资源限制超出 |
+| `JsonDecodeError` | `json()` 遇到非 JSON body（同时也是 `json.JSONDecodeError`） |
 
 ## 示例
 
@@ -839,11 +1014,13 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `custom_fingerprint.py` | TlsProfile / H2Profile / TcpFingerprint 完全自定义 |
 | `fingerprint_validation.py` | validate_fingerprint_consistency |
 | `streaming_response.py` | StreamingResponse 逐块/完整读取 |
+| `streaming_upload.py` | body_stream 的 file-like / 生成器 / 异步可迭代源，content_length |
 | `connection_prewarming.py` | preconnect / preconnect_many / prefetch |
 | `metrics.py` | enable_metrics / snapshot / prometheus_text |
 | `timeout_config.py` | 超时配置、ResourceLimits |
 | `accept_encoding.py` | AcceptEncoding 控制、no_decompress |
 | `certificate_config.py` | CA 证书 PEM/DER/文件、verify、ECH |
+| `ip_family.py` | `ip_family=` 地址族选择，离线演示 + 打真实双栈域名 |
 | `logging_config.py` | set_log_level、过滤指令 |
 | `error_handling.py` | 全部异常类型、通用错误处理模式 |
 | `pool_stats.py` | PoolStats 连接池统计 |

@@ -2,6 +2,7 @@
 
 import os
 import asyncio
+import json
 import pytest
 import lkrequest
 from lkrequest.blocking import Client as BlockingClient
@@ -370,6 +371,37 @@ class TestTypes:
         assert lkrequest.HttpVersion.H2 == 2
         assert lkrequest.HttpVersion.HTTP11 == 1
 
+    @pytest.mark.parametrize(
+        "enum_name",
+        [
+            "HttpVersion",
+            "HttpIntent",
+            "PreferredHttpVersion",
+            "Idempotency",
+            "BrokenQuicPolicy",
+            "WsMessage",
+        ],
+    )
+    def test_public_enums_are_hashable(self, enum_name):
+        # A pyclass that declares `eq` without `hash` gets `__hash__ = None`
+        # from CPython, so mapping a member to something — the obvious use for
+        # an enum — raised `TypeError: unhashable type`.
+        cls = getattr(lkrequest, enum_name)
+        if enum_name == "WsMessage":
+            members = [cls.text("a"), cls.binary(b"b")]
+        else:
+            members = [v for v in vars(cls).values() if isinstance(v, cls)]
+        assert len(members) >= 2, f"{enum_name} exposes too few members to test"
+
+        lookup = {member: index for index, member in enumerate(members)}
+        assert len(lookup) == len(members), "distinct members collided in a dict"
+        assert len(set(members)) == len(members)
+        for index, member in enumerate(members):
+            assert lookup[member] == index
+        # Equal values must hash equally, or dict lookups by a fresh instance
+        # would miss.
+        assert hash(members[0]) == hash(members[0])
+
     def test_exponential_backoff(self):
         eb = lkrequest.ExponentialBackoff(max_retries=5, base_delay=0.5)
         assert "max_retries=5" in repr(eb)
@@ -425,8 +457,17 @@ class TestProxyConfig:
 
         assert proxy.hop_count() == 1
         assert str(proxy) == "socks5://proxy.example.com:1080"
-        assert proxy.identity() == "YOUR_PROXY_USER@proxy.example.com:1080"
         assert "YOUR_PROXY_PASS" not in repr(proxy)
+
+        # identity() is an opaque pooling / failure-tracking key, so assert the
+        # properties upstream guarantees rather than the exact encoding: every
+        # hop's protocol, host, port and username, and never the password. The
+        # credential fragment carries a kind prefix (``user:`` here) whose exact
+        # spelling is upstream's business, so only the username is pinned.
+        [hop] = json.loads(proxy.identity())
+        assert hop[:3] == ["socks5", "proxy.example.com", 1080]
+        assert "YOUR_PROXY_USER" in hop[3]
+        assert "YOUR_PROXY_PASS" not in proxy.identity()
 
     def test_parse_chain_preserves_order(self):
         chain = lkrequest.ProxyConfig.parse_chain(
@@ -443,9 +484,20 @@ class TestProxyConfig:
             "socks5h://hop2.example:1081 -> "
             "http://final.example:8080"
         )
-        assert chain.identity() == (
-            "hop1.example:1080>hop2.example:1081>final.example:8080"
-        )
+        assert json.loads(chain.identity()) == [
+            ["socks5", "hop1.example", 1080, None],
+            ["socks5h", "hop2.example", 1081, None],
+            ["http", "final.example", 8080, None],
+        ]
+
+    def test_identity_distinguishes_dns_mode(self):
+        # socks5 and socks5h differ only in who resolves the hostname, which the
+        # old delimiter-joined identity could not express — two chains that route
+        # differently must not share a cooldown/failure key.
+        local = lkrequest.ProxyConfig("socks5://hop.example:1080")
+        remote = lkrequest.ProxyConfig("socks5h://hop.example:1080")
+
+        assert local.identity() != remote.identity()
 
     def test_through_returns_new_config(self):
         final = lkrequest.ProxyConfig.parse("socks5://final.example:1080")
@@ -459,6 +511,91 @@ class TestProxyConfig:
         assert final.hop_count() == 1
         assert chain.hop_count() == 3
         assert str(chain).startswith("http://hop1.example:8080 -> socks5://hop2")
+
+    def test_credential_setters_return_new_configs(self):
+        plain = lkrequest.ProxyConfig("http://proxy.example:8080")
+        bearer = plain.with_http_auth("Bearer", "token-123")
+
+        assert json.loads(plain.identity())[0][3] is None
+        assert bearer is not plain
+        assert bearer.with_auth_header("authorization") is not bearer
+
+    def test_identity_separates_credentials_without_exposing_them(self):
+        # Two tokens on one gateway are two proxies: sharing a key would let
+        # one failing credential blacklist the other.
+        proxy = lkrequest.ProxyConfig("http://proxy.example:8080")
+        first = proxy.with_http_auth("Bearer", "token-one").identity()
+        second = proxy.with_http_auth("Bearer", "token-two").identity()
+
+        assert first != second
+        assert "token-one" not in first
+
+    def test_with_user_pass_replaces_the_url_credential(self):
+        proxy = lkrequest.ProxyConfig("http://old:secret@proxy.example:8080")
+        [hop] = json.loads(proxy.with_user_pass("new", "pw").identity())
+        assert "new" in hop[3]
+        assert "old" not in hop[3]
+
+    def test_socks5_cannot_carry_an_http_credential(self):
+        with pytest.raises(ValueError):
+            lkrequest.ProxyConfig("socks5://proxy.example:1080").with_http_auth(
+                "Bearer", "token"
+            )
+
+    def test_unknown_auth_header_is_rejected(self):
+        with pytest.raises(ValueError, match="proxy-authorization"):
+            lkrequest.ProxyConfig("http://proxy.example:8080").with_auth_header(
+                "x-proxy-token"
+            )
+
+    @pytest.mark.parametrize(
+        ("header", "expected"),
+        [(None, "proxy-authorization"), ("Authorization", "authorization")],
+    )
+    def test_http_credential_is_sent_on_connect(self, header, expected):
+        # A one-shot HTTP CONNECT proxy that records the request and refuses it,
+        # which is all it takes to see which header the credential went out in.
+        import socket
+        import threading
+
+        seen = {}
+        listener = socket.create_server(("127.0.0.1", 0))
+
+        def _serve():
+            conn, _ = listener.accept()
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                for line in data.decode().split("\r\n")[1:]:
+                    if ":" in line:
+                        name, value = line.split(":", 1)
+                        seen[name.strip().lower()] = value.strip()
+                conn.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+
+        thread = threading.Thread(target=_serve, daemon=True)
+        thread.start()
+        proxy = lkrequest.ProxyConfig(
+            f"http://127.0.0.1:{listener.getsockname()[1]}"
+        ).with_http_auth("Bearer", "token-123")
+        if header is not None:
+            proxy = proxy.with_auth_header(header)
+
+        try:
+            with pytest.raises(lkrequest.ProxyError):
+                BlockingClient.chrome_131().session(proxy=proxy).get(
+                    "https://target.example/", timeout=5.0
+                )
+        finally:
+            thread.join(5)
+            listener.close()
+
+        assert seen[expected] == "Bearer token-123"
+        other = {"proxy-authorization", "authorization"} - {expected}
+        assert not other & seen.keys()
 
     def test_parse_chain_rejects_empty_input(self):
         with pytest.raises(ValueError, match="at least one proxy"):

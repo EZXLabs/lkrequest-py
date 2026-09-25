@@ -65,6 +65,28 @@ impl PyQuicProfile {
         }
     }
 
+    /// Chrome 153 QUIC / HTTP/3 profile. Like the other captured Chromium
+    /// profiles it follows Chromium's GREASE generation rules, so the reserved
+    /// H3 SETTINGS, the reserved transport parameters and the Initial packet
+    /// layout are re-randomized per connection rather than fixed.
+    #[staticmethod]
+    fn chrome_153() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_153_quic(),
+        }
+    }
+
+    /// Chrome 154 QUIC / HTTP/3 profile: identical to Chrome 153. The public
+    /// capture verified QUIC through the Initial flight; the H3 SETTINGS and
+    /// request priority carry over from Chrome 153's completed navigation,
+    /// since that capture path never received a QUIC response.
+    #[staticmethod]
+    fn chrome_154() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_154_quic(),
+        }
+    }
+
     /// Load a profile from a JSON string.
     #[staticmethod]
     fn from_json(json_str: &str) -> PyResult<Self> {

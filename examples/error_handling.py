@@ -4,6 +4,8 @@
 演示所有异常类型及其使用场景。
 """
 
+import json
+
 import lkrequest
 from lkrequest.blocking import Client
 
@@ -21,7 +23,9 @@ def main():
     print(f"  ├── LkConnectionError - 连接失败")
     print(f"  ├── LkTimeoutError    - 超时")
     print(f"  ├── TooManyRedirectsError - 重定向过多")
-    print(f"  └── ResourceLimitError    - 资源限制超出")
+    print(f"  ├── ResourceLimitError    - 资源限制超出")
+    print("  └── JsonDecodeError       - body 不是合法 JSON")
+    print("     （JsonDecodeError 同时也是 json.JSONDecodeError）")
 
     # === HttpStatusError ===
     print(f"\n=== HttpStatusError ===")
@@ -45,6 +49,17 @@ def main():
         limited_session.get("https://httpbin.org/redirect/10")
     except lkrequest.TooManyRedirectsError as e:
         print(f"捕获: {type(e).__name__}: {e}")
+
+    # === JsonDecodeError ===
+    # 两个基类都能接住：库自己的 RequestError，以及标准库的 json.JSONDecodeError。
+    print("\n=== JsonDecodeError ===")
+    html = session.get("https://httpbin.org/html")
+    try:
+        html.json()
+    except lkrequest.RequestError as e:
+        print(f"按 RequestError 捕获: {type(e).__name__}: {e}")
+        print(f"  同时也是 json.JSONDecodeError: {isinstance(e, json.JSONDecodeError)}")
+        print(f"  失败位置: pos={e.pos} line={e.lineno} col={e.colno}")
 
     # === 通用错误处理模式 ===
     print(f"\n=== 通用错误处理模式 ===")
@@ -88,6 +103,7 @@ def main():
         lkrequest.LkTimeoutError,
         lkrequest.TooManyRedirectsError,
         lkrequest.ResourceLimitError,
+        lkrequest.JsonDecodeError,
     ]
     for err_cls in errors:
         is_request_error = issubclass(err_cls, lkrequest.RequestError)

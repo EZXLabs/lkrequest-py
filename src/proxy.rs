@@ -24,7 +24,8 @@ impl PyProxyConfig {
         Self::parse(url)
     }
 
-    /// Parse a single HTTP CONNECT or SOCKS5 proxy URL.
+    /// Parse a single HTTP CONNECT, SOCKS5 or (with the `masque` feature)
+    /// MASQUE proxy URL.
     #[staticmethod]
     fn parse(url: &str) -> PyResult<Self> {
         Ok(Self {
@@ -45,6 +46,48 @@ impl PyProxyConfig {
     fn through(&self, hops: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
             inner: self.inner.clone().through(resolve_proxy_list(hops)?),
+        })
+    }
+
+    /// Return a new config that authenticates this hop with a username and
+    /// password, replacing any credential already set.
+    fn with_user_pass(&self, username: &str, password: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .clone()
+                .with_user_pass(username, password)
+                .map_err(to_py_err)?,
+        })
+    }
+
+    /// Return a new config that authenticates this hop with a static HTTP
+    /// auth-scheme and already-encoded credentials (`Bearer`, `Preshared`,
+    /// ...), replacing any credential already set.
+    fn with_http_auth(&self, scheme: &str, credentials: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .clone()
+                .with_http_auth(scheme, credentials)
+                .map_err(to_py_err)?,
+        })
+    }
+
+    /// Return a new config that sends the credential in the given header:
+    /// `"proxy-authorization"` (the default) or `"authorization"`.
+    fn with_auth_header(&self, header: &str) -> PyResult<Self> {
+        let header = match header.to_ascii_lowercase().as_str() {
+            "proxy-authorization" => lkrequest::proxy::ProxyAuthHeader::ProxyAuthorization,
+            "authorization" => lkrequest::proxy::ProxyAuthHeader::Authorization,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown proxy auth header: '{header}'. Use 'proxy-authorization' or 'authorization'"
+                )));
+            }
+        };
+        Ok(Self {
+            inner: self.inner.clone().with_auth_header(header),
         })
     }
 
@@ -176,16 +219,27 @@ pub struct PyHealthCheckConfig {
 #[pymethods]
 impl PyHealthCheckConfig {
     #[new]
-    #[pyo3(signature = (*, interval=60.0, timeout=5.0, target_host="www.google.com", target_port=443))]
-    fn new(interval: f64, timeout: f64, target_host: &str, target_port: u16) -> PyResult<Self> {
-        Ok(PyHealthCheckConfig {
-            inner: lkrequest::HealthCheckConfig {
-                interval: validated_duration(interval)?,
-                timeout: validated_duration(timeout)?,
-                target_host: target_host.to_string(),
-                target_port,
-            },
-        })
+    #[pyo3(signature = (*, interval=60.0, timeout=5.0, target_host="www.google.com", target_port=443, tunnel_probe=false, masque=None))]
+    fn new(
+        interval: f64,
+        timeout: f64,
+        target_host: &str,
+        target_port: u16,
+        tunnel_probe: bool,
+        masque: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        // `HealthCheckConfig` is `#[non_exhaustive]`, so start from the default
+        // and assign the fields rather than writing a literal.
+        let mut inner = lkrequest::HealthCheckConfig::default();
+        inner.interval = validated_duration(interval)?;
+        inner.timeout = validated_duration(timeout)?;
+        inner.target_host = target_host.to_string();
+        inner.target_port = target_port;
+        // A plain TCP connect proves nothing about a MASQUE proxy, so upstream
+        // skips those unless the CONNECT-UDP probe is switched on.
+        let masque = crate::masque::resolve(masque.as_ref())?;
+        crate::masque::apply_to_health_check(&mut inner, tunnel_probe, masque)?;
+        Ok(PyHealthCheckConfig { inner })
     }
 
     fn __repr__(&self) -> String {

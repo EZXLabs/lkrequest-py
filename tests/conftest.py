@@ -13,13 +13,15 @@ cert PEM for tests that prefer pinning over disabling verification.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import datetime
+import hashlib
 import ipaddress
 import json
 import socket
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -70,6 +72,16 @@ def _free_port() -> int:
     return port
 
 
+def _ipv6_loopback_available() -> bool:
+    """Whether this host can bind ::1 (CI containers often run without IPv6)."""
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
 def _wait_until_listening(port: int, timeout: float = 15.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -82,10 +94,12 @@ def _wait_until_listening(port: int, timeout: float = 15.0) -> None:
 
 
 class _ServerHandle:
-    def __init__(self, port: int, ca_pem: bytes, stop, thread):
+    def __init__(self, port: int, ca_pem: bytes, stop, thread, *, ipv6: bool = False):
         self.port = port
         self.ca_pem = ca_pem
         self.url = f"https://127.0.0.1:{port}"
+        # Set only when the server also listens on ::1.
+        self.ipv6_url = f"https://[::1]:{port}" if ipv6 else None
         self._stop = stop
         self._thread = thread
 
@@ -126,6 +140,119 @@ def _with_early_hints(inner):
             }
         )
         await send({"type": "http.response.body", "body": b"final"})
+
+    return app
+
+
+def _with_upload_echo(inner):
+    """Add an `/upload-echo` endpoint that reports the request body it read.
+
+    httpbin is a WSGI app, and WSGI cannot read a request body without
+    `CONTENT_LENGTH`: an unknown-length upload reaches it as an empty body over
+    HTTP/2, and Werkzeug answers chunked HTTP/1.1 with `501 Not Implemented`.
+    Neither is a client-side limit — the very same bytes with a length arrive at
+    httpbin intact — so streaming-upload tests need a handler that reads the
+    ASGI body itself.
+
+    Reports the byte count and digest rather than echoing the body, so the same
+    endpoint works for a payload of any size, plus the framing headers the
+    server saw: that is how a test tells `Content-Length` from chunked framing.
+    """
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http" or scope["path"] != "/upload-echo":
+            await inner(scope, receive, send)
+            return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            body.extend(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        headers = {
+            key.decode("latin-1"): value.decode("latin-1")
+            for key, value in scope["headers"]
+        }
+        payload = json.dumps(
+            {
+                "length": len(body),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "content_length": headers.get("content-length"),
+                "transfer_encoding": headers.get("transfer-encoding"),
+                "http_version": scope.get("http_version"),
+            }
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    return app
+
+
+#: Default body for `/charset`. Encodable in GBK, Big5 and the other CJK
+#: charsets the tests reach for, and every character is outside ASCII, so a
+#: decode that silently fell back to UTF-8 cannot accidentally pass.
+_CHARSET_SAMPLE = "中文测试"
+
+
+def _with_charset_body(inner):
+    """Add a `/charset` endpoint serving a body in a non-UTF-8 charset.
+
+    httpbin's only charset route is `/encoding/utf8`, so there is nothing to
+    point a GBK / Shift_JIS test at. Query parameters:
+
+    - `label`: charset to encode the body with, also the `charset=` value sent
+      back (default `gbk`);
+    - `text`: body content, given as UTF-8 and re-encoded to `label`
+      (default `_CHARSET_SAMPLE`);
+    - `declare`: the `charset=` value to send, defaulting to `label`. `0` omits
+      it entirely — a server that leaves the encoding to be guessed — and any
+      other value declares a charset that disagrees with the bytes, which is a
+      server that states the wrong one;
+    - `bom=1`: prefix a UTF-8 BOM, to check it is honoured and stripped.
+
+    `content-length` is set from the encoded bytes, so a test can also tell that
+    byte length and character count differ.
+    """
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http" or scope["path"] != "/charset":
+            await inner(scope, receive, send)
+            return
+
+        query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+        label = query.get("label", ["gbk"])[0]
+        body = query.get("text", [_CHARSET_SAMPLE])[0].encode(label)
+        if query.get("bom", ["0"])[0] == "1":
+            body = codecs.BOM_UTF8 + body
+        declared = query.get("declare", [label])[0]
+        content_type = (
+            "text/plain" if declared == "0" else f"text/plain; charset={declared}"
+        )
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", content_type.encode("latin-1")),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
 
     return app
 
@@ -219,15 +346,23 @@ def _start_server(cert_file, key_file, ca_pem, *, with_quic: bool) -> _ServerHan
     from hypercorn.config import Config
 
     port = _free_port()
-    asgi_app = _with_websocket_echo(_with_early_hints(WsgiToAsgi(flask_app)))
+    asgi_app = _with_websocket_echo(
+        _with_charset_body(_with_upload_echo(_with_early_hints(WsgiToAsgi(flask_app))))
+    )
 
     config = Config()
     config.bind = [f"127.0.0.1:{port}"]
+    # The H3 server also listens on ::1 where the host has it, so HTTP/3 over
+    # IPv6 can be exercised (`h3_server_url_ipv6`). The plain server stays
+    # IPv4-only: the ip_family tests rely on ::1 being refused there.
+    ipv6 = with_quic and _ipv6_loopback_available()
+    if ipv6:
+        config.bind.append(f"[::1]:{port}")
     config.certfile = str(cert_file)
     config.keyfile = str(key_file)
     config.loglevel = "ERROR"
     if with_quic:
-        config.quic_bind = [f"127.0.0.1:{port}"]  # HTTP/3 over UDP, same port
+        config.quic_bind = list(config.bind)  # HTTP/3 over UDP, same port
         config.alpn_protocols = ["h3", "h2", "http/1.1"]
     else:
         config.alpn_protocols = ["h2", "http/1.1"]
@@ -262,7 +397,7 @@ def _start_server(cert_file, key_file, ca_pem, *, with_quic: bool) -> _ServerHan
     thread = threading.Thread(target=_run, name="hypercorn-test-server", daemon=True)
     thread.start()
     _wait_until_listening(port)
-    return _ServerHandle(port, ca_pem, stop, thread)
+    return _ServerHandle(port, ca_pem, stop, thread, ipv6=ipv6)
 
 
 @pytest.fixture(scope="session")
@@ -309,15 +444,58 @@ def ws_handshake_probe() -> str:
 
 
 @pytest.fixture(scope="session")
-def h3_server_url(_certs) -> str:
+def charset_sample() -> str:
+    """Body `/charset` serves by default, as the text it should decode back to."""
+    return _CHARSET_SAMPLE
+
+
+@pytest.fixture(scope="session")
+def _h3_server(_certs):
+    cert_file, key_file, ca_pem = _certs
+    handle = _start_server(cert_file, key_file, ca_pem, with_quic=True)
+    try:
+        yield handle
+    finally:
+        handle.shutdown()
+
+
+@pytest.fixture(scope="session")
+def h3_server_url(_h3_server) -> str:
     """Base URL of a dedicated HTTP/3-capable server (quic_bind enabled).
 
     Started lazily so it only runs for tests that request it (e.g. the H3
     functional test under the quic-h3 build).
     """
-    cert_file, key_file, ca_pem = _certs
-    handle = _start_server(cert_file, key_file, ca_pem, with_quic=True)
+    return _h3_server.url
+
+
+@pytest.fixture(scope="session")
+def h3_server_url_ipv6(_h3_server) -> str:
+    """The same HTTP/3 server over IPv6 (``https://[::1]:port``); skips without ::1."""
+    if _h3_server.ipv6_url is None:
+        pytest.skip("this host cannot bind the IPv6 loopback ::1")
+    return _h3_server.ipv6_url
+
+
+@pytest.fixture(scope="session")
+def _masque_proxy_server(_certs):
+    from _masque_proxy import MasqueProxy
+
+    cert_file, key_file, _ = _certs
+    proxy = MasqueProxy(cert_file, key_file)
     try:
-        yield handle.url
+        yield proxy
     finally:
-        handle.shutdown()
+        proxy.shutdown()
+
+
+@pytest.fixture
+def masque_proxy(_masque_proxy_server):
+    """A local MASQUE CONNECT-UDP proxy (see `_masque_proxy.py`).
+
+    Its certificate is the same self-signed one as the other servers, so trust
+    it with `MasqueConfig(ca_cert_pem=server_ca)`. What it has seen is cleared
+    before each test; `masque_proxy.stats.connects` records every CONNECT-UDP.
+    """
+    _masque_proxy_server.reset()
+    return _masque_proxy_server

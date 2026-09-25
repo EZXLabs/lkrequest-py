@@ -1,6 +1,7 @@
 """Tests for features added while tracking the lkrequest core update:
 
-new browser presets (chrome_145/146/147/148), request priority, protocol
+new browser presets (chrome_145 through chrome_154, firefox_156), request
+priority, protocol
 policy / HTTP intent, session resumption, per-request preferred HTTP version /
 idempotency, and the QUIC/H3 surface.
 
@@ -24,6 +25,8 @@ NEW_CHROME_PRESETS = [
     "chrome_150",
     "chrome_151",
     "chrome_152",
+    "chrome_153",
+    "chrome_154",
 ]
 
 
@@ -68,10 +71,11 @@ class TestNewPresets:
             == lkrequest.H2Profile.chrome_150().to_json()
         )
 
-    def test_chrome_152_is_the_only_preset_that_greases_signature_algorithms(self):
+    def test_signature_algorithm_grease_starts_at_chrome_152(self):
         # Python mirror of upstream's `chrome_152_is_first_chromium_profile_with_
         # signature_algorithm_grease`. GREASE placement is a fingerprint-visible
         # difference, so a preset silently gaining/losing it must fail here.
+        # Chrome 152 introduced it and Chrome 153 and 154 keep it.
         greased = {
             name
             for name in NEW_CHROME_PRESETS + ["chrome_131", "chrome_144"]
@@ -79,7 +83,7 @@ class TestNewPresets:
                 "signature_algorithms"
             ]
         }
-        assert greased == {"chrome_152"}
+        assert greased == {"chrome_152", "chrome_153", "chrome_154"}
 
     def test_chrome_152_carries_trust_anchor_ids(self):
         # Python mirror of upstream's `chrome_152_adds_capture_verified_trust_
@@ -112,11 +116,149 @@ class TestNewPresets:
             == lkrequest.H2Profile.chrome_151().to_json()
         )
 
+    def test_chrome_153_h2_is_unchanged_from_chrome_152(self):
+        # The Chrome 153 capture reproduced Chrome 152's SETTINGS order, window
+        # update, pseudo-header order and navigation priority.
+        assert (
+            lkrequest.H2Profile.chrome_153().to_json()
+            == lkrequest.H2Profile.chrome_152().to_json()
+        )
+
+    def test_chrome_153_narrows_the_trust_anchor_list(self):
+        # The only fingerprint-visible TLS difference from Chrome 152: the
+        # shuffled 0xca34 identifier set drops from 32 to 28. Named explicitly
+        # because a capture that silently regrows the list is a detectable
+        # mismatch against real Chrome 153, not a harmless refresh.
+        def anchors(name):
+            specs = [
+                e
+                for e in json.loads(getattr(lkrequest.TlsProfile, name)().to_json())[
+                    "extensions"
+                ]
+                if e["extension_type"] == lkrequest.ExtType.TRUST_ANCHOR_IDS
+            ]
+            assert len(specs) == 1
+            return specs[0]["source"]["ids"]
+
+        ids152, ids153 = anchors("chrome_152"), anchors("chrome_153")
+        assert (len(ids152), len(ids153)) == (32, 28)
+        assert set(ids152) - set(ids153) == {
+            "d6790902",
+            "d6790903",
+            "d6790909",
+            "d679090e",
+        }
+        assert set(ids153) - set(ids152) == set()
+
+        # Everything else about the TLS profile is Chrome 152's, name aside.
+        tls152 = json.loads(lkrequest.TlsProfile.chrome_152().to_json())
+        tls153 = json.loads(lkrequest.TlsProfile.chrome_153().to_json())
+        assert (tls152.pop("name"), tls153.pop("name")) == ("Chrome 152", "Chrome 153")
+        assert [k for k in tls152 if tls152[k] != tls153[k]] == ["extensions"]
+
+    def test_chrome_153_quic_tls_drops_grease_and_ml_dsa(self):
+        # Chrome 153's QUIC ClientHello differs from its TCP one in two ways that
+        # show on the wire: no ordinary TLS GREASE slots at all, and the nine
+        # classic signature algorithms without TCP's three ML-DSA codepoints.
+        tcp = json.loads(lkrequest.TlsProfile.chrome_153().to_json())
+        quic = json.loads(lkrequest.TlsProfile.chrome_153_quic().to_json())
+        assert any(tcp["grease"].values())
+        assert not any(quic["grease"].values())
+        assert {0x0904, 0x0905, 0x0906}.issubset(tcp["signature_algorithms"])
+        assert quic["signature_algorithms"] == [
+            0x0403,
+            0x0804,
+            0x0401,
+            0x0503,
+            0x0805,
+            0x0501,
+            0x0806,
+            0x0601,
+            0x0201,
+        ]
+
+    def test_chrome_154_is_chrome_153_under_a_new_name(self):
+        # Python mirror of upstream's `chrome_154_matches_capture_verified_
+        # chrome_153_tls_shape`: the Chrome 154.0.8037.58 capture reproduced
+        # Chrome 153's TCP and QUIC ClientHellos and its H2 shape, so anything
+        # beyond the profile name drifting apart is an unreviewed change.
+        for prev, cur in (
+            ("chrome_153", "chrome_154"),
+            ("chrome_153_quic", "chrome_154_quic"),
+        ):
+            old = json.loads(getattr(lkrequest.TlsProfile, prev)().to_json())
+            new = json.loads(getattr(lkrequest.TlsProfile, cur)().to_json())
+            assert new.pop("name") == old.pop("name").replace("153", "154")
+            assert new == old
+        assert (
+            lkrequest.H2Profile.chrome_154().to_json()
+            == lkrequest.H2Profile.chrome_153().to_json()
+        )
+
+    def test_firefox_156_matches_the_public_capture(self):
+        # Python mirror of upstream's `firefox_156_matches_public_cloudflare_
+        # capture`. Against Firefox 147 exactly four things move: the name, two
+        # ECDSA CBC suites (0xc00a / 0xc009) and both FFDHE groups (256 / 257)
+        # dropped, and an ECH GREASE switched to AES-128-GCM with a fixed
+        # 240-byte payload.
+        ff147 = json.loads(lkrequest.TlsProfile.firefox_147().to_json())
+        ff156 = json.loads(lkrequest.TlsProfile.firefox_156().to_json())
+        assert ff156["name"] == "Firefox 156"
+        assert [k for k in ff156 if ff156[k] != ff147[k]] == [
+            "name",
+            "cipher_suites",
+            "supported_groups",
+            "ech",
+        ]
+        assert ff156["cipher_suites"] == [
+            4865, 4867, 4866, 49195, 49199, 52393, 52392, 49196, 49200,
+            49171, 49172, 156, 157, 47, 53,
+        ]  # fmt: skip
+        assert set(ff147["cipher_suites"]) - set(ff156["cipher_suites"]) == {
+            0xC00A,
+            0xC009,
+        }
+        assert ff156["supported_groups"] == [4588, 29, 23, 24, 25]
+        assert ff156["key_share_curves"] == [4588, 29, 23]
+        assert ff156["signature_algorithms"] == [
+            1027, 1283, 1539, 2052, 2053, 2054, 1025, 1281, 1537, 515, 513,
+        ]  # fmt: skip
+        ech = ff156["ech"]
+        assert ech["type"] == "grease"
+        assert (
+            ech["aead_id"] == 1
+        )  # AES-128-GCM; Firefox 147 sent 3 (ChaCha20-Poly1305)
+        assert (ech["payload_length_min"], ech["payload_length_max"]) == (240, 240)
+        # H2 was captured unchanged from Firefox 147.
+        assert (
+            lkrequest.H2Profile.firefox_156().to_json()
+            == lkrequest.H2Profile.firefox_147().to_json()
+        )
+
+    def test_firefox_156_claims_no_quic(self):
+        # Upstream captured Firefox 156's QUIC Initial but ships the preset
+        # TLS/H2-only, because the transport cannot reproduce every observed
+        # Firefox QUIC field; the preset turns HTTP/3 off rather than send
+        # Chrome's QUIC under Firefox's name. Nothing here may offer one.
+        assert not hasattr(lkrequest.TlsProfile, "firefox_156_quic")
+        if not hasattr(lkrequest, "QuicProfile"):
+            pytest.skip("built without the quic-h3 feature")
+        assert not hasattr(lkrequest.QuicProfile, "firefox_156")
+        with pytest.raises(ValueError, match="Unknown QUIC profile: 'firefox_156'"):
+            lkrequest.Client(quic_profile="firefox_156")
+
     def test_quic_tls_presets_differ_from_their_tcp_counterparts(self):
         # The QUIC-TLS presets are the ClientHello Chrome sends inside QUIC; they
         # are plain TLS profiles (no quic-h3 feature needed) and must not be
         # confused with the TCP profile of the same version.
-        for name in ("chrome_146", "chrome_150", "chrome_151", "chrome_152"):
+        for name in (
+            "chrome_146",
+            "chrome_150",
+            "chrome_151",
+            "chrome_152",
+            "chrome_153",
+            "chrome_154",
+        ):
             tcp = json.loads(getattr(lkrequest.TlsProfile, name)().to_json())
             quic = json.loads(getattr(lkrequest.TlsProfile, f"{name}_quic")().to_json())
             assert quic["name"] == f"{tcp['name']} QUIC"
@@ -171,8 +313,11 @@ class TestNewPresets:
             "chrome_150",
             "chrome_151",
             "chrome_152",
+            "chrome_153",
+            "chrome_154",
             "firefox_133",
             "firefox_147",
+            "firefox_156",
             "safari_18",
             "safari_26",
         ],
@@ -330,7 +475,13 @@ class TestQuicSurface:
         if not hasattr(lkrequest, "QuicProfile"):
             pytest.skip("built without the quic-h3 feature")
         profiles = {}
-        for name in ("chrome_146", "chrome_150", "chrome_151"):
+        for name in (
+            "chrome_146",
+            "chrome_150",
+            "chrome_151",
+            "chrome_153",
+            "chrome_154",
+        ):
             qp = getattr(lkrequest.QuicProfile, name)()
             assert qp.connection_id_length >= 0
             qp.validate()  # raises on invalid
@@ -351,6 +502,11 @@ class TestQuicSurface:
         # profile is reachable only through `Client.chrome_151()`, so the
         # difference is not observable on QuicProfile itself.
         assert profiles["chrome_151"] == profiles["chrome_150"]
+        # Chrome 154 is Chrome 153's QUIC and H3 verbatim: the Initial flight
+        # matched, and the H3 SETTINGS carry over because the public capture
+        # path never received a QUIC response (upstream's
+        # `chrome_154_matches_public_initial_capture_and_inherits_h3_baseline`).
+        assert profiles["chrome_154"] == profiles["chrome_153"]
 
     def test_chrome_152_quic_drops_google_initial_rtt(self):
         # Unlike Chrome 151 (identical to 150), Chrome 152 is the first preset
@@ -371,6 +527,54 @@ class TestQuicSurface:
             assert (
                 google_initial_rtt in params[name]["transport_parameter_order"]
             ) is present
+
+    def test_captured_chromium_presets_generate_grease_per_connection(self):
+        # Chromium re-derives its GREASE values for every connection, so a fixed
+        # value in the profile would itself be a fingerprint. Three flags say the
+        # profile defers to Chromium's generation rules instead: `chromium_grease`
+        # for the reserved H3 SETTINGS and control-stream frame,
+        # `randomize_grease_shape` for the reserved transport parameters, and
+        # `initial_packet_chaos` for the Initial packet layout. They are
+        # `#[serde(default)]` and off when absent, which is what keeps a profile
+        # loaded from JSON on the old fixed behaviour — so read them with `.get`.
+        if not hasattr(lkrequest, "QuicProfile"):
+            pytest.skip("built without the quic-h3 feature")
+        captured = (
+            "chrome_146",
+            "chrome_150",
+            "chrome_151",
+            "chrome_152",
+            "chrome_153",
+            "chrome_154",
+        )
+        for name in captured + ("chrome",):
+            p = json.loads(getattr(lkrequest.QuicProfile, name)().to_json())
+            assert p["h3"].get("chromium_grease") is True, name
+            # The generic profile models no specific capture, so only the H3
+            # rules apply to it.
+            expected = name in captured
+            assert (
+                p["transport_params"].get("randomize_grease_shape", False) is expected
+            ), name
+            assert p["packetization"].get("initial_packet_chaos", False) is expected, (
+                name
+            )
+
+    def test_quic_profile_json_without_the_grease_flags_stays_fixed(self):
+        # A `QuicProfile` a caller saved before upstream added the flags, or built
+        # by hand, must keep its old behaviour rather than silently start
+        # randomizing — that is the point of defaulting them to off.
+        if not hasattr(lkrequest, "QuicProfile"):
+            pytest.skip("built without the quic-h3 feature")
+        p = json.loads(lkrequest.QuicProfile.chrome_153().to_json())
+        del p["h3"]["chromium_grease"]
+        del p["transport_params"]["randomize_grease_shape"]
+        del p["packetization"]["initial_packet_chaos"]
+        restored = json.loads(lkrequest.QuicProfile.from_json(json.dumps(p)).to_json())
+        # Absent in the output too: they serialize only when set.
+        assert "chromium_grease" not in restored["h3"]
+        assert "randomize_grease_shape" not in restored["transport_params"]
+        assert "initial_packet_chaos" not in restored["packetization"]
 
 
 # ==========================================================================

@@ -1,6 +1,12 @@
 """Advanced tests covering all remaining lkrequest features."""
 
+import importlib
 import json
+import multiprocessing
+import pickle
+import time
+from concurrent.futures import ProcessPoolExecutor
+
 import pytest
 import lkrequest
 from lkrequest.blocking import Client as BlockingClient
@@ -565,6 +571,16 @@ class TestAdvancedCookies:
         val = session.get_cookie("https://example.com/api", "secure_cookie")
         assert val is not None
 
+    def test_set_cookie_raw_is_available_on_the_blocking_session(self, session):
+        # It existed on the async Session and upstream's blocking Session, but
+        # the blocking binding never exposed it — which left blocking callers
+        # with no way to set Expires or SameSite at all, since
+        # set_cookie_with_attrs takes neither.
+        session.set_cookie_raw(
+            "https://example.com", "raw=value; Path=/; SameSite=Strict"
+        )
+        assert session.get_cookie("https://example.com", "raw") == "value"
+
     def test_cookie_override_in_request(self, session):
         session.set_cookie(f"{BASE}", "original", "old_value")
         resp = session.get(
@@ -579,6 +595,268 @@ class TestAdvancedCookies:
 # ==========================================================================
 # Advanced HTTP Methods
 # ==========================================================================
+
+
+class TestCookieAttributes:
+    """Reading a jar entry's attributes, not just its name and value."""
+
+    @pytest.fixture(params=["async", "blocking"])
+    def session(self, request):
+        # Both clients expose the same jar API, so every case runs twice.
+        if request.param == "async":
+            return lkrequest.Client(verify=False).session()
+        return BlockingClient(verify=False).session()
+
+    def test_every_attribute_survives_the_round_trip(self, session):
+        session.set_cookie_raw(
+            "https://shop.example.com/api/orders",
+            "sid=abc123; Domain=shop.example.com; Path=/api; Secure; HttpOnly; "
+            "SameSite=Lax; Max-Age=3600",
+        )
+        cookies = session.get_cookies_with_attrs("https://shop.example.com/api/orders")
+        assert len(cookies) == 1
+        cookie = cookies[0]
+        assert cookie.name == "sid"
+        assert cookie.value == "abc123"
+        assert cookie.domain == "shop.example.com"
+        assert cookie.path == "/api"
+        assert cookie.secure is True
+        assert cookie.http_only is True
+        assert cookie.same_site == "Lax"
+        # A Domain attribute was sent, so subdomains match too.
+        assert cookie.host_only is False
+        assert cookie.is_persistent is True
+        assert cookie.expires is not None
+        assert abs(cookie.expires - time.time() - 3600) < 60
+
+    def test_same_name_cookies_become_distinguishable(self, session):
+        # The heart of the issue: get_cookies() returns two entries named
+        # `token` with no way to tell which scope each belongs to.
+        session.set_cookie_raw("https://example.com/", "token=ROOT; Path=/")
+        session.set_cookie_raw("https://example.com/api", "token=API; Path=/api")
+
+        flat = session.get_cookies("https://example.com/api/users")
+        assert sorted(flat) == [("token", "API"), ("token", "ROOT")]
+        assert len({name for name, _ in flat}) == 1, "name alone cannot separate them"
+
+        detailed = session.get_cookies_with_attrs("https://example.com/api/users")
+        by_path = {c.path: c.value for c in detailed if c.name == "token"}
+        assert by_path == {"/": "ROOT", "/api": "API"}
+
+    def test_session_cookie_has_no_expiry(self, session):
+        session.set_cookie_raw("https://example.com", "sid=abc; Path=/")
+        cookie = session.get_cookies_with_attrs("https://example.com/")[0]
+        assert cookie.expires is None
+        assert cookie.is_persistent is False
+
+    def test_host_only_reflects_a_missing_domain_attribute(self, session):
+        session.set_cookie_raw("https://example.com", "a=1; Path=/")
+        session.set_cookie_raw("https://example.com", "b=2; Path=/; Domain=example.com")
+        host_only = {
+            c.name: c.host_only
+            for c in session.get_cookies_with_attrs("https://example.com/")
+        }
+        assert host_only == {"a": True, "b": False}
+
+    def test_all_cookies_spans_domains_while_the_url_view_does_not(self, session):
+        session.set_cookie("https://a.example.com", "ka", "va")
+        session.set_cookie("https://b.example.com", "kb", "vb")
+
+        assert sorted(c.name for c in session.get_all_cookies()) == ["ka", "kb"]
+        scoped = session.get_cookies_with_attrs("https://a.example.com/")
+        assert [c.name for c in scoped] == ["ka"]
+
+    def test_cookies_are_hashable_and_comparable(self, session):
+        # So two jars can be diffed with set operations — and because `eq`
+        # without `hash` is the bug that made the public enums unusable as dict
+        # keys.
+        session.set_cookie("https://example.com", "a", "1")
+        session.set_cookie("https://example.com", "b", "2")
+        cookies = session.get_all_cookies()
+        assert len(set(cookies)) == len(cookies) == 2
+        assert cookies[0] == session.get_all_cookies()[0]
+
+        session.set_cookie("https://example.com", "c", "3")
+        added = set(session.get_all_cookies()) - set(cookies)
+        assert {c.name for c in added} == {"c"}
+
+    def test_repr_names_the_attributes(self, session):
+        session.set_cookie_raw("https://example.com", "k=v; Path=/; Secure")
+        text = repr(session.get_all_cookies()[0])
+        assert text.startswith("Cookie(")
+        for field in ("name=", "path=", "secure=", "same_site=", "expires="):
+            assert field in text
+
+    def test_repr_reads_like_python(self, session):
+        # Rust's Debug spellings (`Some("…")`, `true`) used to leak through.
+        session.set_cookie_raw(
+            "https://example.com", "k=it's; Path=/; Secure; SameSite=Lax"
+        )
+        session.set_cookie_raw("https://example.com", "tmp=1")
+        cookies = {c.name: repr(c) for c in session.get_all_cookies()}
+        assert cookies["k"] == (
+            "Cookie(name='k', value=\"it's\", domain='example.com', path='/', "
+            "secure=True, http_only=False, same_site='Lax', expires=None)"
+        )
+        assert "same_site=None" in cookies["tmp"]
+        assert "Some(" not in cookies["tmp"] and "true" not in cookies["tmp"]
+
+    def test_attributes_survive_a_real_server_set_cookie(self, server_url):
+        # Everything above seeds the jar directly. This one goes through the
+        # wire: httpbin's /cookies/set sends a Set-Cookie, the jar parses and
+        # stores it, and the attributes must come back out.
+        session = BlockingClient(verify=False).session()
+        resp = session.get(f"{server_url}/cookies/set?wire_key=wire_val")
+        assert resp.status_code == 200
+
+        cookies = session.get_cookies_with_attrs(f"{server_url}/")
+        stored = {c.name: c for c in cookies}
+        assert "wire_key" in stored, f"jar holds {sorted(stored)}"
+        cookie = stored["wire_key"]
+        assert cookie.value == "wire_val"
+        # httpbin sets it with Path=/ and no Domain, so it is host-only.
+        assert cookie.path == "/"
+        assert cookie.host_only is True
+        assert cookie.expires is None and cookie.is_persistent is False
+
+    def test_a_jar_can_be_rebuilt_from_what_it_reports(self, session):
+        # The acceptance test for the feature: what comes out must be enough to
+        # put back — including the order, since `get_all_cookies` lists cookies
+        # oldest first and the jar sends them in creation order within a path.
+        # A third cookie sharing `pref`'s path is what gives that teeth: with
+        # only two, path length alone would decide the header.
+        session.set_cookie_raw(
+            "https://example.com/api",
+            "sid=abc; Domain=example.com; Path=/api; Secure; HttpOnly; SameSite=Lax",
+        )
+        session.set_cookie_raw("https://example.com/", "pref=dark; Path=/")
+        session.set_cookie_raw("https://example.com/", "lang=en; Path=/")
+
+        restored = BlockingClient(verify=False).session()
+        for c in session.get_all_cookies():
+            parts = [f"{c.name}={c.value}"]
+            if not c.host_only and c.domain:
+                parts.append(f"Domain={c.domain}")
+            parts.append(f"Path={c.path}")
+            if c.secure:
+                parts.append("Secure")
+            if c.http_only:
+                parts.append("HttpOnly")
+            if c.same_site:
+                parts.append(f"SameSite={c.same_site}")
+            # A host-only cookie has to be re-seeded from a URL on that host so
+            # the jar derives HostOnly rather than a Domain suffix.
+            restored.set_cookie_raw(f"https://{c.domain}/", "; ".join(parts))
+
+        url = "https://example.com/api/users"
+        assert session.get_cookies_with_attrs(url) == restored.get_cookies_with_attrs(
+            url
+        )
+        assert session.cookie_header(url) == "sid=abc; pref=dark; lang=en"
+        assert session.cookie_header(url) == restored.cookie_header(url)
+
+
+class TestCookieOrdering:
+    """The `Cookie` header order, which is visible on the wire.
+
+    The jar sorts matches the way Chrome's `CookieMonster::CookieSorter` does:
+    longer paths first, then older cookies first. Before upstream added a
+    creation sequence the jar iterated a hash map, so the order was arbitrary and
+    differed between two sessions holding the same cookies.
+    """
+
+    @pytest.fixture(params=["async", "blocking"])
+    def session(self, request):
+        # The jar API is synchronous on both clients, so every case runs twice.
+        if request.param == "async":
+            return lkrequest.Client(verify=False).session()
+        return BlockingClient(verify=False).session()
+
+    def test_matches_the_header_chrome_sent(self, session):
+        # Python mirror of upstream's golden, captured from Chrome
+        # 153.0.8010.47 (headless, fresh profile): this `Set-Cookie` sequence,
+        # one response each, produced this `Cookie` header on three runs.
+        for set_cookie in [
+            "b=1; Path=/",
+            "a=2; Path=/",
+            "api=3; Path=/api",
+            "c=4; Path=/",
+            "a=2; Path=/; Max-Age=3600",  # same value: keeps its age
+            "b=changed; Path=/",  # new value: becomes a new cookie
+        ]:
+            session.set_cookie_raw("http://127.0.0.1:8765/", set_cookie)
+        assert (
+            session.cookie_header("http://127.0.0.1:8765/api/echo")
+            == "api=3; a=2; c=4; b=changed"
+        )
+
+    def test_longer_paths_sort_first_regardless_of_creation(self, session):
+        for set_cookie in [
+            "root=1; Path=/",
+            "deep=2; Path=/api/v1",
+            "mid=3; Path=/api",
+            "root2=4; Path=/",
+        ]:
+            session.set_cookie_raw("https://example.com/", set_cookie)
+        assert (
+            session.cookie_header("https://example.com/api/v1/users")
+            == "deep=2; mid=3; root=1; root2=4"
+        )
+
+    def test_same_path_cookies_follow_creation_order(self, session):
+        for i, name in enumerate(["f", "a", "d", "b", "e", "c"]):
+            session.set_cookie_raw("https://example.com/", f"{name}={i}; Path=/")
+        assert (
+            session.cookie_header("https://example.com/")
+            == "f=0; a=1; d=2; b=3; e=4; c=5"
+        )
+
+    def test_the_order_is_the_same_in_every_session(self, session):
+        # The bug this replaces: a hash-map iteration order that changed from
+        # session to session, so two identically-seeded jars sent different
+        # headers. `session` here only fixes the client kind.
+        def build():
+            fresh = BlockingClient(verify=False).session()
+            for i, name in enumerate(["a", "b", "c", "d", "e", "f"]):
+                fresh.set_cookie_raw("https://example.com/", f"{name}={i}; Path=/")
+            return fresh.cookie_header("https://example.com/")
+
+        first = build()
+        assert first == "a=0; b=1; c=2; d=3; e=4; f=5"
+        assert {build() for _ in range(20)} == {first}
+
+    def test_get_cookie_returns_the_longest_path_match(self, session):
+        # Upstream documented this order long before it held; it does now.
+        session.set_cookie_raw("https://example.com/", "token=root; Path=/")
+        session.set_cookie_raw("https://example.com/", "token=api; Path=/api")
+        url = "https://example.com/api/users"
+        assert session.get_cookie(url, "token") == "api"
+        assert session.get_cookie_values(url, "token") == ["api", "root"]
+        assert session.get_cookies(url) == [("token", "api"), ("token", "root")]
+
+    def test_clear_cookies_resets_the_creation_order(self, session):
+        session.set_cookie_raw("https://example.com/", "a=1; Path=/")
+        session.clear_cookies()
+        session.set_cookie_raw("https://example.com/", "b=2; Path=/")
+        session.set_cookie_raw("https://example.com/", "a=1; Path=/")
+        # `a` is the newer cookie now, so it goes last.
+        assert session.cookie_header("https://example.com/") == "b=2; a=1"
+
+    def test_all_cookies_lists_oldest_first_across_domains_and_paths(self, session):
+        session.set_cookie_raw("https://b.example.com/", "one=1; Path=/x")
+        session.set_cookie_raw("https://a.example.com/", "two=2; Path=/")
+        session.set_cookie_raw("https://b.example.com/", "three=3; Path=/")
+        # A new value makes `one` a new cookie, which moves it to the end.
+        session.set_cookie_raw("https://b.example.com/", "one=changed; Path=/x")
+        assert [c.name for c in session.get_all_cookies()] == ["two", "three", "one"]
+
+    def test_a_removed_cookie_loses_its_place(self, session):
+        session.set_cookie_raw("https://example.com/", "a=1; Path=/")
+        session.set_cookie_raw("https://example.com/", "b=2; Path=/")
+        session.remove_cookie("https://example.com/", "a")
+        assert session.cookie_header("https://example.com/") == "b=2"
+        session.set_cookie_raw("https://example.com/", "a=1; Path=/")
+        assert session.cookie_header("https://example.com/") == "b=2; a=1"
 
 
 class TestHTTPMethods:
@@ -1180,6 +1458,55 @@ class TestClientConfiguration:
         with pytest.raises(ValueError, match="requires system_dns_cache_ttl"):
             cls(system_dns_cache_max_entries=100)
 
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_unknown_ip_family_is_rejected(self, cls):
+        with pytest.raises(ValueError, match="any, ipv4, ipv6"):
+            cls(ip_family="v4")
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    @pytest.mark.parametrize("family", ["any", "ipv4", "ipv6"])
+    def test_every_ip_family_builds(self, cls, family):
+        assert "Client" in repr(cls(ip_family=family))
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_ip_family_composes_with_dns(self, cls):
+        # The filter has to wrap whichever resolver the other DNS options chose,
+        # so both of those paths are exercised here: a named dns= preset...
+        assert "Client" in repr(cls(dns="system", ip_family="ipv4"))
+        assert "Client" in repr(cls(dns="cloudflare", ip_family="ipv4"))
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_ip_family_composes_with_the_system_dns_cache(self, cls):
+        # ...and the cached system resolver, which is a different construction
+        # path. Neither may be lost when ip_family wraps it.
+        assert "Client" in repr(cls(system_dns_cache_ttl=30.0, ip_family="ipv4"))
+        assert "Client" in repr(
+            cls(
+                system_dns_cache_ttl=30.0,
+                system_dns_cache_max_entries=4096,
+                ip_family="ipv6",
+            )
+        )
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_ip_family_does_not_disturb_the_dns_conflict_check(self, cls):
+        # The dns= / cache exclusivity rule still applies with ip_family set.
+        with pytest.raises(ValueError, match="cannot be combined with dns"):
+            cls(system_dns_cache_ttl=30.0, dns="google", ip_family="ipv4")
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_h2_dispatch_batch_size(self, cls):
+        # Defaults to one request per driver write turn, which is the shape the
+        # browser presets are captured with; batching is opt-in because it
+        # coalesces requests into one write and is visible on the wire.
+        assert cls().h2_dispatch_batch_size == 1
+        assert cls(h2_dispatch_batch_size=32).h2_dispatch_batch_size == 32
+
+    @pytest.mark.parametrize("cls", [lkrequest.Client, BlockingClient])
+    def test_h2_dispatch_batch_size_rejects_zero(self, cls):
+        with pytest.raises(ValueError, match="greater than 0"):
+            cls(h2_dispatch_batch_size=0)
+
 
 # ==========================================================================
 # Session Configuration Options
@@ -1626,3 +1953,92 @@ class TestExceptionHierarchy:
         session = client.session(max_redirects=1)
         with pytest.raises(lkrequest.TooManyRedirectsError):
             session.get(f"{BASE}/redirect/5")
+
+
+# Every exception the package exports, by the name it exports it as. The name
+# matters as much as the class: see `test_reported_name_matches_the_export`.
+EXCEPTION_NAMES = [
+    "RequestError",
+    "TlsError",
+    "ProxyError",
+    "HttpStatusError",
+    "LkConnectionError",
+    "LkTimeoutError",
+    "TooManyRedirectsError",
+    "ResourceLimitError",
+]
+
+
+class TestExceptionPickling:
+    """Exceptions must survive a process boundary.
+
+    `pickle` stores a class by name, not by value: it imports `__module__` and
+    looks up `__qualname__` there, then checks it got the same object back. The
+    classes used to report `__module__ = "_lkrequest"`, which is not importable
+    on its own — the extension lives inside the `lkrequest` package — so every
+    one of them failed to pickle. Under `multiprocessing` or a
+    `ProcessPoolExecutor` that turned a real error in a worker into an unrelated
+    `PicklingError` in the parent, with the original message lost and
+    `except lkrequest.RequestError` no longer matching.
+    """
+
+    @pytest.mark.parametrize("name", EXCEPTION_NAMES)
+    def test_round_trips_through_pickle(self, name):
+        cls = getattr(lkrequest, name)
+        restored = pickle.loads(pickle.dumps(cls("boom")))
+        assert type(restored) is cls
+        assert isinstance(restored, lkrequest.RequestError)
+        assert str(restored) == "boom"
+
+    @pytest.mark.parametrize("name", EXCEPTION_NAMES)
+    def test_reported_name_matches_the_export(self, name):
+        # The contract that makes pickling work, and the one most likely to be
+        # broken by accident later: the Rust ident passed to `create_exception!`
+        # becomes `__qualname__`, and `pickle` looks that exact name up on the
+        # module `__module__` names. So it has to equal the attribute
+        # `lkrequest/__init__.py` re-exports the class as — which is why
+        # `ConnectionError` and `TimeoutError` carry an `Lk` prefix in Rust and
+        # the others do not.
+        cls = getattr(lkrequest, name)
+        assert cls.__module__ == "lkrequest"
+        assert cls.__qualname__ == name
+        assert getattr(importlib.import_module(cls.__module__), cls.__qualname__) is cls
+
+    def test_json_decode_error_round_trips_with_its_position(self, server_url):
+        # Built with `type()` rather than `create_exception!`, so its
+        # `__module__` is set separately and could drift from the rest. It also
+        # inherits `json.JSONDecodeError.__reduce__`, which re-creates it from
+        # (msg, doc, pos) — those have to come back too, and all three bases
+        # have to still match.
+        session = BlockingClient(verify=False).session()
+        with pytest.raises(lkrequest.JsonDecodeError) as excinfo:
+            session.get(f"{server_url}/html").json()
+
+        restored = pickle.loads(pickle.dumps(excinfo.value))
+        assert type(restored) is lkrequest.JsonDecodeError
+        assert isinstance(restored, lkrequest.RequestError)
+        assert isinstance(restored, json.JSONDecodeError)
+        assert (restored.msg, restored.pos) == (excinfo.value.msg, excinfo.value.pos)
+
+    def test_an_exception_survives_a_process_boundary(self):
+        # The end of the story the docstring tells. Runs the real path rather
+        # than pickling by hand, because `ProcessPoolExecutor` is where a caller
+        # actually hits this.
+        #
+        # Pinned to "spawn" rather than taking the platform default: this process
+        # has already started the extension's tokio threads, and forking a
+        # threaded process can deadlock the child. A hang would be worse than a
+        # failure here, and the start method makes no difference to what is being
+        # tested — pickle is what carries the exception back either way.
+        pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+        with pool:
+            with pytest.raises(lkrequest.LkTimeoutError) as excinfo:
+                pool.submit(_raise_in_worker).result()
+        assert str(excinfo.value) == "request timed out"
+
+
+def _raise_in_worker():
+    """Raise a library exception in a worker process; must be importable."""
+    import lkrequest
+
+    raise lkrequest.LkTimeoutError("request timed out")

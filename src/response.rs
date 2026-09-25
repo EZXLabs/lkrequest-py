@@ -178,6 +178,84 @@ impl PyRedirectRecord {
 // Response
 // ---------------------------------------------------------------------------
 
+/// Resolve a WHATWG encoding label (`gbk`, `shift_jis`, `utf-8`, …) to a
+/// decoder. Label matching is case-insensitive and whitespace-tolerant, so the
+/// raw `charset=` value from the header can be passed straight in.
+fn encoding_for_label(label: &str) -> Option<&'static encoding_rs::Encoding> {
+    encoding_rs::Encoding::for_label(label.as_bytes())
+}
+
+/// Decode a body, replacing malformed sequences with U+FFFD.
+///
+/// Lossy rather than fatal, matching `requests` and `httpx`: a body is remote
+/// input, and one bad byte in the middle of a page should not cost the caller
+/// the entire response. `content` is there when the exact bytes matter.
+///
+/// A BOM is stripped, and it wins over a charset the header declared — the
+/// WHATWG Encoding Standard's rule, and therefore what browsers do. Both halves
+/// are deliberate, and both go further than `requests` and `httpx`, which strip
+/// nothing and always let the header win:
+///
+/// - stripping keeps an invisible U+FEFF out of the string, where it silently
+///   defeats `json.loads`, `startswith` and equality. `requests.json()` fails
+///   outright on a BOM-prefixed UTF-8 body for exactly this reason;
+/// - overriding is almost always right, because a UTF-8 BOM read under the
+///   declared charset is garbage no real document starts with, so its presence
+///   says the body is UTF-8 and the header is wrong.
+///
+/// `decode_with_bom_removal` would strip only a BOM that agrees with the header,
+/// and `decode_without_bom_handling` would match the other two clients; the
+/// browser rule is the choice here.
+fn decode_body(encoding: &'static encoding_rs::Encoding, body: &[u8]) -> String {
+    let (text, _, _) = encoding.decode(body);
+    text.into_owned()
+}
+
+/// The decoder for a charset the response declared, or UTF-8 without one.
+///
+/// A label the server made up is remote data, not a caller mistake, so it
+/// falls back to UTF-8 rather than denying access to the body.
+fn declared_decoder(declared: Option<&str>) -> &'static encoding_rs::Encoding {
+    declared
+        .and_then(encoding_for_label)
+        .unwrap_or(encoding_rs::UTF_8)
+}
+
+/// Decode with a codec the *caller* named through `encoding=`.
+///
+/// That is a Python programmer naming a codec, so it goes to Python's codec
+/// registry rather than the WHATWG table (see `Response.text`). An unknown
+/// codec raises `LookupError`, which is what `bytes.decode` itself raises for
+/// the same mistake.
+fn decode_with_codec<'py>(
+    py: Python<'py>,
+    body: &[u8],
+    codec: &str,
+) -> PyResult<Bound<'py, PyString>> {
+    PyBytes::new(py, body)
+        .call_method1("decode", (codec, "replace"))?
+        .downcast_into()
+        .map_err(Into::into)
+}
+
+/// `text()` for a body read in one piece: `encoding=` when the caller gave
+/// one, otherwise the declared charset. Shared by both streaming responses so
+/// they decode exactly like `Response.text()`.
+fn decode_text<'py>(
+    py: Python<'py>,
+    body: &[u8],
+    declared: Option<&str>,
+    encoding: Option<&str>,
+) -> PyResult<Bound<'py, PyString>> {
+    match encoding {
+        Some(codec) => decode_with_codec(py, body, codec),
+        None => Ok(PyString::new(
+            py,
+            &decode_body(declared_decoder(declared), body),
+        )),
+    }
+}
+
 fn parse_encoding(headers: &[(String, String)]) -> Option<String> {
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("content-type") {
@@ -344,24 +422,53 @@ impl PyResponse {
         Ok(d)
     }
 
-    fn text(&self) -> PyResult<String> {
-        if let Some(cached) = self.cached_text.get() {
-            return Ok(cached.clone());
+    /// Decode the body as text.
+    ///
+    /// The charset comes from `Content-Type` (the same value `encoding`
+    /// reports) and falls back to UTF-8 when the response declares none.
+    /// `encoding=` overrides both, for servers that omit the charset or state
+    /// the wrong one.
+    ///
+    /// The two paths deliberately consult different authorities. A charset out
+    /// of a header is a *web* label, so it is resolved against the WHATWG
+    /// Encoding Standard — the set browsers implement, which is the behaviour
+    /// this library exists to reproduce. An `encoding=` argument is a *Python
+    /// caller* naming a codec, so it goes to Python's codec registry: a
+    /// Python programmer reaches for `latin-1`, `utf-8-sig` or `cp936`, none of
+    /// which the web standard lists, and being refused those would make the
+    /// argument useless for the job it is here to do.
+    ///
+    /// The result is cached, except when `encoding=` is given — that decode is
+    /// one-off and neither reads nor fills the cache.
+    #[pyo3(signature = (encoding=None))]
+    fn text<'py>(&self, py: Python<'py>, encoding: Option<&str>) -> PyResult<Bound<'py, PyString>> {
+        if let Some(codec) = encoding {
+            return decode_with_codec(py, &self.body, codec);
         }
-        let text = std::str::from_utf8(&self.body)
-            .map_err(|e| pyo3::exceptions::PyUnicodeDecodeError::new_err(e.to_string()))?
-            .to_string();
-        let _ = self.cached_text.set(text.clone());
-        Ok(text)
+
+        if let Some(cached) = self.cached_text.get() {
+            return Ok(PyString::new(py, cached));
+        }
+        let text = decode_body(declared_decoder(self.encoding.as_deref()), &self.body);
+        let decoded = PyString::new(py, &text);
+        let _ = self.cached_text.set(text);
+        Ok(decoded)
     }
 
+    /// Parse the body as JSON (cached after the first call).
+    ///
+    /// Raises `JsonDecodeError` when the body is not JSON. That class is both a
+    /// `RequestError` and a `json.JSONDecodeError`, so either `except` catches
+    /// it.
     fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         if let Some(cached) = self.cached_json.get() {
             return Ok(cached.bind(py).clone());
         }
-        let text = self.text()?;
+        let text = self.text(py, None)?;
         let json_mod = py.import("json")?;
-        let result = json_mod.call_method1("loads", (text,))?;
+        let result = json_mod
+            .call_method1("loads", (text,))
+            .map_err(|e| crate::error::to_json_py_err(py, e))?;
         let _ = self.cached_json.set(result.clone().unbind());
         Ok(result)
     }
@@ -545,17 +652,22 @@ impl PyStreamingResponse {
         })
     }
 
-    fn text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Read the rest of the body and decode it exactly like `Response.text()`:
+    /// the charset `Content-Type` declares (UTF-8 without one), or the codec
+    /// named by `encoding=`, with malformed bytes replaced by U+FFFD.
+    #[pyo3(signature = (encoding=None))]
+    fn text<'py>(&self, py: Python<'py>, encoding: Option<String>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let declared = parse_encoding(&self.headers);
         crate::bridge::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             let stream = guard.take().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
             })?;
-            match stream.text().await {
-                Ok(text) => Ok(text),
-                Err(e) => Err(crate::error::to_py_err(e)),
-            }
+            let body = stream.bytes().await.map_err(crate::error::to_py_err)?;
+            Python::with_gil(|py| {
+                decode_text(py, &body, declared.as_deref(), encoding.as_deref()).map(Bound::unbind)
+            })
         })
     }
 
@@ -689,17 +801,27 @@ impl PyBlockingStreamingResponse {
         Ok(PyBytes::new(py, &data))
     }
 
-    fn text(&self, py: Python<'_>) -> PyResult<String> {
+    /// Read the rest of the body and decode it exactly like `Response.text()`:
+    /// the charset `Content-Type` declares (UTF-8 without one), or the codec
+    /// named by `encoding=`, with malformed bytes replaced by U+FFFD.
+    #[pyo3(signature = (encoding=None))]
+    fn text<'py>(&self, py: Python<'py>, encoding: Option<&str>) -> PyResult<Bound<'py, PyString>> {
         let inner = self.inner.clone();
-        py.allow_threads(|| {
+        let body = py.allow_threads(|| {
             crate::client::blocking_runtime().block_on(async move {
                 let mut guard = inner.lock().await;
                 let stream = guard.take().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
                 })?;
-                stream.text().await.map_err(crate::error::to_py_err)
+                stream.bytes().await.map_err(crate::error::to_py_err)
             })
-        })
+        })?;
+        decode_text(
+            py,
+            &body,
+            parse_encoding(&self.headers).as_deref(),
+            encoding,
+        )
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

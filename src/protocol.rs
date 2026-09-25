@@ -6,8 +6,8 @@ use pyo3::prelude::*;
 
 /// High-level desired HTTP protocol behaviour, independent of the wire-format
 /// fingerprint profiles (TLS / H2 / H3).
-#[pyclass(name = "HttpIntent", eq, eq_int)]
-#[derive(Clone, Copy, PartialEq)]
+#[pyclass(name = "HttpIntent", eq, eq_int, hash, frozen)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyHttpIntent {
     /// Disable QUIC / HTTP/3 and stay on TCP-based HTTP.
     H2Only = 0,
@@ -122,8 +122,8 @@ impl PyProtocolPolicy {
 
 /// Per-request preferred HTTP version. Overrides the session's protocol
 /// preference for a single request without changing the rest of the policy.
-#[pyclass(name = "PreferredHttpVersion", eq, eq_int)]
-#[derive(Clone, Copy, PartialEq)]
+#[pyclass(name = "PreferredHttpVersion", eq, eq_int, hash, frozen)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyPreferredHttpVersion {
     /// Use whatever the server negotiates via ALPN and policy defaults.
     Auto = 0,
@@ -153,8 +153,8 @@ impl From<PyPreferredHttpVersion> for lkrequest::PreferredHttpVersion {
 
 /// Per-request replay-safety declaration, controlling QUIC 0-RTT / TLS early
 /// data eligibility.
-#[pyclass(name = "Idempotency", eq, eq_int)]
-#[derive(Clone, Copy, PartialEq)]
+#[pyclass(name = "Idempotency", eq, eq_int, hash, frozen)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyIdempotency {
     /// Decide automatically based on the HTTP method (RFC 9110 safe methods).
     Default = 0,
@@ -176,8 +176,8 @@ impl From<PyIdempotency> for lkrequest::Idempotency {
 
 /// How a session quarantines an origin whose QUIC/H3 path has been failing, so
 /// it temporarily falls back to TCP instead of retrying H3 every time.
-#[pyclass(name = "BrokenQuicPolicy", eq, eq_int)]
-#[derive(Clone, Copy, PartialEq)]
+#[pyclass(name = "BrokenQuicPolicy", eq, eq_int, hash, frozen)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyBrokenQuicPolicy {
     /// Library default — 5 min initial cooldown, escalating up to 1 h after
     /// repeated failures. Best for stable networks (matches Chrome).

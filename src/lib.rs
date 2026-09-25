@@ -15,9 +15,11 @@
 mod bridge;
 mod client;
 mod client_pool;
+mod dns;
 mod error;
 mod fingerprint;
 mod hsts;
+mod masque;
 mod metrics;
 mod middleware;
 mod multipart;
@@ -32,6 +34,7 @@ mod retry;
 mod session;
 mod session_pool;
 mod types;
+mod upload;
 mod websocket;
 
 use pyo3::prelude::*;
@@ -45,6 +48,7 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<response::PyStreamingResponse>()?;
     m.add_class::<response::PyHeaderMap>()?;
     m.add_class::<response::PyRedirectRecord>()?;
+    m.add_class::<session::PyCookie>()?;
 
     // Blocking API
     m.add_class::<client::PyBlockingClient>()?;
@@ -103,6 +107,10 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // QUIC / HTTP3 (only available with the quic-h3 feature)
     #[cfg(feature = "quic-h3")]
     m.add_class::<quic::PyQuicProfile>()?;
+
+    // MASQUE outer-hop configuration (only available with the masque feature)
+    #[cfg(feature = "masque")]
+    m.add_class::<masque::PyMasqueConfig>()?;
 
     // Fingerprint randomization policy. `Randomize` (Tiers 0/1) is always
     // present; the `Layers` mask and `NegotiabilityFloor` are only meaningful for

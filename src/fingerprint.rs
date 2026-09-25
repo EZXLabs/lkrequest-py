@@ -520,6 +520,22 @@ impl PyTlsProfile {
             inner: lktls::profile::presets::chrome_152(),
         }
     }
+    /// Chrome 153: Chrome 152's shape with a narrower trust-anchor set — the
+    /// shuffled `0xca34` list drops from 32 identifiers to 28.
+    #[staticmethod]
+    fn chrome_153() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_153(),
+        }
+    }
+    /// Chrome 154: the Chrome 154.0.8037.58 capture kept Chrome 153's TLS shape,
+    /// 28-entry trust-anchor set included; only the profile name differs.
+    #[staticmethod]
+    fn chrome_154() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_154(),
+        }
+    }
     /// Chrome 146 QUIC-TLS profile: the ClientHello Chrome sends *inside* QUIC,
     /// which differs from the TCP profile of the same version. Pass it to
     /// `Client(quic_fingerprint=...)`; HTTP/3 otherwise reuses the main TLS profile.
@@ -551,6 +567,22 @@ impl PyTlsProfile {
             inner: lktls::profile::presets::chrome_152_quic(),
         }
     }
+    /// Chrome 153 QUIC-TLS profile: unlike the TCP profile it keeps the nine
+    /// classic signature algorithms (no ML-DSA) and sends no TLS GREASE slots.
+    #[staticmethod]
+    fn chrome_153_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_153_quic(),
+        }
+    }
+    /// Chrome 154 QUIC-TLS profile: Chrome 153's — nine classic signature
+    /// algorithms, shuffled extensions and no TLS GREASE slots.
+    #[staticmethod]
+    fn chrome_154_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_154_quic(),
+        }
+    }
     #[staticmethod]
     fn firefox_133() -> Self {
         PyTlsProfile {
@@ -561,6 +593,15 @@ impl PyTlsProfile {
     fn firefox_147() -> Self {
         PyTlsProfile {
             inner: lktls::profile::presets::firefox_147(),
+        }
+    }
+    /// Firefox 156: against Firefox 147 it drops two ECDSA CBC suites and both
+    /// FFDHE groups, and its ECH GREASE uses AES-128-GCM with a fixed 240-byte
+    /// payload.
+    #[staticmethod]
+    fn firefox_156() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::firefox_156(),
         }
     }
     #[staticmethod]
@@ -1071,6 +1112,21 @@ impl PyH2Profile {
             inner: lkh2::profile::chrome_152_h2(),
         }
     }
+    /// Chrome 153 H2 profile: the Chrome 153 capture reproduced Chrome 152's
+    /// SETTINGS order, window update, pseudo-header order and navigation priority.
+    #[staticmethod]
+    fn chrome_153() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_153_h2(),
+        }
+    }
+    /// Chrome 154 H2 profile: unchanged from Chrome 153.
+    #[staticmethod]
+    fn chrome_154() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_154_h2(),
+        }
+    }
     #[staticmethod]
     fn firefox_133() -> Self {
         PyH2Profile {
@@ -1081,6 +1137,13 @@ impl PyH2Profile {
     fn firefox_147() -> Self {
         PyH2Profile {
             inner: lkh2::profile::firefox_147_h2(),
+        }
+    }
+    /// Firefox 156 H2 profile: unchanged from Firefox 147.
+    #[staticmethod]
+    fn firefox_156() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::firefox_156_h2(),
         }
     }
     #[staticmethod]

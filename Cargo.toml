@@ -1,6 +1,6 @@
 [package]
 name = "lkrequest-py"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -36,6 +36,19 @@ http = "1"
 hyper = "1"
 hyper-util = "0.1"
 bytes = "1"
+# Needed to implement upstream's `#[async_trait]` `DnsResolver` trait, which
+# `src/dns.rs` wraps to filter resolved addresses by family. Already in the tree
+# as a transitive dependency of lkrequest, so this adds no code to the build.
+async-trait = "0.1"
+# Charset decoding for `Response.text()`. A Content-Type charset may be any label
+# in the WHATWG Encoding Standard (gbk, shift_jis, euc-kr, …); Rust's std only
+# decodes UTF-8, so without this the non-UTF-8 web is unreachable from `text()`.
+# This is the same crate the browsers use.
+encoding_rs = "0.8"
+# Only for the `Stream` trait bound on upstream's `RequestBuilder::body_stream`,
+# which `src/upload.rs` feeds from a Python source. Already in the tree as a
+# transitive dependency of lkrequest itself, so this adds no code to the build.
+futures-core = "0.3"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -62,6 +75,10 @@ synthetic-fp = ["lkrequest/synthetic-fp"]
 # exist. Kept in the default wheel build (see pyproject.toml) so those values keep
 # working exactly as before.
 doh = ["lkrequest/doh"]
+# MASQUE (RFC 9298 CONNECT-UDP) proxies: `masque://` URLs, `MasqueConfig`, and
+# the CONNECT-UDP health-check probe. Experimental upstream. Implies quic-h3,
+# because the outer hop is HTTP/3 and the tunneled connection is QUIC.
+masque = ["quic-h3", "lkrequest/masque"]
 
 [lints.clippy]
 unwrap_used = "warn"
