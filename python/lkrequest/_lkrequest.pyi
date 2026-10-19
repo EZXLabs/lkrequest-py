@@ -323,6 +323,26 @@ class BrokenQuicPolicy:
     Resilient: BrokenQuicPolicy
     Disabled: BrokenQuicPolicy
 
+class H3RetryMode:
+    """Whether a session replays a request after selected HTTP/3 protocol errors.
+
+    Pass via ``Client.session(h3_retry_mode=...)``. Independent of the session's
+    retry policy and of QUIC 0-RTT. Without the ``quic-h3`` build feature only
+    ``Safe`` is accepted.
+
+    ``Safe`` is the default: no replay beyond the usual safety checks.
+    ``Chrome155ProtocolErrors`` retries selected HTTP/3 protocol errors up to twice
+    per redirect hop, before response headers arrive, as Chrome 155 does. That
+    replays a finite buffered request, **including a POST the server may already
+    have processed**. Streaming uploads are not retried, and a request sent with
+    ``Idempotency.NotIdempotent`` opts out. It adds no status-code retries and
+    does not touch 0-RTT eligibility. A request that is not HTTP/3-only also
+    needs a protocol policy that allows falling back to TCP.
+    """
+
+    Safe: H3RetryMode
+    Chrome155ProtocolErrors: H3RetryMode
+
 class Hsts:
     """HTTP→HTTPS scheme-upgrade (HSTS) policy for a session, passed via
     ``Client.session(hsts=...)``.
@@ -438,6 +458,14 @@ class QuicProfile:
         The public capture verified QUIC through the Initial flight; the H3
         SETTINGS and request priority carry over from Chrome 153's completed
         navigation, since that capture path never received a QUIC response.
+        """
+    @staticmethod
+    def chrome_155() -> QuicProfile:
+        """Chrome 155 QUIC fingerprint preset, identical to Chrome 154.
+
+        Unlike the Chrome 154 capture, this one completed an HTTP/3 navigation,
+        so the H3 SETTINGS it carries over were observed directly rather than
+        inherited.
         """
     @staticmethod
     def from_json(json_str: str) -> QuicProfile:
@@ -617,7 +645,13 @@ class ProxyPool:
         health_check: Optional[HealthCheckConfig] = None,
     ) -> None: ...
     async def acquire(self) -> str:
-        """Acquire the next available proxy URL according to the rotation policy."""
+        """Acquire the next available proxy according to the rotation policy.
+
+        A pool that has proxies never answers with "no proxy" (which a caller
+        would take for a direct connection): while every proxy is cooling down
+        this waits for one to recover, so bound it with ``asyncio.wait_for`` if
+        needed. Only a pool created with an empty list returns ``""``.
+        """
     def mark_bad(self, identity: str) -> None:
         """Mark a proxy as failing so it is cooled down."""
 
@@ -920,6 +954,7 @@ class Session:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -952,6 +987,7 @@ class Session:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -985,6 +1021,7 @@ class Session:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1017,6 +1054,7 @@ class Session:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1048,6 +1086,7 @@ class Session:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1099,6 +1138,7 @@ class Session:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1236,6 +1276,22 @@ class Session:
         """Register an event hook called before each request."""
     def on_response(self, callback: Callable[..., Any]) -> None:
         """Register an event hook called after each response."""
+    @property
+    def closed(self) -> bool:
+        """Whether ``close()`` has been called."""
+    def close(self) -> None:
+        """Close the session and release what it holds.
+
+        Aborts the pooled connections, abandons the requests still in flight
+        (they raise ``RuntimeError``), drops the event hooks and the callbacks of
+        any session-level ``middleware``, and makes further requests raise
+        ``RuntimeError``. Closing twice is harmless.
+
+        Cookies stay readable. Callbacks of a ``Client(middleware=...)`` belong
+        to the client and are not released by closing a session.
+        """
+    async def __aenter__(self) -> Session: ...
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool: ...
 
 class BlockingSession:
     """A synchronous HTTP session sharing connections, cookies, and configuration across requests."""
@@ -1255,6 +1311,7 @@ class BlockingSession:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1285,6 +1342,7 @@ class BlockingSession:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1316,6 +1374,7 @@ class BlockingSession:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1346,6 +1405,7 @@ class BlockingSession:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1375,6 +1435,7 @@ class BlockingSession:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1424,6 +1485,7 @@ class BlockingSession:
         no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
         priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
         preferred_http_version: Optional[PreferredHttpVersion] = None,
         idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
@@ -1559,6 +1621,22 @@ class BlockingSession:
         """Register an event hook called before each request."""
     def on_response(self, callback: Callable[..., Any]) -> None:
         """Register an event hook called after each response."""
+    @property
+    def closed(self) -> bool:
+        """Whether ``close()`` has been called."""
+    def close(self) -> None:
+        """Close the session and release what it holds.
+
+        Aborts the pooled connections, abandons the requests still in flight
+        (they raise ``RuntimeError``), drops the event hooks and the callbacks of
+        any session-level ``middleware``, and makes further requests raise
+        ``RuntimeError``. Closing twice is harmless.
+
+        Cookies stay readable. Callbacks of a ``Client(middleware=...)`` belong
+        to the client and are not released by closing a session.
+        """
+    def __enter__(self) -> BlockingSession: ...
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool: ...
 
 # ---------------------------------------------------------------------------
 # Client
@@ -1692,6 +1770,9 @@ class Client:
     def chrome_154() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
+    def chrome_155() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
     def firefox_133() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
@@ -1733,6 +1814,7 @@ class Client:
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
         broken_quic_policy: Optional[BrokenQuicPolicy] = None,
+        h3_retry_mode: Optional[H3RetryMode] = None,
         header_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
@@ -1896,6 +1978,9 @@ class BlockingClient:
     def chrome_154() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
+    def chrome_155() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
     def firefox_133() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
@@ -1937,6 +2022,7 @@ class BlockingClient:
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
         broken_quic_policy: Optional[BrokenQuicPolicy] = None,
+        h3_retry_mode: Optional[H3RetryMode] = None,
         header_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
@@ -2208,6 +2294,9 @@ class TlsProfile:
     def chrome_154() -> TlsProfile:
         """Chrome 154: the capture kept Chrome 153's TLS shape; only the profile name differs."""
     @staticmethod
+    def chrome_155() -> TlsProfile:
+        """Chrome 155: the capture kept Chrome 154's TLS shape; only the profile name differs."""
+    @staticmethod
     def chrome_146_quic() -> TlsProfile:
         """Chrome 146 QUIC-TLS preset (the ClientHello sent inside QUIC), for ``Client(quic_fingerprint=...)``."""
     @staticmethod
@@ -2225,6 +2314,9 @@ class TlsProfile:
     @staticmethod
     def chrome_154_quic() -> TlsProfile:
         """Chrome 154 QUIC-TLS preset: Chrome 153's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
+    @staticmethod
+    def chrome_155_quic() -> TlsProfile:
+        """Chrome 155 QUIC-TLS preset: Chrome 154's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
     @staticmethod
     def firefox_133() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
@@ -2286,7 +2378,14 @@ class PriorityFrame:
     ) -> None: ...
 
 class PriorityConfig:
-    """HTTP/2 priority strategy (urgency weights, stream dependency policy, defaults)."""
+    """HTTP/2 priority strategy (urgency weights, stream dependency policy, defaults).
+
+    ``stream_dep_policy`` is ``"flat"`` (every stream depends on stream 0),
+    ``"chain"`` (each stream depends on the previous one the client opened,
+    closed or not) or ``"priority_chain"`` (Chrome's: each stream depends on the
+    newest still-active stream of equal or higher priority; finished streams
+    leave the chain).
+    """
 
     def __init__(
         self,
@@ -2303,7 +2402,7 @@ class PriorityConfig:
         """Return the library's default priority configuration."""
     @staticmethod
     def chrome() -> PriorityConfig:
-        """Priority configuration matching Chrome."""
+        """Priority configuration matching Chrome (``"priority_chain"`` dependencies)."""
     @staticmethod
     def firefox() -> PriorityConfig:
         """Priority configuration matching Firefox."""
@@ -2338,9 +2437,15 @@ class H2Profile:
         headers_priority: Optional[HeadersPriority] = None,
         priority_frames: Optional[list[PriorityFrame]] = None,
         priority_config: Optional[PriorityConfig] = None,
-    ) -> None: ...
+        initial_stream_id: int = 1,
+    ) -> None:
+        """``initial_stream_id`` is the ID of the first request stream opened on
+        a connection: an odd number up to 2**31 - 1 (``ValueError`` otherwise)."""
     @property
     def priority_config(self) -> PriorityConfig: ...
+    @property
+    def initial_stream_id(self) -> int:
+        """The ID of the first request stream opened on a connection."""
     @staticmethod
     def chrome_131() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
@@ -2378,6 +2483,9 @@ class H2Profile:
     def chrome_154() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 153)."""
     @staticmethod
+    def chrome_155() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 154)."""
+    @staticmethod
     def firefox_133() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
     @staticmethod
@@ -2385,7 +2493,8 @@ class H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
     @staticmethod
     def firefox_156() -> H2Profile:
-        """HTTP/2 fingerprint preset for this browser version (unchanged from Firefox 147)."""
+        """HTTP/2 fingerprint preset for this browser version (Firefox 147's SETTINGS, window and
+        pseudo-header order; the first request opens stream 3 and navigation HEADERS carry weight 41)."""
     @staticmethod
     def safari_18() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
@@ -2407,7 +2516,13 @@ class H2Profile:
         """Serialize this profile to a dict."""
 
 class TcpFingerprint:
-    """TCP-layer fingerprint (window size, MSS, scale, TTL, buffers); supports OS presets and JA4T."""
+    """TCP-layer fingerprint (window size, MSS, scale, TTL, buffers); supports OS presets and JA4T.
+
+    These are socket settings the library asks the OS for, on new direct
+    connections and on the hop to the first proxy. The OS still builds the SYN, so
+    a JA4T match is not guaranteed: window size and scale only steer the receive
+    buffer, MSS is applied on Linux only, and TCP options are descriptive.
+    """
 
     def __init__(
         self,

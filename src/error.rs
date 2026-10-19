@@ -131,8 +131,12 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 pub fn to_py_err(err: lkrequest::error::Error) -> PyErr {
     use lkrequest::error::Error as E;
-    let message = describe(&err);
-    match &err {
+    // With an H3 retry mode on, upstream wraps the original error in a request
+    // context. Classify the original: the wrapper itself would always fall
+    // through to the catch-all arm below.
+    let err = err.unwrapped();
+    let message = describe(err);
+    match err {
         E::Timeout { .. } => LkTimeoutError::new_err(message),
         E::Connection(_) | E::Io(_) => LkConnectionError::new_err(message),
         E::Tls(_) => TlsError::new_err(message),

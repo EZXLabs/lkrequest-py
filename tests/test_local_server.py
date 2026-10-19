@@ -394,32 +394,22 @@ def _ws_handshake_seen_by_server(ws_server_url, probe):
         ws.close()
 
 
-@pytest.mark.xfail(
-    reason="upstream ws_upgrade_h1 sends absolute-form; see "
-    "docs/UPSTREAM-WS-REQUEST-TARGET.md",
-    strict=True,
-)
 def test_ws_upgrade_uses_an_origin_form_request_target(
     ws_server_url, ws_handshake_probe
 ):
     # RFC 9112 §3.2.2: a client sends absolute-form only to a proxy; to an
-    # origin server the target MUST be origin-form. Upstream builds the request
-    # URI as `https://{host}{path}`, so the whole URI goes out as the target and
-    # any server that routes on the path (here hypercorn) misroutes the upgrade.
+    # origin server the target MUST be origin-form. An absolute-form upgrade
+    # also makes any server that routes on the path (here hypercorn) misroute
+    # it, and no browser sends one.
     seen = _ws_handshake_seen_by_server(ws_server_url, ws_handshake_probe)
     assert seen["raw_path"] == "/ws-echo"
 
 
-@pytest.mark.xfail(
-    reason="upstream ws_upgrade_h1 drops the port from Host; see "
-    "docs/UPSTREAM-WS-REQUEST-TARGET.md",
-    strict=True,
-)
 def test_ws_upgrade_host_header_carries_the_port(ws_server_url, ws_handshake_probe):
     # RFC 9110 §7.2: Host carries the port whenever it is not the scheme
-    # default. Upstream reuses the bare hostname as the authority, so a
-    # non-443 wss:// endpoint is addressed as if it were on 443 — invisible
-    # against public servers, wrong against anything vhosted on another port.
+    # default. Without it a non-443 wss:// endpoint is addressed as if it were
+    # on 443 — invisible against public servers, wrong against anything
+    # vhosted on another port.
     port = urlsplit(ws_server_url).port
     seen = _ws_handshake_seen_by_server(ws_server_url, ws_handshake_probe)
     assert seen["host"] == f"127.0.0.1:{port}"
@@ -509,7 +499,9 @@ def test_h3_get(h3_server_url):
     not hasattr(lkrequest, "QuicProfile"),
     reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
 )
-@pytest.mark.parametrize("preset", ["chrome", "chrome_146", "chrome_153", "chrome_154"])
+@pytest.mark.parametrize(
+    "preset", ["chrome", "chrome_146", "chrome_153", "chrome_154", "chrome_155"]
+)
 def test_h3_connection_survives_the_qpack_dynamic_table(h3_server_url, preset):
     # The Chrome QUIC presets advertise a 64 KiB QPACK dynamic table, as Chrome
     # does, and the test server's encoder (aioquic, on ls-qpack) takes them up

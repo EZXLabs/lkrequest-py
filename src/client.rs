@@ -8,12 +8,13 @@ use std::collections::HashMap;
 
 use crate::fingerprint::{PyH2Profile, PyTcpFingerprint, PyTlsProfile};
 use crate::hsts::PyHsts;
-use crate::middleware::{PyMiddleware, PyMiddlewareWrapper};
-use crate::protocol::{PyBrokenQuicPolicy, PyHttpIntent, PyProtocolPolicy};
+use crate::middleware::{MiddlewareSlots, PyMiddleware, PyMiddlewareWrapper};
+use crate::protocol::{PyBrokenQuicPolicy, PyH3RetryMode, PyHttpIntent, PyProtocolPolicy};
 use crate::proxy::apply_session_proxy;
 use crate::randomize::PyRandomize;
 use crate::retry::{PyCallableRetryPolicy, PyExponentialBackoff, PyFixedInterval};
-use crate::session::{EventHooks, PyBlockingSession, PySession};
+use crate::session::{PyBlockingSession, PySession};
+use crate::session_state::SessionState;
 use crate::types::{
     resolve_h2_profile, resolve_tcp_fingerprint, resolve_tls_profile, validated_duration,
     PyAcceptEncoding, PySessionResumptionConfig,
@@ -45,7 +46,7 @@ fn resolve_h2_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkh2::profile::H2Prof
 
 /// Resolve a QUIC profile from a preset name (`"chrome"` / `"chrome_146"` /
 /// `"chrome_150"` / `"chrome_151"` / `"chrome_152"` / `"chrome_153"` /
-/// `"chrome_154"`) or a
+/// `"chrome_154"` / `"chrome_155"`) or a
 /// `QuicProfile` object. Requires the `quic-h3` feature; without it any value is
 /// rejected with a clear error.
 #[cfg(feature = "quic-h3")]
@@ -59,8 +60,9 @@ fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProf
             "chrome_152" => Ok(lkrequest::lkh3::chrome_152_quic()),
             "chrome_153" => Ok(lkrequest::lkh3::chrome_153_quic()),
             "chrome_154" => Ok(lkrequest::lkh3::chrome_154_quic()),
+            "chrome_155" => Ok(lkrequest::lkh3::chrome_155_quic()),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154",
+                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155",
                 s
             ))),
         }
@@ -78,6 +80,31 @@ fn resolve_quic_from_any(_obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicPro
     Err(pyo3::exceptions::PyRuntimeError::new_err(
         "quic_profile requires building lkrequest-py with the 'quic-h3' feature: maturin develop --features quic-h3",
     ))
+}
+
+/// Set the session's HTTP/3 retry mode. Anything but the default needs the
+/// `quic-h3` feature; `Safe` is what a build without it does anyway.
+#[cfg(feature = "quic-h3")]
+fn apply_h3_retry_mode(
+    builder: lkrequest::session::SessionBuilder,
+    mode: PyH3RetryMode,
+) -> PyResult<lkrequest::session::SessionBuilder> {
+    Ok(builder.h3_retry_mode(mode.into()))
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn apply_h3_retry_mode(
+    builder: lkrequest::session::SessionBuilder,
+    mode: PyH3RetryMode,
+) -> PyResult<lkrequest::session::SessionBuilder> {
+    match mode {
+        PyH3RetryMode::Safe => Ok(builder),
+        PyH3RetryMode::Chrome155ProtocolErrors => {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "h3_retry_mode=H3RetryMode.Chrome155ProtocolErrors requires building lkrequest-py with the 'quic-h3' feature: maturin develop --features quic-h3",
+            ))
+        }
+    }
 }
 
 fn resolve_tcp_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::TcpFingerprint> {
@@ -110,14 +137,22 @@ fn apply_retry_policy(
     }
 }
 
+/// Add Python middleware to a session builder. The returned handles let the
+/// session release the callbacks when it is closed.
 fn apply_middlewares_to_session(
     mut builder: lkrequest::session::SessionBuilder,
     middlewares: &[PyMiddleware],
-) -> lkrequest::session::SessionBuilder {
+) -> (
+    lkrequest::session::SessionBuilder,
+    Vec<std::sync::Arc<MiddlewareSlots>>,
+) {
+    let mut slots = Vec::with_capacity(middlewares.len());
     for mw in middlewares {
-        builder = builder.middleware(PyMiddlewareWrapper::from_py(mw));
+        let wrapper = PyMiddlewareWrapper::from_py(mw);
+        slots.push(wrapper.slots());
+        builder = builder.middleware(wrapper);
     }
-    builder
+    (builder, slots)
 }
 
 /// Resolve a DNS resolver preset name. The three `*_https` (DNS-over-HTTPS)
@@ -824,6 +859,16 @@ impl PyClient {
     }
 
     #[staticmethod]
+    fn chrome_155() -> Self {
+        PyClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_155(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         PyClient {
             inner: build_preset_client(
@@ -873,10 +918,10 @@ impl PyClient {
         }
     }
 
-    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
     fn session<'py>(
         &self,
-        _py: Python<'py>,
+        py: Python<'py>,
         proxy: Option<Bound<'py, PyAny>>,
         max_redirects: Option<u32>,
         allow_redirects: bool,
@@ -895,6 +940,7 @@ impl PyClient {
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
         broken_quic_policy: Option<PyBrokenQuicPolicy>,
+        h3_retry_mode: Option<PyH3RetryMode>,
         header_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
@@ -930,8 +976,9 @@ impl PyClient {
         if let Some(ref retry_obj) = retry {
             builder = apply_retry_policy(builder, retry_obj)?;
         }
+        let mut middleware_slots = Vec::new();
         if let Some(ref mws) = middleware {
-            builder = apply_middlewares_to_session(builder, mws);
+            (builder, middleware_slots) = apply_middlewares_to_session(builder, mws);
         }
         if let Some(ae) = accept_encoding {
             builder = builder.default_accept_encoding(ae.inner);
@@ -954,6 +1001,9 @@ impl PyClient {
         if let Some(policy) = broken_quic_policy {
             builder = builder.broken_quic_policy(policy.into());
         }
+        if let Some(mode) = h3_retry_mode {
+            builder = apply_h3_retry_mode(builder, mode)?;
+        }
         if let Some(order) = header_order {
             let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
             builder = builder.header_order(refs);
@@ -975,24 +1025,16 @@ impl PyClient {
         if let Some(ctx) = network_partition_context {
             builder = builder.network_partition_context(ctx.inner);
         }
-        let hooks = EventHooks::default();
+        let state = SessionState::default().with_middleware(middleware_slots);
         if let Some(cb) = on_request {
-            hooks
-                .request_hooks
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-                .push(cb);
+            state.hooks.push_request(py, cb)?;
         }
         if let Some(cb) = on_response {
-            hooks
-                .response_hooks
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-                .push(cb);
+            state.hooks.push_response(py, cb)?;
         }
         Ok(PySession {
             inner: builder.build(),
-            hooks,
+            state,
             base_url,
         })
     }
@@ -1394,6 +1436,16 @@ impl PyBlockingClient {
     }
 
     #[staticmethod]
+    fn chrome_155() -> Self {
+        PyBlockingClient {
+            inner: build_preset_client(
+                lkrequest::preset::chrome_155(),
+                lkrequest::TcpFingerprint::chrome(),
+            ),
+        }
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         PyBlockingClient {
             inner: build_preset_client(
@@ -1443,10 +1495,10 @@ impl PyBlockingClient {
         }
     }
 
-    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
     fn session<'py>(
         &self,
-        _py: Python<'py>,
+        py: Python<'py>,
         proxy: Option<Bound<'py, PyAny>>,
         max_redirects: Option<u32>,
         allow_redirects: bool,
@@ -1465,6 +1517,7 @@ impl PyBlockingClient {
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
         broken_quic_policy: Option<PyBrokenQuicPolicy>,
+        h3_retry_mode: Option<PyH3RetryMode>,
         header_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
@@ -1500,8 +1553,9 @@ impl PyBlockingClient {
         if let Some(ref retry_obj) = retry {
             builder = apply_retry_policy(builder, retry_obj)?;
         }
+        let mut middleware_slots = Vec::new();
         if let Some(ref mws) = middleware {
-            builder = apply_middlewares_to_session(builder, mws);
+            (builder, middleware_slots) = apply_middlewares_to_session(builder, mws);
         }
         if let Some(ae) = accept_encoding {
             builder = builder.default_accept_encoding(ae.inner);
@@ -1524,6 +1578,9 @@ impl PyBlockingClient {
         if let Some(policy) = broken_quic_policy {
             builder = builder.broken_quic_policy(policy.into());
         }
+        if let Some(mode) = h3_retry_mode {
+            builder = apply_h3_retry_mode(builder, mode)?;
+        }
         if let Some(order) = header_order {
             let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
             builder = builder.header_order(refs);
@@ -1545,24 +1602,16 @@ impl PyBlockingClient {
         if let Some(ctx) = network_partition_context {
             builder = builder.network_partition_context(ctx.inner);
         }
-        let hooks = EventHooks::default();
+        let state = SessionState::default().with_middleware(middleware_slots);
         if let Some(cb) = on_request {
-            hooks
-                .request_hooks
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-                .push(cb);
+            state.hooks.push_request(py, cb)?;
         }
         if let Some(cb) = on_response {
-            hooks
-                .response_hooks
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-                .push(cb);
+            state.hooks.push_response(py, cb)?;
         }
         Ok(PyBlockingSession {
             inner: builder.build(),
-            hooks,
+            state,
             base_url,
         })
     }

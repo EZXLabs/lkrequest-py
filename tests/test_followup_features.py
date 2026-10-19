@@ -1,6 +1,6 @@
 """Tests for features added while tracking the lkrequest core update:
 
-new browser presets (chrome_145 through chrome_154, firefox_156), request
+new browser presets (chrome_145 through chrome_155, firefox_156), request
 priority, protocol
 policy / HTTP intent, session resumption, per-request preferred HTTP version /
 idempotency, and the QUIC/H3 surface.
@@ -27,7 +27,19 @@ NEW_CHROME_PRESETS = [
     "chrome_152",
     "chrome_153",
     "chrome_154",
+    "chrome_155",
 ]
+
+
+def _flatten_json(value: dict, prefix: str = "") -> dict:
+    """`{"a": {"b": 1}}` -> `{"a.b": 1}`, so two profiles compare field by field."""
+    flat = {}
+    for key, item in value.items():
+        if isinstance(item, dict):
+            flat.update(_flatten_json(item, f"{prefix}{key}."))
+        else:
+            flat[f"{prefix}{key}"] = item
+    return flat
 
 
 class TestNewPresets:
@@ -75,7 +87,7 @@ class TestNewPresets:
         # Python mirror of upstream's `chrome_152_is_first_chromium_profile_with_
         # signature_algorithm_grease`. GREASE placement is a fingerprint-visible
         # difference, so a preset silently gaining/losing it must fail here.
-        # Chrome 152 introduced it and Chrome 153 and 154 keep it.
+        # Chrome 152 introduced it and Chrome 153 through 155 keep it.
         greased = {
             name
             for name in NEW_CHROME_PRESETS + ["chrome_131", "chrome_144"]
@@ -83,7 +95,7 @@ class TestNewPresets:
                 "signature_algorithms"
             ]
         }
-        assert greased == {"chrome_152", "chrome_153", "chrome_154"}
+        assert greased == {"chrome_152", "chrome_153", "chrome_154", "chrome_155"}
 
     def test_chrome_152_carries_trust_anchor_ids(self):
         # Python mirror of upstream's `chrome_152_adds_capture_verified_trust_
@@ -195,6 +207,67 @@ class TestNewPresets:
             == lkrequest.H2Profile.chrome_153().to_json()
         )
 
+    def test_chrome_155_is_chrome_154_under_a_new_name(self):
+        # The Chrome 155.0.8059.40 capture matched Chrome 154 field for field
+        # over TCP TLS, QUIC TLS and H2, so upstream builds 155 from 154 and only
+        # the profile name may differ.
+        for prev, cur in (
+            ("chrome_154", "chrome_155"),
+            ("chrome_154_quic", "chrome_155_quic"),
+        ):
+            old = json.loads(getattr(lkrequest.TlsProfile, prev)().to_json())
+            new = json.loads(getattr(lkrequest.TlsProfile, cur)().to_json())
+            assert new.pop("name") == old.pop("name").replace("154", "155")
+            assert new == old
+        assert (
+            lkrequest.H2Profile.chrome_155().to_json()
+            == lkrequest.H2Profile.chrome_154().to_json()
+        )
+
+    @pytest.mark.parametrize(
+        "hpack, expected",
+        [
+            # :method, :authority, :scheme, :path — the control case.
+            (
+                b"\x82\x41\x0bexample.com\x87\x84",
+                ["method", "authority", "scheme", "path"],
+            ),
+            # Python mirror of upstream's `oversized_hpack_lengths_do_not_panic_
+            # or_fabricate_headers`: integers and string lengths far past the
+            # frame, which the old arithmetic overflowed on.
+            (b"\x3f\xe1\xff\xff\xff\x0f", []),
+            (b"\x40\x7f\x80\xff\xff\xff\x0f", []),
+            (b"\x40\x7f\xff\xff\xff\xff\x7f", []),
+            (b"\x40\x7f\xff\xff\xff\xff\xff\x7f", []),
+            # Continuation bytes past 64 bits, after one valid field: the scan
+            # keeps what it read and stops instead of misreading the rest.
+            (b"\x82\x40\x7f" + b"\xff" * 12 + b"\x01", ["method"]),
+        ],
+    )
+    def test_h2_frame_parsing_survives_oversized_hpack_lengths(self, hpack, expected):
+        preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        # HEADERS (type 0x1) with END_HEADERS (0x4) on stream 1.
+        headers = len(hpack).to_bytes(3, "big") + b"\x01\x04\x00\x00\x00\x01" + hpack
+        profile = lkrequest.H2Profile.from_h2_frames(preface + headers)
+        assert json.loads(profile.to_json())["pseudo_header_order"] == expected
+
+    @pytest.mark.parametrize("client_cls", [lkrequest.Client, BlockingClient])
+    def test_default_fingerprint_is_chrome_155(self, client_cls):
+        # Python mirror of upstream's `default_clients_use_chrome_155_and_
+        # explicit_144_remains_available`: a client built without a TLS or H2
+        # profile takes upstream's default, which moved from Chrome 144 to 155.
+        default = client_cls().fingerprint_info()
+        explicit = client_cls(
+            tls_profile="chrome_155", h2_profile="chrome_155"
+        ).fingerprint_info()
+        assert default["tls_profile"] == "Chrome 155"
+        assert default == explicit
+        # The previous default stays reachable by name.
+        assert (
+            client_cls(tls_profile="chrome_144").fingerprint_info()["tls_profile"]
+            == "Chrome 144"
+        )
+
     def test_firefox_156_matches_the_public_capture(self):
         # Python mirror of upstream's `firefox_156_matches_public_cloudflare_
         # capture`. Against Firefox 147 exactly four things move: the name, two
@@ -229,11 +302,23 @@ class TestNewPresets:
             ech["aead_id"] == 1
         )  # AES-128-GCM; Firefox 147 sent 3 (ChaCha20-Poly1305)
         assert (ech["payload_length_min"], ech["payload_length_max"]) == (240, 240)
-        # H2 was captured unchanged from Firefox 147.
-        assert (
-            lkrequest.H2Profile.firefox_156().to_json()
-            == lkrequest.H2Profile.firefox_147().to_json()
-        )
+        # H2 keeps Firefox 147's SETTINGS, connection window and pseudo-header
+        # order. The capture moved two things: the first request is stream 3, and
+        # navigation HEADERS carry wire weight 41 (semantic weight 42) where 147
+        # carried 42.
+        h2_147 = lkrequest.H2Profile.firefox_147().to_dict()
+        h2_156 = lkrequest.H2Profile.firefox_156().to_dict()
+        assert sorted(k for k in h2_156 if h2_156[k] != h2_147[k]) == [
+            "headers_priority",
+            "initial_stream_id",
+        ]
+        assert (h2_147["initial_stream_id"], h2_156["initial_stream_id"]) == (1, 3)
+        assert h2_147["headers_priority"]["weight"] == 42
+        assert h2_156["headers_priority"] == {
+            "stream_dependency": 0,
+            "weight": 41,
+            "exclusive": False,
+        }
 
     def test_firefox_156_claims_no_quic(self):
         # Upstream captured Firefox 156's QUIC Initial but ships the preset
@@ -258,6 +343,7 @@ class TestNewPresets:
             "chrome_152",
             "chrome_153",
             "chrome_154",
+            "chrome_155",
         ):
             tcp = json.loads(getattr(lkrequest.TlsProfile, name)().to_json())
             quic = json.loads(getattr(lkrequest.TlsProfile, f"{name}_quic")().to_json())
@@ -315,6 +401,7 @@ class TestNewPresets:
             "chrome_152",
             "chrome_153",
             "chrome_154",
+            "chrome_155",
             "firefox_133",
             "firefox_147",
             "firefox_156",
@@ -455,6 +542,27 @@ class TestQuicSurface:
         )
         assert "Session" in repr(session)
 
+    def test_h3_retry_mode_enum(self):
+        assert (
+            lkrequest.H3RetryMode.Safe != lkrequest.H3RetryMode.Chrome155ProtocolErrors
+        )
+        assert {lkrequest.H3RetryMode.Safe, lkrequest.H3RetryMode.Safe} == {
+            lkrequest.H3RetryMode.Safe
+        }
+
+    @pytest.mark.parametrize("client_cls", [lkrequest.Client, BlockingClient])
+    def test_session_accepts_h3_retry_mode(self, client_cls):
+        client = client_cls.chrome_155()
+        # `Safe` is what every build does, so every build takes it.
+        safe = client.session(h3_retry_mode=lkrequest.H3RetryMode.Safe)
+        assert "Session" in repr(safe)
+        chrome = lkrequest.H3RetryMode.Chrome155ProtocolErrors
+        if hasattr(lkrequest, "QuicProfile"):
+            assert "Session" in repr(client.session(h3_retry_mode=chrome))
+        else:
+            with pytest.raises(RuntimeError, match="quic-h3"):
+                client.session(h3_retry_mode=chrome)
+
     def test_client_disable_http3(self):
         assert "Client" in repr(lkrequest.Client(disable_http3=True))
 
@@ -481,6 +589,7 @@ class TestQuicSurface:
             "chrome_151",
             "chrome_153",
             "chrome_154",
+            "chrome_155",
         ):
             qp = getattr(lkrequest.QuicProfile, name)()
             assert qp.connection_id_length >= 0
@@ -507,6 +616,39 @@ class TestQuicSurface:
         # path never received a QUIC response (upstream's
         # `chrome_154_matches_public_initial_capture_and_inherits_h3_baseline`).
         assert profiles["chrome_154"] == profiles["chrome_153"]
+        # Chrome 155 keeps Chrome 154's transport parameters and H3 SETTINGS (its
+        # capture completed an H3 navigation, which confirmed the SETTINGS 154
+        # had inherited). What it adds are Chrome 155's request-handling and
+        # loss-recovery behaviours, as boolean switches that 154 does not have:
+        # nothing 154 carries changes, and every added field is on.
+        flat_154 = _flatten_json(json.loads(profiles["chrome_154"]))
+        flat_155 = _flatten_json(json.loads(profiles["chrome_155"]))
+        assert {k: flat_155[k] for k in flat_154} == flat_154
+        assert {k: v for k, v in flat_155.items() if k not in flat_154} == {
+            f"h3.{name}": True
+            for name in (
+                "accept_truncated_response_payloads",
+                "cancel_response_before_upload",
+                "defer_qpack_stream_prefixes",
+                "request_priority_updates",
+                "wait_for_incomplete_response_frame_headers",
+                "wait_for_response_after_upload_stop",
+            )
+        } | {
+            f"packetization.{name}": True
+            for name in (
+                "ack_obligation_only",
+                "chrome_loss_timing",
+                "chrome_pto_timing",
+                "chrome_rtt_quantization",
+                "discard_blocked_close",
+                "pto_single_probe_with_gap",
+                "queue_pto_while_blocked",
+                "reset_finished_on_stop",
+                "reuse_rejected_0rtt_streams",
+                "stop_before_matching_reset",
+            )
+        }
 
     def test_chrome_152_quic_drops_google_initial_rtt(self):
         # Unlike Chrome 151 (identical to 150), Chrome 152 is the first preset
@@ -546,6 +688,7 @@ class TestQuicSurface:
             "chrome_152",
             "chrome_153",
             "chrome_154",
+            "chrome_155",
         )
         for name in captured + ("chrome",):
             p = json.loads(getattr(lkrequest.QuicProfile, name)().to_json())

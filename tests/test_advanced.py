@@ -283,12 +283,78 @@ class TestH2Profile:
             settings, 15663105, order, priority_config=lkrequest.PriorityConfig.chrome()
         )
         assert profile.priority_config.auto_priority_header is True
-        assert profile.priority_config.stream_dep_policy == "chain"
+        assert profile.priority_config.stream_dep_policy == "priority_chain"
         # Omitting priority_config yields the neutral default (the #7 fix lets
         # callers opt into browser-accurate priority that was previously fixed).
         default_profile = lkrequest.H2Profile(settings, 15663105, order)
         assert default_profile.priority_config.auto_priority_header is False
         assert default_profile.priority_config.urgency_weights is None
+
+    def test_initial_stream_id_defaults_to_one(self):
+        settings = [lkrequest.H2Setting("header_table_size", 65536)]
+        order = ["method", "authority", "scheme", "path"]
+        profile = lkrequest.H2Profile(settings, 15663105, order)
+        assert profile.initial_stream_id == 1
+        assert profile.to_dict()["initial_stream_id"] == 1
+
+    def test_initial_stream_id_is_settable(self):
+        settings = [lkrequest.H2Setting("header_table_size", 65536)]
+        order = ["method", "authority", "scheme", "path"]
+        profile = lkrequest.H2Profile(settings, 15663105, order, initial_stream_id=5)
+        assert profile.initial_stream_id == 5
+        # The largest legal client stream ID: odd, and it fits in 31 bits.
+        top = lkrequest.H2Profile(
+            settings, 15663105, order, initial_stream_id=0x7FFFFFFF
+        )
+        assert top.initial_stream_id == 0x7FFFFFFF
+
+    @pytest.mark.parametrize("bad", [0, 2, 4, 0x80000001, 0xFFFFFFFF])
+    def test_initial_stream_id_must_be_an_odd_31_bit_number(self, bad):
+        settings = [lkrequest.H2Setting("header_table_size", 65536)]
+        order = ["method", "authority", "scheme", "path"]
+        with pytest.raises(ValueError, match="initial_stream_id"):
+            lkrequest.H2Profile(settings, 15663105, order, initial_stream_id=bad)
+
+    def test_initial_stream_id_survives_a_json_round_trip(self):
+        original = lkrequest.H2Profile.firefox_156()
+        restored = lkrequest.H2Profile.from_json(original.to_json())
+        assert original.initial_stream_id == restored.initial_stream_id == 3
+        assert restored.to_json() == original.to_json()
+
+    def test_json_without_initial_stream_id_means_stream_one(self):
+        # Profiles saved before the field existed must keep working.
+        data = lkrequest.H2Profile.chrome_155().to_dict()
+        del data["initial_stream_id"]
+        assert lkrequest.H2Profile.from_json(json.dumps(data)).initial_stream_id == 1
+
+    def test_json_with_an_even_initial_stream_id_is_rejected(self):
+        data = lkrequest.H2Profile.chrome_155().to_dict()
+        data["initial_stream_id"] = 2
+        with pytest.raises(ValueError, match="initial_stream_id"):
+            lkrequest.H2Profile.from_json(json.dumps(data))
+
+    def test_only_firefox_156_starts_on_stream_three(self):
+        starts = {
+            name: getattr(lkrequest.H2Profile, name)().initial_stream_id
+            for name in (
+                "chrome_131",
+                "chrome_155",
+                "firefox_133",
+                "firefox_147",
+                "firefox_156",
+                "safari_18",
+                "safari_26",
+            )
+        }
+        assert starts == {
+            "chrome_131": 1,
+            "chrome_155": 1,
+            "firefox_133": 1,
+            "firefox_147": 1,
+            "firefox_156": 3,
+            "safari_18": 1,
+            "safari_26": 1,
+        }
 
     def test_use_h2_profile_object_in_client(self):
         profile = lkrequest.H2Profile.chrome_144()
@@ -302,7 +368,7 @@ class TestPriorityConfig:
         assert pc.auto_priority_header is True
         assert pc.exclusive is True
         assert pc.urgency_weights == [255, 219, 146, 110, 73, 36, 0, 0]
-        assert pc.stream_dep_policy == "chain"
+        assert pc.stream_dep_policy == "priority_chain"
 
     def test_default_and_firefox(self):
         assert lkrequest.PriorityConfig.default_config().auto_priority_header is False
@@ -331,6 +397,23 @@ class TestPriorityConfig:
     def test_invalid_stream_dep_policy(self):
         with pytest.raises(ValueError):
             lkrequest.PriorityConfig(stream_dep_policy="bogus")
+
+    @pytest.mark.parametrize("policy", ["flat", "chain", "priority_chain"])
+    def test_every_stream_dep_policy_is_accepted_and_reported(self, policy):
+        assert (
+            lkrequest.PriorityConfig(stream_dep_policy=policy).stream_dep_policy
+            == policy
+        )
+
+    def test_the_error_for_an_unknown_policy_lists_the_valid_ones(self):
+        with pytest.raises(ValueError) as error:
+            lkrequest.PriorityConfig(stream_dep_policy="bogus")
+        for policy in ("flat", "chain", "priority_chain"):
+            assert policy in str(error.value)
+
+    def test_other_browsers_keep_their_own_policy(self):
+        assert lkrequest.PriorityConfig.firefox().stream_dep_policy == "flat"
+        assert lkrequest.PriorityConfig.default_config().stream_dep_policy == "flat"
 
 
 class TestTcpFingerprint:

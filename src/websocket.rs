@@ -3,13 +3,13 @@
 //! connection.
 
 use pyo3::prelude::*;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::client::blocking_runtime;
 use crate::error::to_py_err;
 
 type WsStream = hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>;
+type Connection = lkrequest::ws::WsConnection<WsStream>;
 
 // ---------------------------------------------------------------------------
 // WsMessage
@@ -87,18 +87,66 @@ fn rust_ws_to_py(msg: lkrequest::ws::WsMessage) -> PyWsMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Shared connection
+// ---------------------------------------------------------------------------
+
+/// The upgraded connection, shared by the Python object and the operations in
+/// flight on it.
+///
+/// An operation takes a handle with [`open`](Self::open) and runs on it with no
+/// lock held, so a `recv()` that is waiting for a message does not hold up a
+/// `send_*()` or a `close()`. [`release`](Self::release) drops the object's own
+/// handle once the connection is closed; the connection itself goes away when
+/// the last operation still using it finishes.
+struct SharedConnection {
+    slot: Mutex<Option<Arc<Connection>>>,
+}
+
+impl SharedConnection {
+    fn new(conn: Connection) -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(Some(Arc::new(conn))),
+        })
+    }
+
+    /// The connection, or `None` once it has been closed.
+    fn get(&self) -> Option<Arc<Connection>> {
+        lock(&self.slot).clone()
+    }
+
+    /// Like [`get`](Self::get), as the error a closed connection raises.
+    fn open(&self) -> PyResult<Arc<Connection>> {
+        self.get()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))
+    }
+
+    fn release(&self) {
+        // Taken out first: dropping the last handle runs arbitrary teardown, which
+        // has no business running with the lock held.
+        let released = lock(&self.slot).take();
+        drop(released);
+    }
+}
+
+/// Poisoning needs a panic while the lock is held, and nothing here does more
+/// than clone or take an `Option`; the data is as valid afterwards as before.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// ---------------------------------------------------------------------------
 // Async WsConnection
 // ---------------------------------------------------------------------------
 
 #[pyclass(name = "WsConnection")]
 pub struct PyWsConnection {
-    inner: Arc<Mutex<Option<lkrequest::ws::WsConnection<WsStream>>>>,
+    shared: Arc<SharedConnection>,
 }
 
 impl PyWsConnection {
-    pub fn new(conn: lkrequest::ws::WsConnection<WsStream>) -> Self {
+    pub fn new(conn: Connection) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Some(conn))),
+            shared: SharedConnection::new(conn),
         }
     }
 }
@@ -106,12 +154,9 @@ impl PyWsConnection {
 #[pymethods]
 impl PyWsConnection {
     fn send_text<'py>(&self, py: Python<'py>, text: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         crate::bridge::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             tracing::debug!(len = text.len(), "ws send_text");
             conn.send_text(&text).await.map_err(to_py_err)?;
             Ok(())
@@ -119,12 +164,9 @@ impl PyWsConnection {
     }
 
     fn send_binary<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         crate::bridge::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             tracing::debug!(len = data.len(), "ws send_binary");
             conn.send_binary(&data).await.map_err(to_py_err)?;
             Ok(())
@@ -132,12 +174,9 @@ impl PyWsConnection {
     }
 
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         crate::bridge::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             let msg = conn.recv().await.map_err(to_py_err)?;
             tracing::debug!(msg_type = %ws_msg_type(&msg), "ws recv");
             Ok(rust_ws_to_py(msg))
@@ -151,17 +190,14 @@ impl PyWsConnection {
         code: Option<u16>,
         reason: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         let reason = reason.to_string();
         crate::bridge::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             let close_info = code.map(|c| (c, reason.as_str()));
             tracing::debug!(?code, "ws close");
             conn.close(close_info).await.map_err(to_py_err)?;
-            *guard = None;
+            shared.release();
             Ok(())
         })
     }
@@ -171,26 +207,17 @@ impl PyWsConnection {
     }
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         crate::bridge::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            let conn = match guard.as_mut() {
-                Some(c) => c,
-                None => return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            let Some(conn) = shared.get() else {
+                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             };
             match conn.recv().await {
-                Ok(msg) => {
-                    if matches!(msg, lkrequest::ws::WsMessage::Close(_, _)) {
-                        *guard = None;
-                        Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
-                    } else {
-                        Ok(rust_ws_to_py(msg))
-                    }
-                }
-                Err(_) => {
-                    *guard = None;
+                Ok(lkrequest::ws::WsMessage::Close(_, _)) | Err(_) => {
+                    shared.release();
                     Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
                 }
+                Ok(msg) => Ok(rust_ws_to_py(msg)),
             }
         })
     }
@@ -206,13 +233,13 @@ impl PyWsConnection {
 
 #[pyclass(name = "BlockingWsConnection")]
 pub struct PyBlockingWsConnection {
-    inner: Arc<std::sync::Mutex<Option<lkrequest::ws::WsConnection<WsStream>>>>,
+    shared: Arc<SharedConnection>,
 }
 
 impl PyBlockingWsConnection {
-    pub fn new(conn: lkrequest::ws::WsConnection<WsStream>) -> Self {
+    pub fn new(conn: Connection) -> Self {
         Self {
-            inner: Arc::new(std::sync::Mutex::new(Some(conn))),
+            shared: SharedConnection::new(conn),
         }
     }
 }
@@ -220,14 +247,9 @@ impl PyBlockingWsConnection {
 #[pymethods]
 impl PyBlockingWsConnection {
     fn send_text(&self, py: Python<'_>, text: String) -> PyResult<()> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         py.allow_threads(|| {
-            let mut guard = inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             blocking_runtime()
                 .block_on(conn.send_text(&text))
                 .map_err(to_py_err)
@@ -235,14 +257,9 @@ impl PyBlockingWsConnection {
     }
 
     fn send_binary(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         py.allow_threads(|| {
-            let mut guard = inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             blocking_runtime()
                 .block_on(conn.send_binary(&data))
                 .map_err(to_py_err)
@@ -250,14 +267,9 @@ impl PyBlockingWsConnection {
     }
 
     fn recv(&self, py: Python<'_>) -> PyResult<PyWsMessage> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         py.allow_threads(|| {
-            let mut guard = inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             let msg = blocking_runtime()
                 .block_on(conn.recv())
                 .map_err(to_py_err)?;
@@ -267,20 +279,15 @@ impl PyBlockingWsConnection {
 
     #[pyo3(signature = (code=None, reason=""))]
     fn close(&self, py: Python<'_>, code: Option<u16>, reason: &str) -> PyResult<()> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         let reason = reason.to_string();
         py.allow_threads(|| {
-            let mut guard = inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WebSocket is closed"))?;
+            let conn = shared.open()?;
             let close_info = code.map(|c| (c, reason.as_str()));
             blocking_runtime()
                 .block_on(conn.close(close_info))
                 .map_err(to_py_err)?;
-            *guard = None;
+            shared.release();
             Ok(())
         })
     }
@@ -290,28 +297,17 @@ impl PyBlockingWsConnection {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyWsMessage>> {
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         py.allow_threads(|| {
-            let mut guard = inner
-                .lock()
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?;
-            let conn = match guard.as_mut() {
-                Some(c) => c,
-                None => return Ok(None),
+            let Some(conn) = shared.get() else {
+                return Ok(None);
             };
             match blocking_runtime().block_on(conn.recv()) {
-                Ok(msg) => {
-                    if matches!(msg, lkrequest::ws::WsMessage::Close(_, _)) {
-                        *guard = None;
-                        Ok(None)
-                    } else {
-                        Ok(Some(rust_ws_to_py(msg)))
-                    }
-                }
-                Err(_) => {
-                    *guard = None;
+                Ok(lkrequest::ws::WsMessage::Close(_, _)) | Err(_) => {
+                    shared.release();
                     Ok(None)
                 }
+                Ok(msg) => Ok(Some(rust_ws_to_py(msg))),
             }
         })
     }

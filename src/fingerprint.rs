@@ -536,6 +536,14 @@ impl PyTlsProfile {
             inner: lktls::profile::presets::chrome_154(),
         }
     }
+    /// Chrome 155: the Chrome 155.0.8059.40 capture kept Chrome 154's TLS shape;
+    /// only the profile name differs.
+    #[staticmethod]
+    fn chrome_155() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_155(),
+        }
+    }
     /// Chrome 146 QUIC-TLS profile: the ClientHello Chrome sends *inside* QUIC,
     /// which differs from the TCP profile of the same version. Pass it to
     /// `Client(quic_fingerprint=...)`; HTTP/3 otherwise reuses the main TLS profile.
@@ -581,6 +589,14 @@ impl PyTlsProfile {
     fn chrome_154_quic() -> Self {
         PyTlsProfile {
             inner: lktls::profile::presets::chrome_154_quic(),
+        }
+    }
+    /// Chrome 155 QUIC-TLS profile: Chrome 154's QUIC ClientHello under the
+    /// new name.
+    #[staticmethod]
+    fn chrome_155_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_155_quic(),
         }
     }
     #[staticmethod]
@@ -835,8 +851,9 @@ fn str_to_stream_dep_policy(s: &str) -> PyResult<lkh2::profile::StreamDepPolicy>
     match s {
         "flat" => Ok(lkh2::profile::StreamDepPolicy::Flat),
         "chain" => Ok(lkh2::profile::StreamDepPolicy::Chain),
+        "priority_chain" => Ok(lkh2::profile::StreamDepPolicy::PriorityChain),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown stream_dep_policy: '{}'. Use 'flat' or 'chain'",
+            "Unknown stream_dep_policy: '{}'. Use 'flat', 'chain' or 'priority_chain'",
             other
         ))),
     }
@@ -846,6 +863,7 @@ fn stream_dep_policy_to_str(p: lkh2::profile::StreamDepPolicy) -> &'static str {
     match p {
         lkh2::profile::StreamDepPolicy::Flat => "flat",
         lkh2::profile::StreamDepPolicy::Chain => "chain",
+        lkh2::profile::StreamDepPolicy::PriorityChain => "priority_chain",
     }
 }
 
@@ -854,7 +872,11 @@ impl PyPriorityConfig {
     /// Construct a custom priority configuration.
     ///
     /// `urgency_weights`, when given, must be exactly 8 bytes (urgency 0–7 ->
-    /// H2 wire weight 0–255). `stream_dep_policy` is `"flat"` or `"chain"`.
+    /// H2 wire weight 0–255). `stream_dep_policy` is `"flat"` (every stream
+    /// depends on stream 0), `"chain"` (each stream depends on the previous one
+    /// the client opened, closed or not) or `"priority_chain"` (Chrome's: each
+    /// stream depends on the newest still-active stream of equal or higher
+    /// priority, and finished streams are dropped from the chain).
     #[new]
     #[pyo3(signature = (
         *,
@@ -910,8 +932,8 @@ impl PyPriorityConfig {
         }
     }
 
-    /// Chrome priority strategy (urgency weights, exclusive, chained deps,
-    /// auto RFC 9218 header).
+    /// Chrome priority strategy (urgency weights, exclusive, `"priority_chain"`
+    /// dependencies, auto RFC 9218 header).
     #[staticmethod]
     fn chrome() -> Self {
         PyPriorityConfig {
@@ -999,8 +1021,25 @@ pub struct PyH2Profile {
     pub(crate) inner: lkh2::profile::H2Profile,
 }
 
+/// The largest stream ID a client can open (31 bits).
+const MAX_CLIENT_STREAM_ID: u32 = 0x7fff_ffff;
+
+/// Client-initiated streams have odd, nonzero IDs that fit in 31 bits (RFC 9113
+/// §5.1.1). Upstream rejects anything else when it parses a profile from JSON;
+/// checking here as well makes a hand-built profile fail where it is built.
+fn validated_initial_stream_id(id: u32) -> PyResult<u32> {
+    if id == 0 || id > MAX_CLIENT_STREAM_ID || id & 1 == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "initial_stream_id must be a nonzero odd 31-bit client stream ID",
+        ));
+    }
+    Ok(id)
+}
+
 #[pymethods]
 impl PyH2Profile {
+    /// `initial_stream_id` is the ID of the first request stream the client
+    /// opens on a connection: an odd number, 1 for most browsers.
     #[new]
     #[pyo3(signature = (
         settings,
@@ -1010,6 +1049,7 @@ impl PyH2Profile {
         headers_priority=None,
         priority_frames=None,
         priority_config=None,
+        initial_stream_id=1,
     ))]
     fn new(
         settings: Vec<PyH2Setting>,
@@ -1018,6 +1058,7 @@ impl PyH2Profile {
         headers_priority: Option<PyHeadersPriority>,
         priority_frames: Option<Vec<PyPriorityFrame>>,
         priority_config: Option<PyPriorityConfig>,
+        initial_stream_id: u32,
     ) -> PyResult<Self> {
         let pho: Vec<lkh2::profile::PseudoHeaderId> = pseudo_header_order
             .iter()
@@ -1026,6 +1067,7 @@ impl PyH2Profile {
 
         Ok(PyH2Profile {
             inner: lkh2::profile::H2Profile {
+                initial_stream_id: validated_initial_stream_id(initial_stream_id)?,
                 settings: settings.into_iter().map(|s| s.inner).collect(),
                 window_update,
                 pseudo_header_order: pho,
@@ -1047,6 +1089,12 @@ impl PyH2Profile {
         PyPriorityConfig {
             inner: self.inner.priority_config.clone(),
         }
+    }
+
+    /// The ID of the first request stream opened on a connection.
+    #[getter]
+    fn initial_stream_id(&self) -> u32 {
+        self.inner.initial_stream_id
     }
 
     // ---- Preset constructors ----
@@ -1127,6 +1175,13 @@ impl PyH2Profile {
             inner: lkh2::profile::chrome_154_h2(),
         }
     }
+    /// Chrome 155 H2 profile: unchanged from Chrome 154.
+    #[staticmethod]
+    fn chrome_155() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_155_h2(),
+        }
+    }
     #[staticmethod]
     fn firefox_133() -> Self {
         PyH2Profile {
@@ -1139,7 +1194,9 @@ impl PyH2Profile {
             inner: lkh2::profile::firefox_147_h2(),
         }
     }
-    /// Firefox 156 H2 profile: unchanged from Firefox 147.
+    /// Firefox 156 H2 profile: Firefox 147's SETTINGS, connection window and
+    /// pseudo-header order, but the first request opens stream 3 rather than 1
+    /// and navigation HEADERS carry wire weight 41.
     #[staticmethod]
     fn firefox_156() -> Self {
         PyH2Profile {

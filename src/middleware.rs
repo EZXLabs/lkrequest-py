@@ -1,6 +1,8 @@
 //! `Middleware` pyclass and the wrapper that bridges Python `on_request` /
 //! `on_response` callbacks into the `lkrequest::Middleware` trait.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -46,19 +48,69 @@ impl PyMiddleware {
 // PyMiddlewareWrapper — bridges PyMiddleware → lkrequest::Middleware trait
 // ---------------------------------------------------------------------------
 
+/// The callbacks of one middleware, behind locks so that closing the session
+/// that owns the middleware can drop them.
+///
+/// They live in the Rust heap, where Python's cycle collector cannot see them:
+/// a callback that refers back to the session (a closure over it, a bound
+/// method of an object that holds it) therefore keeps the whole session alive
+/// until the session is closed.
+pub(crate) struct MiddlewareSlots {
+    on_request: Mutex<Option<PyObject>>,
+    on_response: Mutex<Option<PyObject>>,
+}
+
+/// Poisoning needs a panic while the lock is held, and nothing here does more
+/// than swap an `Option`; the data is as valid afterwards as before.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl MiddlewareSlots {
+    fn has_on_request(&self) -> bool {
+        lock(&self.on_request).is_some()
+    }
+
+    fn has_on_response(&self) -> bool {
+        lock(&self.on_response).is_some()
+    }
+
+    fn on_request(&self, py: Python<'_>) -> Option<PyObject> {
+        lock(&self.on_request).as_ref().map(|f| f.clone_ref(py))
+    }
+
+    fn on_response(&self, py: Python<'_>) -> Option<PyObject> {
+        lock(&self.on_response).as_ref().map(|f| f.clone_ref(py))
+    }
+
+    /// Drop both callbacks. Dropping a Python object can run arbitrary code
+    /// (`__del__`), so they are taken out first and dropped with no lock held.
+    pub(crate) fn release(&self) {
+        let request = lock(&self.on_request).take();
+        let response = lock(&self.on_response).take();
+        drop((request, response));
+    }
+}
+
 pub(crate) struct PyMiddlewareWrapper {
     name: String,
-    on_request_fn: Option<PyObject>,
-    on_response_fn: Option<PyObject>,
+    slots: Arc<MiddlewareSlots>,
 }
 
 impl PyMiddlewareWrapper {
     pub fn from_py(mw: &PyMiddleware) -> Self {
         Python::with_gil(|py| PyMiddlewareWrapper {
             name: mw.name.clone(),
-            on_request_fn: mw.on_request_fn.as_ref().map(|o| o.clone_ref(py)),
-            on_response_fn: mw.on_response_fn.as_ref().map(|o| o.clone_ref(py)),
+            slots: Arc::new(MiddlewareSlots {
+                on_request: Mutex::new(mw.on_request_fn.as_ref().map(|o| o.clone_ref(py))),
+                on_response: Mutex::new(mw.on_response_fn.as_ref().map(|o| o.clone_ref(py))),
+            }),
         })
+    }
+
+    /// A handle onto the callbacks, for whoever has to release them later.
+    pub(crate) fn slots(&self) -> Arc<MiddlewareSlots> {
+        Arc::clone(&self.slots)
     }
 }
 
@@ -67,11 +119,17 @@ impl lkrequest::Middleware for PyMiddlewareWrapper {
         &self,
         mut req: lkrequest::middleware::MiddlewareRequest,
     ) -> Result<lkrequest::middleware::MiddlewareRequest, lkrequest::error::Error> {
-        let Some(ref func) = self.on_request_fn else {
+        // Checked before taking the GIL: a middleware that only watches
+        // responses should not make every request wait for it.
+        if !self.slots.has_on_request() {
             return Ok(req);
-        };
+        }
         tracing::debug!(middleware = %self.name, method = %req.method, url = %req.url, "middleware.on_request");
         Python::with_gil(|py| {
+            // Released between the check above and here: the session was closed.
+            let Some(func) = self.slots.on_request(py) else {
+                return Ok(req);
+            };
             let dict = PyDict::new(py);
             let _ = dict.set_item("method", req.method.as_str());
             let _ = dict.set_item("url", &req.url);
@@ -131,11 +189,14 @@ impl lkrequest::Middleware for PyMiddlewareWrapper {
         &self,
         mut resp: lkrequest::middleware::MiddlewareResponse,
     ) -> Result<lkrequest::middleware::MiddlewareResponse, lkrequest::error::Error> {
-        let Some(ref func) = self.on_response_fn else {
+        if !self.slots.has_on_response() {
             return Ok(resp);
-        };
+        }
         tracing::debug!(middleware = %self.name, status = %resp.status.as_u16(), "middleware.on_response");
         Python::with_gil(|py| {
+            let Some(func) = self.slots.on_response(py) else {
+                return Ok(resp);
+            };
             let dict = PyDict::new(py);
             let _ = dict.set_item("status", resp.status.as_u16());
 

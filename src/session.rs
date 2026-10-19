@@ -2,9 +2,10 @@
 //! that persist cookies and base configuration across requests and fire
 //! request/response event hooks.
 
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
+use pyo3::PyTraverseError;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::client::blocking_runtime;
 use crate::error::to_py_err;
@@ -12,6 +13,7 @@ use crate::multipart::PyMultipart;
 use crate::priority::PyRequestPriority;
 use crate::protocol::{PyHttpIntent, PyIdempotency, PyPreferredHttpVersion, PyProtocolPolicy};
 use crate::response::PyResponse;
+use crate::session_state::{EventHooks, SessionState};
 use crate::types::{serialize_json, validated_duration, PyAcceptEncoding, StrPairs};
 use crate::websocket::{PyBlockingWsConnection, PyWsConnection};
 
@@ -112,60 +114,6 @@ impl From<lkrequest::CookieInfo> for PyCookie {
 }
 
 // ---------------------------------------------------------------------------
-// Event Hooks
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Default)]
-pub(crate) struct EventHooks {
-    pub request_hooks: Arc<std::sync::Mutex<Vec<Py<PyAny>>>>,
-    pub response_hooks: Arc<std::sync::Mutex<Vec<Py<PyAny>>>>,
-}
-
-impl EventHooks {
-    fn fire_request(&self, method: &str, url: &str, headers: &Option<Vec<(String, String)>>) {
-        Python::with_gil(|py| {
-            let hooks: Vec<Py<PyAny>> = {
-                let guard = match self.request_hooks.lock() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
-                if guard.is_empty() {
-                    return;
-                }
-                guard.iter().map(|h| h.clone_ref(py)).collect()
-            };
-            let headers_val: HashMap<String, String> =
-                headers.clone().unwrap_or_default().into_iter().collect();
-            for hook in &hooks {
-                if let Err(e) = hook.call1(py, (method, url, &headers_val)) {
-                    tracing::warn!(error = %e, "event_hook.on_request failed");
-                }
-            }
-        });
-    }
-
-    fn fire_response(&self, status_code: u16, url: &str, elapsed: f64) {
-        Python::with_gil(|py| {
-            let hooks: Vec<Py<PyAny>> = {
-                let guard = match self.response_hooks.lock() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
-                if guard.is_empty() {
-                    return;
-                }
-                guard.iter().map(|h| h.clone_ref(py)).collect()
-            };
-            for hook in &hooks {
-                if let Err(e) = hook.call1(py, (status_code, url, elapsed)) {
-                    tracing::warn!(error = %e, "event_hook.on_response failed");
-                }
-            }
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Shared request-building logic
 // ---------------------------------------------------------------------------
 
@@ -194,6 +142,8 @@ struct PreparedRequest {
 #[derive(Default)]
 struct RequestOpts {
     priority: Option<lkh2::RequestPriority>,
+    /// Wire weight (0-255) for the legacy priority field of an H2 HEADERS frame.
+    h2_priority_weight: Option<u8>,
     preferred_http_version: Option<lkrequest::PreferredHttpVersion>,
     idempotency: Option<lkrequest::Idempotency>,
     header_order: Option<Vec<String>>,
@@ -276,6 +226,9 @@ fn apply_request_options(
     }
     if let Some(priority) = req.opts.priority {
         rb = rb.priority(priority);
+    }
+    if let Some(weight) = req.opts.h2_priority_weight {
+        rb = rb.h2_priority_weight(weight);
     }
     if let Some(version) = req.opts.preferred_http_version {
         rb = rb.preferred_http_version(version);
@@ -454,7 +407,7 @@ fn extract_multipart(
 #[derive(Clone)]
 pub struct PySession {
     pub(crate) inner: lkrequest::Session,
-    pub(crate) hooks: EventHooks,
+    pub(crate) state: SessionState,
     pub(crate) base_url: Option<String>,
 }
 
@@ -492,8 +445,10 @@ impl PySession {
             &opts.body_stream,
             opts.content_length,
         )?;
+        self.state.ensure_open()?;
         let session = self.inner.clone();
-        let hooks = self.hooks.clone();
+        let hooks = self.state.hooks.clone();
+        let closing = self.state.closing();
         let prepared = PreparedRequest {
             method: method.to_string(),
             url,
@@ -514,7 +469,9 @@ impl PySession {
             opts,
         };
         crate::bridge::future_into_py(py, async move {
-            execute_request(session, prepared, hooks).await
+            closing
+                .guard(execute_request(session, prepared, hooks))
+                .await
         })
     }
 }
@@ -523,7 +480,7 @@ impl PySession {
 impl PySession {
     // --- HTTP Methods -------------------------------------------------------
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn get<'py>(
         &self,
         py: Python<'py>,
@@ -539,6 +496,7 @@ impl PySession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -567,6 +525,7 @@ impl PySession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -580,7 +539,7 @@ impl PySession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn post<'py>(
         &self,
         py: Python<'py>,
@@ -602,6 +561,7 @@ impl PySession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -635,6 +595,7 @@ impl PySession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -648,7 +609,7 @@ impl PySession {
         )
     }
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn request<'py>(
         &self,
         py: Python<'py>,
@@ -671,6 +632,7 @@ impl PySession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -704,6 +666,7 @@ impl PySession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -717,7 +680,7 @@ impl PySession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn put<'py>(
         &self,
         py: Python<'py>,
@@ -739,6 +702,7 @@ impl PySession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -772,6 +736,7 @@ impl PySession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -785,7 +750,7 @@ impl PySession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn delete<'py>(
         &self,
         py: Python<'py>,
@@ -806,6 +771,7 @@ impl PySession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -838,6 +804,7 @@ impl PySession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -901,7 +868,7 @@ impl PySession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn patch<'py>(
         &self,
         py: Python<'py>,
@@ -923,6 +890,7 @@ impl PySession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -956,6 +924,7 @@ impl PySession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -1039,22 +1008,27 @@ impl PySession {
         headers: Option<StrPairs>,
         protocols: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
-        crate::bridge::future_into_py(py, async move {
-            let mut builder = session.websocket(&url);
-            if let Some(h) = headers {
-                for (k, v) in h.0 {
-                    builder = builder.header(&k, &v);
+        crate::bridge::future_into_py(
+            py,
+            closing.guard(async move {
+                let mut builder = session.websocket(&url);
+                if let Some(h) = headers {
+                    for (k, v) in h.0 {
+                        builder = builder.header(&k, &v);
+                    }
                 }
-            }
-            if let Some(protos) = protocols {
-                for p in protos {
-                    builder = builder.protocol(&p);
+                if let Some(protos) = protocols {
+                    for p in protos {
+                        builder = builder.protocol(&p);
+                    }
                 }
-            }
-            let conn = builder.connect().await.map_err(to_py_err)?;
-            Ok(PyWsConnection::new(conn))
-        })
+                let conn = builder.connect().await.map_err(to_py_err)?;
+                Ok(PyWsConnection::new(conn))
+            }),
+        )
     }
 
     // --- Cookie Management --------------------------------------------------
@@ -1125,11 +1099,16 @@ impl PySession {
     // --- Connection Preconnect -----------------------------------------------
 
     fn preconnect<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
-        crate::bridge::future_into_py(py, async move {
-            session.preconnect(&url).await.map_err(to_py_err)?;
-            Ok(())
-        })
+        crate::bridge::future_into_py(
+            py,
+            closing.guard(async move {
+                session.preconnect(&url).await.map_err(to_py_err)?;
+                Ok(())
+            }),
+        )
     }
 
     fn preconnect_many<'py>(
@@ -1137,49 +1116,59 @@ impl PySession {
         py: Python<'py>,
         urls: Vec<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
-        crate::bridge::future_into_py(py, async move {
-            let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
-            let results = session.preconnect_many(&url_refs).await;
-            Python::with_gil(|py| {
-                let list: Vec<Py<pyo3::types::PyDict>> = results
-                    .into_iter()
-                    .zip(urls.iter())
-                    .map(|(r, url)| {
-                        let dict = pyo3::types::PyDict::new(py);
-                        dict.set_item("url", url)?;
-                        dict.set_item("success", r.is_ok())?;
-                        dict.set_item("error", r.err().map(|e| e.to_string()))?;
-                        Ok(dict.unbind())
-                    })
-                    .collect::<PyResult<_>>()?;
-                Ok(list)
-            })
-        })
+        crate::bridge::future_into_py(
+            py,
+            closing.guard(async move {
+                let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
+                let results = session.preconnect_many(&url_refs).await;
+                Python::with_gil(|py| {
+                    let list: Vec<Py<pyo3::types::PyDict>> = results
+                        .into_iter()
+                        .zip(urls.iter())
+                        .map(|(r, url)| {
+                            let dict = pyo3::types::PyDict::new(py);
+                            dict.set_item("url", url)?;
+                            dict.set_item("success", r.is_ok())?;
+                            dict.set_item("error", r.err().map(|e| e.to_string()))?;
+                            Ok(dict.unbind())
+                        })
+                        .collect::<PyResult<_>>()?;
+                    Ok(list)
+                })
+            }),
+        )
     }
 
     // --- Connection Prefetch -------------------------------------------------
 
     fn prefetch<'py>(&self, py: Python<'py>, urls: Vec<String>) -> PyResult<Bound<'py, PyAny>> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
-        crate::bridge::future_into_py(py, async move {
-            let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
-            let results = session.prefetch(&url_refs).await;
-            Python::with_gil(|py| {
-                let list: Vec<Py<pyo3::types::PyDict>> = results
-                    .iter()
-                    .map(|r| {
-                        let dict = pyo3::types::PyDict::new(py);
-                        dict.set_item("url", &r.url)?;
-                        dict.set_item("success", r.success)?;
-                        dict.set_item("duration_ms", r.duration.as_secs_f64() * 1000.0)?;
-                        dict.set_item("error", r.error.as_deref())?;
-                        Ok(dict.unbind())
-                    })
-                    .collect::<PyResult<_>>()?;
-                Ok(list)
-            })
-        })
+        crate::bridge::future_into_py(
+            py,
+            closing.guard(async move {
+                let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
+                let results = session.prefetch(&url_refs).await;
+                Python::with_gil(|py| {
+                    let list: Vec<Py<pyo3::types::PyDict>> = results
+                        .iter()
+                        .map(|r| {
+                            let dict = pyo3::types::PyDict::new(py);
+                            dict.set_item("url", &r.url)?;
+                            dict.set_item("success", r.success)?;
+                            dict.set_item("duration_ms", r.duration.as_secs_f64() * 1000.0)?;
+                            dict.set_item("error", r.error.as_deref())?;
+                            Ok(dict.unbind())
+                        })
+                        .collect::<PyResult<_>>()?;
+                    Ok(list)
+                })
+            }),
+        )
     }
 
     // --- Streaming -----------------------------------------------------------
@@ -1212,6 +1201,8 @@ impl PySession {
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
@@ -1251,31 +1242,69 @@ impl PySession {
                 ..Default::default()
             },
         };
-        crate::bridge::future_into_py(py, async move {
-            let rb = apply_request_options(&session, prepared)?;
-            let resp = rb.send_streaming().await.map_err(to_py_err)?;
-            Ok(crate::response::PyStreamingResponse::new(resp))
-        })
+        crate::bridge::future_into_py(
+            py,
+            closing.guard(async move {
+                let rb = apply_request_options(&session, prepared)?;
+                let resp = rb.send_streaming().await.map_err(to_py_err)?;
+                Ok(crate::response::PyStreamingResponse::new(resp))
+            }),
+        )
     }
 
     // --- Event Hooks ---------------------------------------------------------
 
-    fn on_request(&self, callback: Py<PyAny>) -> PyResult<()> {
-        self.hooks
-            .request_hooks
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-            .push(callback);
-        Ok(())
+    fn on_request(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.state.ensure_open()?;
+        self.state.hooks.push_request(py, callback)
     }
 
-    fn on_response(&self, callback: Py<PyAny>) -> PyResult<()> {
-        self.hooks
-            .response_hooks
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-            .push(callback);
-        Ok(())
+    fn on_response(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.state.ensure_open()?;
+        self.state.hooks.push_response(py, callback)
+    }
+
+    // --- Lifecycle -----------------------------------------------------------
+
+    /// Whether `close()` has been called.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.state.is_closed()
+    }
+
+    /// Close the session: abort its pooled connections, abandon the requests
+    /// still in flight (they raise `RuntimeError`), drop its event hooks and the
+    /// callbacks of its session-level middleware, and refuse further requests
+    /// with `RuntimeError`. Closing twice is harmless.
+    fn close(&self, py: Python<'_>) {
+        self.state.close(py);
+        self.inner.pool_clear();
+    }
+
+    // --- Garbage collection --------------------------------------------------
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse(&visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_for_gc();
+    }
+
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        slf.borrow(py).state.ensure_open()?;
+        crate::bridge::future_into_py(py, async move { Ok(slf) })
+    }
+
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Bound<'py, PyAny>,
+        _exc_val: Bound<'py, PyAny>,
+        _exc_tb: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.close(py);
+        crate::bridge::future_into_py(py, async move { Ok(false) })
     }
 
     fn __repr__(&self) -> String {
@@ -1291,7 +1320,7 @@ impl PySession {
 #[derive(Clone)]
 pub struct PyBlockingSession {
     pub(crate) inner: lkrequest::Session,
-    pub(crate) hooks: EventHooks,
+    pub(crate) state: SessionState,
     pub(crate) base_url: Option<String>,
 }
 
@@ -1329,8 +1358,10 @@ impl PyBlockingSession {
             &opts.body_stream,
             opts.content_length,
         )?;
+        self.state.ensure_open()?;
         let session = self.inner.clone();
-        let hooks = self.hooks.clone();
+        let hooks = self.state.hooks.clone();
+        let closing = self.state.closing();
         let prepared = PreparedRequest {
             method: method.to_string(),
             url,
@@ -1351,15 +1382,18 @@ impl PyBlockingSession {
             opts,
         };
         py.allow_threads(|| {
-            blocking_runtime()
-                .block_on(async move { execute_request(session, prepared, hooks).await })
+            blocking_runtime().block_on(async move {
+                closing
+                    .guard(execute_request(session, prepared, hooks))
+                    .await
+            })
         })
     }
 }
 
 #[pymethods]
 impl PyBlockingSession {
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn get(
         &self,
         py: Python<'_>,
@@ -1375,6 +1409,7 @@ impl PyBlockingSession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -1403,6 +1438,7 @@ impl PyBlockingSession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -1416,7 +1452,7 @@ impl PyBlockingSession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn post(
         &self,
         py: Python<'_>,
@@ -1438,6 +1474,7 @@ impl PyBlockingSession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -1471,6 +1508,7 @@ impl PyBlockingSession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -1484,7 +1522,7 @@ impl PyBlockingSession {
         )
     }
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn request(
         &self,
         py: Python<'_>,
@@ -1507,6 +1545,7 @@ impl PyBlockingSession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -1540,6 +1579,7 @@ impl PyBlockingSession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -1553,7 +1593,7 @@ impl PyBlockingSession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn put(
         &self,
         py: Python<'_>,
@@ -1575,6 +1615,7 @@ impl PyBlockingSession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -1608,6 +1649,7 @@ impl PyBlockingSession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -1621,7 +1663,7 @@ impl PyBlockingSession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn delete(
         &self,
         py: Python<'_>,
@@ -1642,6 +1684,7 @@ impl PyBlockingSession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -1674,6 +1717,7 @@ impl PyBlockingSession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -1737,7 +1781,7 @@ impl PyBlockingSession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn patch(
         &self,
         py: Python<'_>,
@@ -1759,6 +1803,7 @@ impl PyBlockingSession {
         no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
         priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
         preferred_http_version: Option<PyPreferredHttpVersion>,
         idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
@@ -1792,6 +1837,7 @@ impl PyBlockingSession {
             accept_encoding.map(|a| a.inner),
             RequestOpts {
                 priority: priority.map(|p| p.inner),
+                h2_priority_weight,
                 preferred_http_version: preferred_http_version.map(Into::into),
                 idempotency: idempotency.map(Into::into),
                 header_order,
@@ -1875,9 +1921,11 @@ impl PyBlockingSession {
         headers: Option<StrPairs>,
         protocols: Option<Vec<String>>,
     ) -> PyResult<PyBlockingWsConnection> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
         py.allow_threads(|| {
-            blocking_runtime().block_on(async move {
+            blocking_runtime().block_on(closing.guard(async move {
                 let mut builder = session.websocket(&url);
                 if let Some(h) = headers {
                     for (k, v) in h.0 {
@@ -1891,7 +1939,7 @@ impl PyBlockingSession {
                 }
                 let conn = builder.connect().await.map_err(to_py_err)?;
                 Ok(PyBlockingWsConnection::new(conn))
-            })
+            }))
         })
     }
 
@@ -1963,10 +2011,13 @@ impl PyBlockingSession {
     // --- Connection Preconnect -----------------------------------------------
 
     fn preconnect(&self, py: Python<'_>, url: String) -> PyResult<()> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
         py.allow_threads(|| {
-            blocking_runtime()
-                .block_on(async move { session.preconnect(&url).await.map_err(to_py_err) })
+            blocking_runtime().block_on(
+                closing.guard(async move { session.preconnect(&url).await.map_err(to_py_err) }),
+            )
         })
     }
 
@@ -1975,9 +2026,11 @@ impl PyBlockingSession {
         py: Python<'_>,
         urls: Vec<String>,
     ) -> PyResult<Vec<Py<pyo3::types::PyDict>>> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
         py.allow_threads(|| {
-            blocking_runtime().block_on(async move {
+            blocking_runtime().block_on(closing.guard(async move {
                 let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
                 let results = session.preconnect_many(&url_refs).await;
                 Python::with_gil(|py| {
@@ -1993,7 +2046,7 @@ impl PyBlockingSession {
                         })
                         .collect::<PyResult<Vec<_>>>()
                 })
-            })
+            }))
         })
     }
 
@@ -2004,9 +2057,11 @@ impl PyBlockingSession {
         py: Python<'_>,
         urls: Vec<String>,
     ) -> PyResult<Vec<Py<pyo3::types::PyDict>>> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let session = self.inner.clone();
         py.allow_threads(|| {
-            blocking_runtime().block_on(async move {
+            blocking_runtime().block_on(closing.guard(async move {
                 let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
                 let results = session.prefetch(&url_refs).await;
                 Python::with_gil(|py| {
@@ -2022,7 +2077,7 @@ impl PyBlockingSession {
                         })
                         .collect::<PyResult<Vec<_>>>()
                 })
-            })
+            }))
         })
     }
 
@@ -2056,6 +2111,8 @@ impl PyBlockingSession {
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
     ) -> PyResult<crate::response::PyBlockingStreamingResponse> {
+        self.state.ensure_open()?;
+        let closing = self.state.closing();
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
@@ -2096,32 +2153,67 @@ impl PyBlockingSession {
             },
         };
         py.allow_threads(|| {
-            blocking_runtime().block_on(async move {
+            blocking_runtime().block_on(closing.guard(async move {
                 let rb = apply_request_options(&session, prepared)?;
                 let resp = rb.send_streaming().await.map_err(to_py_err)?;
                 Ok(crate::response::PyBlockingStreamingResponse::new(resp))
-            })
+            }))
         })
     }
 
     // --- Event Hooks ---------------------------------------------------------
 
-    fn on_request(&self, callback: Py<PyAny>) -> PyResult<()> {
-        self.hooks
-            .request_hooks
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-            .push(callback);
-        Ok(())
+    fn on_request(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.state.ensure_open()?;
+        self.state.hooks.push_request(py, callback)
     }
 
-    fn on_response(&self, callback: Py<PyAny>) -> PyResult<()> {
-        self.hooks
-            .response_hooks
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?
-            .push(callback);
-        Ok(())
+    fn on_response(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
+        self.state.ensure_open()?;
+        self.state.hooks.push_response(py, callback)
+    }
+
+    // --- Lifecycle -----------------------------------------------------------
+
+    /// Whether `close()` has been called.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.state.is_closed()
+    }
+
+    /// Close the session: abort its pooled connections, abandon the requests
+    /// still in flight (they raise `RuntimeError`), drop its event hooks and the
+    /// callbacks of its session-level middleware, and refuse further requests
+    /// with `RuntimeError`. Closing twice is harmless.
+    fn close(&self, py: Python<'_>) {
+        self.state.close(py);
+        self.inner.pool_clear();
+    }
+
+    // --- Garbage collection --------------------------------------------------
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.state.traverse(&visit)
+    }
+
+    fn __clear__(&mut self) {
+        self.state.clear_for_gc();
+    }
+
+    fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
+        slf.borrow(py).state.ensure_open()?;
+        Ok(slf)
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_val: &Bound<'_, PyAny>,
+        _exc_tb: &Bound<'_, PyAny>,
+    ) -> bool {
+        self.close(py);
+        false
     }
 
     fn __repr__(&self) -> String {

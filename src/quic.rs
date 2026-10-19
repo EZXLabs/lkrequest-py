@@ -87,6 +87,16 @@ impl PyQuicProfile {
         }
     }
 
+    /// Chrome 155 QUIC / HTTP/3 profile: identical to Chrome 154. Unlike the
+    /// Chrome 154 capture, this one completed an HTTP/3 navigation, so the H3
+    /// SETTINGS it carries over were observed directly rather than inherited.
+    #[staticmethod]
+    fn chrome_155() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_155_quic(),
+        }
+    }
+
     /// Load a profile from a JSON string.
     #[staticmethod]
     fn from_json(json_str: &str) -> PyResult<Self> {

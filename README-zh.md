@@ -28,14 +28,15 @@ Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性�
 - **自动解压** — Brotli / gzip / deflate / zstd，可控 `AcceptEncoding`
 - **证书管理** — 自定义 CA / 禁用验证 / 系统证书
 - **ECH** — Encrypted Client Hello 支持，包括 TLS/QUIC HelloRetryRequest 处理
-- **请求优先级** — `RequestPriority`（RFC 9218 urgency/incremental），`session.get(url, priority=...)`
+- **请求优先级** — `RequestPriority`（RFC 9218 urgency/incremental），`session.get(url, priority=...)`；`h2_priority_weight=` 设置 HTTP/2 HEADERS 帧里旧式优先级字段的权重（0–255），与 `priority` 请求头互相独立
 - **协议策略** — `ProtocolPolicy` / `HttpIntent` 控制 H2/H3 选择、获取与回退（client / session / 请求级）
 - **会话恢复控制** — `SessionResumptionConfig` 控制 TLS1.3 PSK / TLS1.2 ticket 恢复（指纹形态层）；`Client(tls_session_resumption_policy=..., tls_session_cache_partition_policy=...)` 控制 ticket 是否**存储**以及缓存如何分键，`session(network_partition_context=NetworkPartitionContext(top_level_site, frame_site))` 复现浏览器的按站点分区行为
 - **H2 DATA 分帧** — `Client(h2_data_frame_policy=H2DataFramePolicy.BROWSER_DEFAULT / PEER_MAX_FRAME_SIZE / fixed_payload(n) / socket_write_aligned(n))` 选择请求体如何切分为 DATA 帧
 - **流式上传** — `session.post(url, body_stream=..., content_length=...)` 不缓冲整个 body：可传 file-like 对象（`read(n)`）、任意 `bytes` 可迭代对象，异步客户端还可传异步可迭代对象。省略 `content_length` 即未知长度（HTTP/1.1 走 chunked，HTTP/2 / HTTP/3 走 DATA 帧）。源是**单次使用**的，因此无法用于自动重试、协议回落，或必须保留请求体的重定向
 - **TLS close_notify** — `Client(require_close_notify=True)` 拒绝未收到 TLS close_notify 警报就被截断的响应体
 - **请求级协议覆盖** — `preferred_http_version` / `idempotency`（0-RTT 重放安全声明）
-- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151/152/153/154 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
+- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151/152/153/154/155 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
+- **HTTP/3 重试** — `session(h3_retry_mode=H3RetryMode.Chrome155ProtocolErrors)` 会像 Chrome 155 那样，在响应头到达之前对特定的 HTTP/3 协议错误最多重试两次。它会重放已缓冲的请求，**包括 POST**，也就是说服务器已经处理过的请求可能被再处理一次；用 `idempotency=Idempotency.NotIdempotent` 可以让单个请求退出。默认关闭（`H3RetryMode.Safe`）；非 `Safe` 的取值需要 `quic-h3` feature
 - **MASQUE 代理（实验性）** — 可选 feature（`maturin develop --features masque`，隐含 `quic-h3`）：`session(proxy="masque://proxy:443", http3_only=True)` 把到目标的 QUIC 连接放进 RFC 9298 CONNECT-UDP 隧道；`Client(masque=MasqueConfig(...))` 配置到代理这一跳的信任，与 `verify` 相互独立；`HealthCheckConfig(tunnel_probe=True, masque=...)` 用真实隧道探测代理池中的 MASQUE 代理
 - **合成指纹（高级）** — 可选 feature（`maturin develop --features synthetic-fp`）：`Client(randomize=Randomize.recombine())` 为每个 session 合成一个跨层（TLS+H2+H3）唯一身份；`Randomize.full()` 进一步对 H2/QUIC 取语料外数值；`Layers` 掩码（如 `Randomize.recombine_layers(Layers.TLS | Layers.H2)`）限定合成层。合成指纹不匹配任何真实浏览器，仅用于黑名单（negative-model）目标，对白名单会立即失败
 
@@ -226,6 +227,31 @@ session.on_request(on_req)
 session.on_response(on_resp)
 ```
 
+### Session 生命周期与内存
+
+连接、cookie 和事件钩子都属于 `Session`，而不是创建它的 `Client`。建议创建一次 Session 反复使用：复用的 Session 在请求之间保持连接，每个请求新建一个 Session 则每次都要重新做 TCP 和 TLS 握手。
+
+不再需要某个 Session 时，用上下文管理器关闭它，或者手动关闭：
+
+```python
+with client.session() as session:          # BlockingClient
+    session.get(url)
+
+async with client.session() as session:    # Client
+    await session.get(url)
+
+session.close()                            # 效果相同，不需要代码块
+```
+
+`close()` 会中止池里的连接，放弃还在途的请求（它们抛出 `RuntimeError`），丢弃事件钩子和会话级中间件的回调，之后 Session 拒绝新的请求并抛出 `RuntimeError`。重复关闭没有副作用，`session.closed` 可以查询是否已关闭，cookie 仍可读取。只想断开连接、继续使用这个 Session 时，用 `session.pool_clear()`。
+
+没有任何引用指向的 Session 会被自动释放，连接一并释放。有几点需要了解：
+
+- **钩子可以引用它的持有者。** 在持有 `self.session` 的类里写 `session.on_response(self.log)` 会形成引用环，Python 的循环垃圾回收器会回收它。回收器是周期性运行的，不是立即回收，在它运行之前这个 Session 的连接仍然开着；`close()` 会立即释放。
+- **中间件的回调是例外。** 它们由 Rust 侧持有，回收器看不到，所以回调如果引用了自己所在的 Session 或 Client（对它的闭包、持有它的对象的方法），不会被自动回收。`session.close()` 会释放会话级中间件的回调；`Client(middleware=...)` 的回调与 Client 同生命周期，这样的 Client 请创建一次复用，不要每个请求新建一个。
+- **连接池默认没有上限。** 空闲连接 300 秒后会被丢弃，但只在这个 Session 下一次被使用时才清理；在此之前，访问过很多不同主机的 Session 会为每个主机保留一条连接，每条约占 100 KB 的量级。`client.session(max_connections=..., idle_timeout=...)` 和 `Client(max_connections_per_session=...)` 可以设置上限，`close()` 或 `pool_clear()` 会立即释放。
+- **释放的内存不一定还给操作系统。** 连接都没了之后，进程的常驻内存可能仍停在峰值：分配器把这些页留着复用。这不是泄漏。
+
 ### Cookie 管理
 
 ```python
@@ -362,6 +388,8 @@ msg = ws.recv()
 ws.close()
 ```
 
+另一个任务（同步客户端则是另一个线程）正在 `recv()` 里等消息时，也可以调用 `send_text()`、`send_binary()` 和 `close()`；关闭时，那个正在等待的 `recv()` 会拿到关闭握手。连接关闭之后，对它的任何操作都抛 `RuntimeError`，迭代则直接结束。
+
 ### 代理
 
 ```python
@@ -391,6 +419,8 @@ pool = lkrequest.ProxyPool(
 )
 proxy = await pool.acquire()
 ```
+
+只要代理池里有代理，就不会返回“没有代理”（调用方会把它当成直连）：所有代理都在冷却时，`await pool.acquire()` 会一直等，需要限时的话用 `asyncio.wait_for` 包一层。只有用空列表创建的池才会返回空字符串。
 
 基于 TCP 的 HTTP 支持混合使用 HTTP CONNECT 与 SOCKS5 跳。QUIC/HTTP3 要求链中
 每一跳都是 SOCKS5；链中含 HTTP 跳时，设置 `http3_with_fallback=True` 可回退 H2。
@@ -501,9 +531,11 @@ h2 = lkrequest.H2Profile(
     15663105,  # window_update
     ["method", "authority", "scheme", "path"],
     headers_priority=lkrequest.HeadersPriority(0, 255, True),
+    initial_stream_id=1,  # 第一个请求所用的流：奇数，多数浏览器是 1，Firefox 156 是 3
 )
 
-# 自定义 TCP Fingerprint
+# 自定义 TCP Fingerprint。这些是库向操作系统请求的 socket 设置，作用于新的直连以及到第一个
+# 代理的那一跳；SYN 包仍由系统生成，所以窗口大小/缩放只影响接收缓冲区，MSS 仅在 Linux 上生效。
 tcp = lkrequest.TcpFingerprint(window_size=65535, mss=1460, window_scale=8, ttl=128)
 
 # 组合使用
@@ -840,17 +872,22 @@ except lkrequest.RequestError as e:
 | `Client.chrome_152()` | Chrome 152 | Chrome 152 | Chrome |
 | `Client.chrome_153()` | Chrome 153 | Chrome 153 | Chrome |
 | `Client.chrome_154()` | Chrome 154 | Chrome 154 | Chrome |
+| `Client.chrome_155()` | Chrome 155 | Chrome 155 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.firefox_156()` | Firefox 156 | Firefox 156 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
 | `Client.safari_26()` | Safari 26 | Safari 26 | Safari |
 
+不传 `tls_profile=` / `h2_profile=` 构建的客户端（直接 `Client()`）使用 Chrome 155 的 TLS 和 HTTP/2 指纹，不带 TCP 指纹，也不带 QUIC / HTTP3 配置。默认值可能随版本更新而变化，如果介意，请显式指定版本。
+
 TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos` / `firefox_win` / `firefox_linux` / `firefox_macos` / `safari`
+
+Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权重为 41；其余预设都从流 1 开始。
 
 只有 Chrome 预设带 QUIC / HTTP3 指纹（需开启 `quic-h3` feature）。Firefox 和 Safari 预设会关闭 HTTP/3，开启 `quic-h3` 构建也不会改变这一点。
 
-预设只设置请求头的**顺序**，不设置请求头的值：`Client.chrome_154()` 发出的请求不会自带 `User-Agent`、`Accept` 等浏览器请求头，需要自己通过 `default_headers=` 或逐个请求设置。
+预设只设置请求头的**顺序**，不设置请求头的值：`Client.chrome_155()` 发出的请求不会自带 `User-Agent`、`Accept` 等浏览器请求头，需要自己通过 `default_headers=` 或逐个请求设置。
 
 ## API 参考
 
@@ -861,7 +898,7 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `tls_profile` | TLS 指纹（字符串名或 `TlsProfile` 对象） |
 | `h2_profile` | HTTP/2 指纹（字符串名或 `H2Profile` 对象） |
 | `tcp_fingerprint` | TCP 指纹（字符串名或 `TcpFingerprint` 对象） |
-| `default_headers` | 默认请求头 |
+| `default_headers` | 默认请求头。跟随重定向离开原来的源时，默认的 `Authorization`、`Cookie`、`Host` 不会带过去；从 https 跳到 http 时，默认的 `Referer` 也会去掉 |
 | `header_order` | Header 发送顺序 |
 | `cookie_order` | Cookie 发送顺序 |
 | `dns_timeout` / `tcp_connect_timeout` / `tls_handshake_timeout` / `ttfb_timeout` / `total_timeout` / `quic_connect_timeout` | 超时控制 |
@@ -884,7 +921,7 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 
 | 方法 | 说明 |
 |------|------|
-| `session(...)` | 创建会话（`network_partition_context=...` 按站点分区 TLS ticket 缓存） |
+| `session(...)` | 创建会话（`network_partition_context=...` 按站点分区 TLS ticket 缓存；`h3_retry_mode=...` 选择 HTTP/3 重试，见“特性”） |
 | `fingerprint_info()` | 返回指纹信息 dict |
 | `randomize_fingerprint(shuffle_extensions=True)` | 返回指纹随机化后的新 Client |
 
@@ -902,13 +939,15 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | `bearer_auth` / `basic_auth` | 认证 |
 | `proxy` | 请求级代理覆盖 |
 | `no_decompress` / `accept_encoding` | 编码控制 |
+| `priority` / `h2_priority_weight` | RFC 9218 请求优先级 / HTTP/2 HEADERS 帧旧式优先级字段的权重（0–255） |
 
 | 方法 | 说明 |
 |------|------|
 | `send_streaming(method, url, ...)` | 流式请求 |
 | `ws_connect(url, *, headers, protocols)` | WebSocket 连接 |
 | `preconnect(url)` / `preconnect_many(urls)` / `prefetch(urls)` | 连接预热 |
-| `pool_stats()` | 连接池统计 (`PoolStats`) |
+| `pool_stats()` / `pool_clear()` | 连接池统计 (`PoolStats`) / 关闭池中所有连接，Session 仍可继续使用 |
+| `close()` / `closed` | 关闭 Session 并释放它持有的资源；也可用 `with session`（阻塞版）和 `async with session`，见 [Session 生命周期与内存](#session-生命周期与内存) |
 | `on_request(callback)` / `on_response(callback)` | 注册 Event Hook |
 | `set_cookie()` / `set_cookie_with_attrs()` / `set_cookie_raw()` | 设置 Cookie |
 | `get_cookie()` / `get_cookies()` / `get_cookie_values()` / `cookie_header()` | 读取 Cookie 名与值 |
@@ -956,7 +995,7 @@ TCP 指纹按操作系统细分：`chrome_win` / `chrome_linux` / `chrome_macos`
 | 类 | 说明 |
 |----|------|
 | `TlsProfile` | TLS 指纹配置，支持预设 / 自定义 / JSON 序列化 |
-| `H2Profile` | HTTP/2 指纹配置 |
+| `H2Profile` | HTTP/2 指纹配置（SETTINGS、窗口更新、伪头顺序、优先级、`initial_stream_id`） |
 | `TcpFingerprint` | TCP 指纹配置，支持 JA4T 格式 |
 | `ExtType` | TLS 扩展类型常量 |
 | `ExtensionSpec` | TLS 扩展规格 |

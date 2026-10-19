@@ -1,5 +1,5 @@
 //! Protocol-behaviour pyclasses: `HttpIntent`, `ProtocolPolicy`,
-//! `PreferredHttpVersion`, `Idempotency`, and `BrokenQuicPolicy` controlling
+//! `PreferredHttpVersion`, `Idempotency`, `BrokenQuicPolicy`, and `H3RetryMode` controlling
 //! HTTP version negotiation, QUIC/HTTP3 acquisition, and fallback.
 
 use pyo3::prelude::*;
@@ -195,6 +195,38 @@ impl From<PyBrokenQuicPolicy> for lkrequest::BrokenQuicPolicy {
             PyBrokenQuicPolicy::Strict => lkrequest::BrokenQuicPolicy::Strict,
             PyBrokenQuicPolicy::Resilient => lkrequest::BrokenQuicPolicy::Resilient,
             PyBrokenQuicPolicy::Disabled => lkrequest::BrokenQuicPolicy::Disabled,
+        }
+    }
+}
+
+/// Whether a session replays a request after selected HTTP/3 protocol errors.
+///
+/// Independent of the session's retry policy and of QUIC 0-RTT. Only the
+/// default exists without the `quic-h3` feature.
+#[pyclass(name = "H3RetryMode", eq, eq_int, hash, frozen)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PyH3RetryMode {
+    /// Library default: no replay beyond the usual safety checks.
+    Safe = 0,
+    /// Retry selected HTTP/3 protocol errors up to twice per redirect hop,
+    /// before response headers arrive, as Chrome 155 does.
+    ///
+    /// This replays a finite buffered request, including a POST the server may
+    /// already have processed. Streaming uploads are not retried, and a request
+    /// sent with `Idempotency.NotIdempotent` opts out. It adds no status-code
+    /// retries and does not touch 0-RTT eligibility. A request that is not
+    /// HTTP/3-only also needs a protocol policy that allows falling back to TCP.
+    Chrome155ProtocolErrors = 1,
+}
+
+#[cfg(feature = "quic-h3")]
+impl From<PyH3RetryMode> for lkrequest::H3RetryMode {
+    fn from(v: PyH3RetryMode) -> Self {
+        match v {
+            PyH3RetryMode::Safe => lkrequest::H3RetryMode::Safe,
+            PyH3RetryMode::Chrome155ProtocolErrors => {
+                lkrequest::H3RetryMode::Chrome155ProtocolErrors
+            }
         }
     }
 }

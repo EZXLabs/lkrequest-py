@@ -15,6 +15,7 @@ def preset_fingerprints():
     presets = [
         ("Chrome 131", lkrequest.Client.chrome_131),
         ("Chrome 144", lkrequest.Client.chrome_144),
+        ("Chrome 155", lkrequest.Client.chrome_155),
         ("Firefox 133", lkrequest.Client.firefox_133),
         ("Firefox 147", lkrequest.Client.firefox_147),
         ("Firefox 156", lkrequest.Client.firefox_156),

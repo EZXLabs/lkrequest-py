@@ -8,7 +8,8 @@ use tokio::sync::Mutex;
 
 use crate::client::{blocking_runtime, PyBlockingClient, PyClient};
 use crate::proxy::resolve_proxy_list;
-use crate::session::{EventHooks, PyBlockingSession, PySession};
+use crate::session::{PyBlockingSession, PySession};
+use crate::session_state::SessionState;
 use crate::types::validated_duration;
 
 // ---------------------------------------------------------------------------
@@ -145,7 +146,7 @@ impl PySessionGuard {
             })?;
             Ok(PySession {
                 inner: (**g).clone(),
-                hooks: EventHooks::default(),
+                state: SessionState::default(),
                 base_url: None,
             })
         })
@@ -160,7 +161,7 @@ impl PySessionGuard {
             })?;
             Ok(PySession {
                 inner: (**g).clone(),
-                hooks: EventHooks::default(),
+                state: SessionState::default(),
                 base_url: None,
             })
         })
@@ -299,7 +300,7 @@ impl PyBlockingSessionGuard {
         })?;
         Ok(PyBlockingSession {
             inner: (**g).clone(),
-            hooks: EventHooks::default(),
+            state: SessionState::default(),
             base_url: None,
         })
     }
@@ -310,7 +311,7 @@ impl PyBlockingSessionGuard {
         })?;
         Ok(PyBlockingSession {
             inner: (**g).clone(),
-            hooks: EventHooks::default(),
+            state: SessionState::default(),
             base_url: None,
         })
     }

@@ -31,7 +31,7 @@ serde = "1"
 # 3.9 matches `requires-python` in pyproject.toml.
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39", "multiple-pymethods"] }
 pyo3-async-runtimes = { version = "0.23", features = ["attributes", "tokio-runtime"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 http = "1"
 hyper = "1"
 hyper-util = "0.1"

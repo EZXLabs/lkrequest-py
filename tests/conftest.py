@@ -21,7 +21,7 @@ import json
 import socket
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -275,14 +275,11 @@ def _with_websocket_echo(inner):
     property under test — a client-side GUID or validation regression cannot
     complete a handshake against it.
 
-    The route match runs on `urlsplit(...).path` because upstream sends the
-    upgrade in absolute-form, so the whole URI arrives as the ASGI `path`. That
-    defect is pinned separately by the xfail tests in test_local_server.py and
-    written up in docs/UPSTREAM-WS-REQUEST-TARGET.md; normalising here keeps it
-    from blocking the handshake coverage above.
+    The route matches on the plain ASGI `path`, so an upgrade sent in
+    absolute-form fails the handshake instead of being quietly normalised.
 
     Sending `_WS_HANDSHAKE_PROBE` gets back JSON describing the request line and
-    Host header the server saw, which is how those xfail tests observe them.
+    Host header the server saw, which is how the handshake tests observe them.
 
     Anything that is not a WebSocket scope is delegated untouched.
     """
@@ -295,7 +292,7 @@ def _with_websocket_echo(inner):
         message = await receive()
         if message["type"] != "websocket.connect":
             return
-        if urlsplit(scope.get("path", "")).path != "/ws-echo":
+        if scope.get("path", "") != "/ws-echo":
             await send({"type": "websocket.close", "code": 1000})
             return
 
@@ -487,6 +484,28 @@ def _masque_proxy_server(_certs):
         yield proxy
     finally:
         proxy.shutdown()
+
+
+@pytest.fixture
+def raw_http():
+    """Start plain HTTP/1.1 servers that answer with raw bytes (see `_raw_http.py`).
+
+    Call it with `reply(request) -> bytes`; the servers are stopped when the
+    test ends.
+    """
+    from _raw_http import RawHttpServer
+
+    started: list[RawHttpServer] = []
+
+    def start(reply, **kwargs) -> RawHttpServer:
+        server = RawHttpServer(reply, **kwargs)
+        server.start()
+        started.append(server)
+        return server
+
+    yield start
+    for server in started:
+        server.stop()
 
 
 @pytest.fixture

@@ -56,6 +56,7 @@ from lkrequest._lkrequest import (
     PreferredHttpVersion,
     Idempotency,
     BrokenQuicPolicy,
+    H3RetryMode,
     # HSTS / scheme-upgrade policy
     Hsts,
     # Fingerprint randomization
@@ -185,6 +186,7 @@ __all__ = [
     "PreferredHttpVersion",
     "Idempotency",
     "BrokenQuicPolicy",
+    "H3RetryMode",
     # HSTS / scheme-upgrade policy
     "Hsts",
     # Fingerprint randomization

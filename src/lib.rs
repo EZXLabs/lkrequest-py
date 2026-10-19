@@ -33,6 +33,7 @@ mod response;
 mod retry;
 mod session;
 mod session_pool;
+mod session_state;
 mod types;
 mod upload;
 mod websocket;
@@ -100,6 +101,7 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<protocol::PyPreferredHttpVersion>()?;
     m.add_class::<protocol::PyIdempotency>()?;
     m.add_class::<protocol::PyBrokenQuicPolicy>()?;
+    m.add_class::<protocol::PyH3RetryMode>()?;
 
     // HSTS / scheme-upgrade policy
     m.add_class::<hsts::PyHsts>()?;

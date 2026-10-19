@@ -379,6 +379,7 @@ class TestTypes:
             "PreferredHttpVersion",
             "Idempotency",
             "BrokenQuicPolicy",
+            "H3RetryMode",
             "WsMessage",
         ],
     )
@@ -690,6 +691,31 @@ class TestProxyPoolConfig:
                 ["http://127.0.0.1:8080"],
                 rotation="invalid",
             )
+
+    async def test_acquire_waits_rather_than_going_direct_while_every_proxy_cools_down(
+        self,
+    ):
+        # A pool that has proxies must never hand back "no proxy", which the
+        # caller would take for a direct connection and expose its own address.
+        pool = lkrequest.ProxyPool(
+            ["socks5://127.0.0.1:1"],
+            bad_proxy_config=lkrequest.BadProxyConfig(
+                failure_threshold=1, window=60.0, cooldown_duration=1.0
+            ),
+        )
+        proxy = await pool.acquire()
+        assert proxy != ""
+        pool.mark_bad(proxy)
+        await asyncio.sleep(0.1)  # the failure is recorded on a task of its own
+
+        acquiring = asyncio.ensure_future(pool.acquire())
+        await asyncio.sleep(0.4)
+        assert not acquiring.done(), "acquire() answered while the proxy cooled down"
+        # ... and it does answer once the cooldown is over.
+        assert await asyncio.wait_for(acquiring, 5) == proxy
+
+    async def test_acquire_on_an_empty_pool_means_a_direct_connection(self):
+        assert await asyncio.wait_for(lkrequest.ProxyPool([]).acquire(), 5) == ""
 
 
 class TestCallableRetry:

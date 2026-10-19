@@ -28,14 +28,15 @@ A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for
 - **Automatic decompression** — Brotli / gzip / deflate / zstd, with controllable `AcceptEncoding`
 - **Certificate management** — Custom CA / disable verification / system certificates
 - **ECH** — Encrypted Client Hello support, including TLS/QUIC HelloRetryRequest handling
-- **Request priority** — `RequestPriority` (RFC 9218 urgency/incremental), `session.get(url, priority=...)`
+- **Request priority** — `RequestPriority` (RFC 9218 urgency/incremental), `session.get(url, priority=...)`; `h2_priority_weight=` sets the weight (0–255) in the legacy priority field of an HTTP/2 HEADERS frame, independently of the `priority` header
 - **Protocol policy** — `ProtocolPolicy` / `HttpIntent` control H2/H3 selection, acquisition, and fallback (client / session / request level)
 - **Session resumption control** — `SessionResumptionConfig` controls TLS1.3 PSK / TLS1.2 ticket resumption (fingerprint shape); `Client(tls_session_resumption_policy=..., tls_session_cache_partition_policy=...)` controls whether tickets are *stored* and how the cache is keyed, and `session(network_partition_context=NetworkPartitionContext(top_level_site, frame_site))` reproduces the browser's per-site partitioning
 - **H2 DATA framing** — `Client(h2_data_frame_policy=H2DataFramePolicy.BROWSER_DEFAULT / PEER_MAX_FRAME_SIZE / fixed_payload(n) / socket_write_aligned(n))` chooses how request bodies are split into DATA frames
 - **Streaming uploads** — `session.post(url, body_stream=..., content_length=...)` uploads without buffering the body: a file-like object (`read(n)`), any iterable of `bytes`, or — on the async client — an async iterable. Omit `content_length` for an unknown-length body (chunked on HTTP/1.1, DATA frames on HTTP/2 and HTTP/3). The source is single-use, so it cannot be replayed for an automatic retry, a protocol fallback, or a redirect that must preserve the body
 - **TLS close_notify** — `Client(require_close_notify=True)` rejects a response whose body was truncated without a TLS close_notify alert
 - **Request-level protocol override** — `preferred_http_version` / `idempotency` (0-RTT replay-safety declaration)
-- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151/152/153/154 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
+- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151/152/153/154/155 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
+- **HTTP/3 retries** — `session(h3_retry_mode=H3RetryMode.Chrome155ProtocolErrors)` retries selected HTTP/3 protocol errors up to twice, before response headers arrive, as Chrome 155 does. It replays buffered requests, **POST included**, so a request the server already processed can be processed again; send `idempotency=Idempotency.NotIdempotent` to opt a request out. Off by default (`H3RetryMode.Safe`); anything but `Safe` needs the `quic-h3` feature
 - **MASQUE proxies (experimental)** — Optional feature (`maturin develop --features masque`, implies `quic-h3`): `session(proxy="masque://proxy:443", http3_only=True)` carries the QUIC connection to the target over an RFC 9298 CONNECT-UDP tunnel; `Client(masque=MasqueConfig(...))` configures trust for the hop to the proxy, independently of `verify`; `HealthCheckConfig(tunnel_probe=True, masque=...)` probes MASQUE proxies in a pool with a real tunnel
 - **Synthetic fingerprints (advanced)** — Optional feature (`maturin develop --features synthetic-fp`): `Client(randomize=Randomize.recombine())` synthesizes a cross-layer (TLS+H2+H3) unique identity per session; `Randomize.full()` additionally draws out-of-corpus values for H2/QUIC; the `Layers` mask (e.g. `Randomize.recombine_layers(Layers.TLS | Layers.H2)`) restricts which layers are synthesized. Synthetic fingerprints match no real browser and are only for blocklist (negative-model) targets — against an allowlist they fail instantly
 
@@ -226,6 +227,31 @@ session.on_request(on_req)
 session.on_response(on_resp)
 ```
 
+### Session lifecycle and memory
+
+Connections, cookies and event hooks belong to the `Session`, not to the `Client` that made it. Create a session once and keep using it: a reused session keeps its connections open between requests, while one created per request pays a TCP and TLS handshake every time.
+
+When a session is no longer needed, close it with a context manager, or by hand:
+
+```python
+with client.session() as session:          # BlockingClient
+    session.get(url)
+
+async with client.session() as session:    # Client
+    await session.get(url)
+
+session.close()                            # the same, without a block
+```
+
+`close()` aborts the pooled connections, abandons requests still in flight (they raise `RuntimeError`), drops the event hooks and the callbacks of session-level middleware, and makes the session refuse further requests with `RuntimeError`. Closing twice is harmless, `session.closed` tells whether it happened, and cookies stay readable. To drop only the connections and keep using the session, call `session.pool_clear()`.
+
+A session that nothing refers to any more is freed on its own, connections included. A few things are worth knowing:
+
+- **Hooks may refer back to their owner.** `session.on_response(self.log)` in a class that keeps `self.session` makes a reference cycle, which Python's cycle collector reclaims. It runs periodically rather than at once, so until it does, the session's connections stay open; `close()` releases them immediately.
+- **Middleware callbacks are the exception.** They are held on the Rust side, out of the collector's sight, so a callback that refers back to its own session or client (a closure over it, a method of an object that holds it) is not reclaimed on its own. `session.close()` releases the callbacks of session-level middleware; those of `Client(middleware=...)` live as long as the client does, so create such a client once rather than per request.
+- **The connection pool is unbounded by default.** An idle connection is dropped after 300 seconds, but only when the session is next used; until then a session that visited many different hosts keeps one connection per host, on the order of 100 KB each. `client.session(max_connections=..., idle_timeout=...)` and `Client(max_connections_per_session=...)` set the limits, and `close()` or `pool_clear()` releases them at once.
+- **Freed memory is not always returned to the operating system.** A process's resident size can stay at its high-water mark after the connections are gone: the allocator keeps the pages for reuse. That is not a leak.
+
 ### Cookie management
 
 ```python
@@ -367,6 +393,8 @@ msg = ws.recv()
 ws.close()
 ```
 
+`send_text()`, `send_binary()` and `close()` can be called while another task (or, with the sync client, another thread) is waiting in `recv()`; closing hands that waiting `recv()` the closing handshake. Once a connection is closed, every operation on it raises `RuntimeError` and iterating it just ends.
+
 ### Proxy
 
 ```python
@@ -396,6 +424,8 @@ pool = lkrequest.ProxyPool(
 )
 proxy = await pool.acquire()
 ```
+
+A pool that has proxies never hands back "no proxy" (which a caller would take for a direct connection): `await pool.acquire()` waits while every proxy is cooling down, so bound the wait with `asyncio.wait_for` if you need to. It returns an empty string only for a pool created with an empty list.
 
 TCP-based HTTP supports mixed HTTP CONNECT and SOCKS5 hops. QUIC/HTTP3 requires
 every hop in the chain to be SOCKS5; a chain containing an HTTP hop falls back
@@ -514,9 +544,12 @@ h2 = lkrequest.H2Profile(
     15663105,  # window_update
     ["method", "authority", "scheme", "path"],
     headers_priority=lkrequest.HeadersPriority(0, 255, True),
+    initial_stream_id=1,  # the first request's stream: odd, 1 for most browsers, 3 for Firefox 156
 )
 
-# Custom TCP Fingerprint
+# Custom TCP Fingerprint. These are socket settings the library asks the OS for, on
+# new direct connections and the hop to the first proxy; the OS still builds the SYN,
+# so window size/scale only steer the receive buffer and MSS is applied on Linux only.
 tcp = lkrequest.TcpFingerprint(window_size=65535, mss=1460, window_scale=8, ttl=128)
 
 # Combine them
@@ -860,17 +893,22 @@ except lkrequest.RequestError as e:
 | `Client.chrome_152()` | Chrome 152 | Chrome 152 | Chrome |
 | `Client.chrome_153()` | Chrome 153 | Chrome 153 | Chrome |
 | `Client.chrome_154()` | Chrome 154 | Chrome 154 | Chrome |
+| `Client.chrome_155()` | Chrome 155 | Chrome 155 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.firefox_156()` | Firefox 156 | Firefox 156 | Firefox |
 | `Client.safari_18()` | Safari 18 | Safari 18 | Safari |
 | `Client.safari_26()` | Safari 26 | Safari 26 | Safari |
 
+A client built without `tls_profile=` / `h2_profile=` (plain `Client()`) uses the Chrome 155 TLS and HTTP/2 fingerprints, without a TCP fingerprint or QUIC / HTTP3 profile. Pin a version explicitly if the default changing between releases would matter to you.
+
 TCP fingerprints are OS-specific: `chrome_win` / `chrome_linux` / `chrome_macos` / `firefox_win` / `firefox_linux` / `firefox_macos` / `safari`
+
+Firefox 156 opens its first HTTP/2 request on stream 3 and sends navigation HEADERS with weight 41; every other preset starts on stream 1.
 
 Only the Chrome presets carry a QUIC / HTTP3 fingerprint (with the `quic-h3` feature). The Firefox and Safari presets turn HTTP/3 off, and building with `quic-h3` does not change that.
 
-A preset sets the header **order**, not header values: a request from `Client.chrome_154()` carries no `User-Agent`, `Accept` or other browser headers unless you set them, through `default_headers=` or per request.
+A preset sets the header **order**, not header values: a request from `Client.chrome_155()` carries no `User-Agent`, `Accept` or other browser headers unless you set them, through `default_headers=` or per request.
 
 ## API Reference
 
@@ -881,7 +919,7 @@ A preset sets the header **order**, not header values: a request from `Client.ch
 | `tls_profile` | TLS fingerprint (string name or `TlsProfile` object) |
 | `h2_profile` | HTTP/2 fingerprint (string name or `H2Profile` object) |
 | `tcp_fingerprint` | TCP fingerprint (string name or `TcpFingerprint` object) |
-| `default_headers` | Default request headers |
+| `default_headers` | Default request headers. A redirect that leaves the origin does not carry along a default `Authorization`, `Cookie` or `Host`, and one from https to http drops a default `Referer` |
 | `header_order` | Header send order |
 | `cookie_order` | Cookie send order |
 | `dns_timeout` / `tcp_connect_timeout` / `tls_handshake_timeout` / `ttfb_timeout` / `total_timeout` / `quic_connect_timeout` | Timeout control |
@@ -904,7 +942,7 @@ A preset sets the header **order**, not header values: a request from `Client.ch
 
 | Method | Description |
 |------|------|
-| `session(...)` | Create a session (`network_partition_context=...` partitions the TLS ticket cache per site) |
+| `session(...)` | Create a session (`network_partition_context=...` partitions the TLS ticket cache per site; `h3_retry_mode=...` selects HTTP/3 retries, see Features) |
 | `fingerprint_info()` | Return a fingerprint info dict |
 | `randomize_fingerprint(shuffle_extensions=True)` | Return a new Client with a randomized fingerprint |
 
@@ -922,13 +960,15 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `bearer_auth` / `basic_auth` | Authentication |
 | `proxy` | Request-level proxy override |
 | `no_decompress` / `accept_encoding` | Encoding control |
+| `priority` / `h2_priority_weight` | RFC 9218 request priority / the weight (0–255) in an HTTP/2 HEADERS frame's legacy priority field |
 
 | Method | Description |
 |------|------|
 | `send_streaming(method, url, ...)` | Streaming request |
 | `ws_connect(url, *, headers, protocols)` | WebSocket connection |
 | `preconnect(url)` / `preconnect_many(urls)` / `prefetch(urls)` | Connection prewarming |
-| `pool_stats()` | Connection pool stats (`PoolStats`) |
+| `pool_stats()` / `pool_clear()` | Connection pool stats (`PoolStats`) / close all pooled connections, keeping the session usable |
+| `close()` / `closed` | Close the session and release what it holds; also `with session` (blocking) and `async with session`. See [Session lifecycle and memory](#session-lifecycle-and-memory) |
 | `on_request(callback)` / `on_response(callback)` | Register event hooks |
 | `set_cookie()` / `set_cookie_with_attrs()` / `set_cookie_raw()` | Set cookies |
 | `get_cookie()` / `get_cookies()` / `get_cookie_values()` / `cookie_header()` | Read cookie names and values |
@@ -976,7 +1016,7 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | Class | Description |
 |----|------|
 | `TlsProfile` | TLS fingerprint config; presets / custom / JSON serialization |
-| `H2Profile` | HTTP/2 fingerprint config |
+| `H2Profile` | HTTP/2 fingerprint config (SETTINGS, window update, pseudo-header order, priority, `initial_stream_id`) |
 | `TcpFingerprint` | TCP fingerprint config; supports JA4T format |
 | `ExtType` | TLS extension type constants |
 | `ExtensionSpec` | TLS extension spec |

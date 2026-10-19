@@ -300,6 +300,8 @@ impl PyProxyPool {
         })
     }
 
+    /// Waits while every proxy of a non-empty pool is cooling down, rather than
+    /// answering "no proxy" (a direct connection); only an empty pool returns `""`.
     fn acquire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         crate::bridge::future_into_py(py, async move {
