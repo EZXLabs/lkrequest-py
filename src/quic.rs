@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 /// Custom transport parameters are not exposed; use the captured browser
 /// presets or load from JSON.
 #[cfg(feature = "quic-h3")]
-#[pyclass(name = "QuicProfile")]
+#[pyclass(name = "QuicProfile", from_py_object)]
 #[derive(Clone)]
 pub struct PyQuicProfile {
     pub(crate) inner: lkrequest::QuicProfile,
@@ -94,6 +94,27 @@ impl PyQuicProfile {
     fn chrome_155() -> Self {
         PyQuicProfile {
             inner: lkrequest::lkh3::chrome_155_quic(),
+        }
+    }
+
+    /// Chrome 156 QUIC / HTTP/3 profile: identical to Chrome 155. The capture
+    /// confirmed its transport values, H3 SETTINGS and priority updates; timing,
+    /// loss and resumption behaviour carry over from Chrome 155 unobserved.
+    #[staticmethod]
+    fn chrome_156() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_156_quic(),
+        }
+    }
+
+    /// Chrome 157 QUIC / HTTP/3 profile: identical to Chrome 156. The capture
+    /// confirmed its transport values, H3 SETTINGS and navigation/favicon
+    /// priority; timing, loss and resumption behaviour carry over from Chrome
+    /// 156 unobserved.
+    #[staticmethod]
+    fn chrome_157() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_157_quic(),
         }
     }
 

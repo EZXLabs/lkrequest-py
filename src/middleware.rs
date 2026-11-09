@@ -10,16 +10,16 @@ use pyo3::types::PyDict;
 // PyMiddleware — Python-facing pyclass
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "Middleware")]
+#[pyclass(name = "Middleware", from_py_object)]
 pub struct PyMiddleware {
     pub(crate) name: String,
-    pub(crate) on_request_fn: Option<PyObject>,
-    pub(crate) on_response_fn: Option<PyObject>,
+    pub(crate) on_request_fn: Option<Py<PyAny>>,
+    pub(crate) on_response_fn: Option<Py<PyAny>>,
 }
 
 impl Clone for PyMiddleware {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| PyMiddleware {
+        Python::attach(|py| PyMiddleware {
             name: self.name.clone(),
             on_request_fn: self.on_request_fn.as_ref().map(|o| o.clone_ref(py)),
             on_response_fn: self.on_response_fn.as_ref().map(|o| o.clone_ref(py)),
@@ -31,7 +31,7 @@ impl Clone for PyMiddleware {
 impl PyMiddleware {
     #[new]
     #[pyo3(signature = (name, *, on_request=None, on_response=None))]
-    fn new(name: String, on_request: Option<PyObject>, on_response: Option<PyObject>) -> Self {
+    fn new(name: String, on_request: Option<Py<PyAny>>, on_response: Option<Py<PyAny>>) -> Self {
         PyMiddleware {
             name,
             on_request_fn: on_request,
@@ -56,8 +56,8 @@ impl PyMiddleware {
 /// method of an object that holds it) therefore keeps the whole session alive
 /// until the session is closed.
 pub(crate) struct MiddlewareSlots {
-    on_request: Mutex<Option<PyObject>>,
-    on_response: Mutex<Option<PyObject>>,
+    on_request: Mutex<Option<Py<PyAny>>>,
+    on_response: Mutex<Option<Py<PyAny>>>,
 }
 
 /// Poisoning needs a panic while the lock is held, and nothing here does more
@@ -75,11 +75,11 @@ impl MiddlewareSlots {
         lock(&self.on_response).is_some()
     }
 
-    fn on_request(&self, py: Python<'_>) -> Option<PyObject> {
+    fn on_request(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         lock(&self.on_request).as_ref().map(|f| f.clone_ref(py))
     }
 
-    fn on_response(&self, py: Python<'_>) -> Option<PyObject> {
+    fn on_response(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         lock(&self.on_response).as_ref().map(|f| f.clone_ref(py))
     }
 
@@ -99,7 +99,7 @@ pub(crate) struct PyMiddlewareWrapper {
 
 impl PyMiddlewareWrapper {
     pub fn from_py(mw: &PyMiddleware) -> Self {
-        Python::with_gil(|py| PyMiddlewareWrapper {
+        Python::attach(|py| PyMiddlewareWrapper {
             name: mw.name.clone(),
             slots: Arc::new(MiddlewareSlots {
                 on_request: Mutex::new(mw.on_request_fn.as_ref().map(|o| o.clone_ref(py))),
@@ -125,7 +125,7 @@ impl lkrequest::Middleware for PyMiddlewareWrapper {
             return Ok(req);
         }
         tracing::debug!(middleware = %self.name, method = %req.method, url = %req.url, "middleware.on_request");
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Released between the check above and here: the session was closed.
             let Some(func) = self.slots.on_request(py) else {
                 return Ok(req);
@@ -144,7 +144,7 @@ impl lkrequest::Middleware for PyMiddlewareWrapper {
                 lkrequest::error::Error::Http(format!("Middleware on_request error: {e}"))
             })?;
 
-            if let Ok(returned) = result.downcast_bound::<PyDict>(py) {
+            if let Ok(returned) = result.cast_bound::<PyDict>(py) {
                 if let Ok(Some(url)) = returned.get_item("url") {
                     match url.extract::<String>() {
                         Ok(u) => req.url = u,
@@ -154,7 +154,7 @@ impl lkrequest::Middleware for PyMiddlewareWrapper {
                     }
                 }
                 if let Ok(Some(headers_obj)) = returned.get_item("headers") {
-                    if let Ok(h) = headers_obj.downcast::<PyDict>() {
+                    if let Ok(h) = headers_obj.cast::<PyDict>() {
                         let mut new_headers = http::HeaderMap::new();
                         for (k, v) in h.iter() {
                             if let (Ok(name), Ok(val)) =
@@ -193,7 +193,7 @@ impl lkrequest::Middleware for PyMiddlewareWrapper {
             return Ok(resp);
         }
         tracing::debug!(middleware = %self.name, status = %resp.status.as_u16(), "middleware.on_response");
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let Some(func) = self.slots.on_response(py) else {
                 return Ok(resp);
             };
@@ -210,9 +210,9 @@ impl lkrequest::Middleware for PyMiddlewareWrapper {
                 lkrequest::error::Error::Http(format!("Middleware on_response error: {e}"))
             })?;
 
-            if let Ok(returned) = result.downcast_bound::<PyDict>(py) {
+            if let Ok(returned) = result.cast_bound::<PyDict>(py) {
                 if let Ok(Some(headers_obj)) = returned.get_item("headers") {
-                    if let Ok(h) = headers_obj.downcast::<PyDict>() {
+                    if let Ok(h) = headers_obj.cast::<PyDict>() {
                         let mut new_headers = http::HeaderMap::new();
                         for (k, v) in h.iter() {
                             if let (Ok(name), Ok(val)) =

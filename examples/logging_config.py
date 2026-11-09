@@ -1,7 +1,9 @@
 """
 日志配置示例
 
-演示 set_log_level 的用法。
+演示 set_log_level 的用法。一个进程里只有第一次调用生效：它返回 True，
+之后的调用都返回 False，也不改变任何设置。所以要在程序启动时调用一次，
+把级别、过滤指令和格式一次定好。
 """
 
 import lkrequest
@@ -9,49 +11,29 @@ from lkrequest.blocking import Client
 
 
 def main():
-    # === 日志级别 ===
-    print("=== 日志级别 ===")
-    print("可用级别: trace, debug, info, warn, error, off")
+    # === 级别与过滤指令 ===
+    # 可用级别: trace, debug, info, warn, error, off
+    # 也支持 tracing 的过滤语法，为不同模块设置不同级别，例如
+    # "lkrequest=debug,lktls=trace"，或 "warn,lkrequest=info"。
+    #
+    # === 格式 ===
+    # format 可选 compact（默认）、full、json，都写到 stderr；
+    # 也可以是 logging，交给 Python 的 logging。logger 名为 "lkrequest."
+    # 加上 Rust target，配置 logging.getLogger("lkrequest") 即可：
+    #     import logging
+    #     logging.basicConfig(level=logging.INFO)
+    #     lkrequest.set_log_level("info", format="logging")
+    installed = lkrequest.set_log_level("warn,lkrequest=info", format="compact")
+    print(f"日志已设置: {installed}")  # True
 
-    # 设置为 info 级别
-    lkrequest.set_log_level("info")
-    print("已设置: info")
+    # 再调用一次不会生效，仍是上面的设置
+    print(f"再设置为 debug: {lkrequest.set_log_level('debug')}")  # False
 
-    # 设置为 debug（更详细）
-    lkrequest.set_log_level("debug")
-    print("已设置: debug")
-
-    # 关闭日志
-    lkrequest.set_log_level("off")
-    print("已设置: off")
-
-    # === 过滤指令 ===
-    print(f"\n=== 过滤指令 ===")
-    print("支持 tracing 过滤语法，可以为不同模块设置不同级别")
-
-    lkrequest.set_log_level("lkrequest=debug,lktls=trace")
-    print("已设置: lkrequest=debug,lktls=trace")
-
-    lkrequest.set_log_level("lkrequest=info")
-    print("已设置: lkrequest=info")
-
-    # === 日志格式 ===
-    print(f"\n=== 日志格式 ===")
-    lkrequest.set_log_level("info", format="compact")
-    print("已设置: info (compact 格式)")
-
-    # === 实际使用场景 ===
-    print(f"\n=== 实际使用 ===")
-    lkrequest.set_log_level("off")
-
+    # === 实际使用 ===
     client = Client.chrome_144()
     session = client.session()
     resp = session.get("https://httpbin.org/get")
     print(f"请求完成: {resp.status_code}")
-
-    # 调试时开启详细日志
-    # lkrequest.set_log_level("debug")
-    # resp = session.get("https://httpbin.org/get")
 
 
 if __name__ == "__main__":

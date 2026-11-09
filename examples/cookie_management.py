@@ -21,12 +21,12 @@ def main():
     print("已设置 3 个 Cookie")
 
     # --- 获取单个 Cookie ---
-    print(f"\n=== 获取单个 Cookie ===")
+    print("\n=== 获取单个 Cookie ===")
     val = session.get_cookie(url, "session_id")
     print(f"session_id = {val}")
 
     # --- 获取所有 Cookie ---
-    print(f"\n=== 获取所有 Cookie ===")
+    print("\n=== 获取所有 Cookie ===")
     cookies = session.get_cookies(url)
     for name, value in cookies:
         print(f"  {name} = {value}")
@@ -36,7 +36,7 @@ def main():
     print(f"\nCookie Header: {header}")
 
     # --- 带属性设置 Cookie ---
-    print(f"\n=== set_cookie_with_attrs ===")
+    print("\n=== set_cookie_with_attrs ===")
     session.set_cookie_with_attrs(
         url,
         "secure_token",
@@ -84,18 +84,18 @@ def main():
     print(f"  发送顺序: {ordered.cookie_header(url + '/api/orders')}")
 
     # --- 验证 Cookie 发送 ---
-    print(f"\n=== 验证 Cookie 请求 ===")
+    print("\n=== 验证 Cookie 请求 ===")
     resp = session.get("https://httpbin.org/cookies")
     print(f"服务器收到的 Cookies: {resp.json()['cookies']}")
 
     # --- 删除 Cookie ---
-    print(f"\n=== 删除 Cookie ===")
+    print("\n=== 删除 Cookie ===")
     session.remove_cookie(url, "lang")
     val = session.get_cookie(url, "lang")
     print(f"删除后 lang = {val}")
 
     # --- Cookie Override ---
-    print(f"\n=== Cookie Override ===")
+    print("\n=== Cookie Override ===")
     session.set_cookie(url, "token", "original_value")
     resp = session.get(
         "https://httpbin.org/cookies",
@@ -104,7 +104,7 @@ def main():
     print(f"Override 后服务器看到: {resp.json()['cookies']}")
 
     # --- 清除所有 Cookie ---
-    print(f"\n=== 清除所有 Cookie ===")
+    print("\n=== 清除所有 Cookie ===")
     session.clear_cookies()
     cookies = session.get_cookies(url)
     print(f"清除后 Cookie 数量: {len(cookies)}")

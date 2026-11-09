@@ -9,6 +9,7 @@ request that went through the tunnel from one that did not.
 from __future__ import annotations
 
 import json
+import ssl
 import time
 from urllib.parse import urlsplit
 
@@ -62,6 +63,17 @@ class TestMasqueConfig:
     def test_ca_cert_pem_loads_every_certificate_in_the_bundle(self, server_ca):
         config = lkrequest.MasqueConfig(ca_cert_pem=server_ca + server_ca)
         assert config.ca_cert_count == 2
+
+    def test_ca_cert_der_adds_one_certificate(self, server_ca):
+        der = ssl.PEM_cert_to_DER_cert(server_ca.decode())
+        assert lkrequest.MasqueConfig(ca_cert_der=der).ca_cert_count == 1
+        both = lkrequest.MasqueConfig(ca_cert_pem=server_ca, ca_cert_der=der)
+        assert both.ca_cert_count == 2
+
+    @pytest.mark.parametrize("der", [b"", b"not a certificate"])
+    def test_a_der_certificate_that_is_none_is_rejected(self, der):
+        with pytest.raises(ValueError, match="not a usable DER certificate"):
+            lkrequest.MasqueConfig(ca_cert_der=der)
 
     def test_ca_cert_reads_a_pem_file(self, server_ca, tmp_path):
         path = tmp_path / "ca.pem"
@@ -169,6 +181,18 @@ class TestRequestsThroughMasque:
         # The response came back through the proxy, not around it.
         assert masque_proxy.stats.datagrams_to_target > 0
         assert masque_proxy.stats.datagrams_to_client > 0
+
+    def test_a_der_ca_alone_is_trusted_for_the_proxy(
+        self, masque_proxy, h3_server_url, server_ca
+    ):
+        der = ssl.PEM_cert_to_DER_cert(server_ca.decode())
+        client = _masque_client(
+            server_ca, ca_cert_pem=None, ca_cert_der=der, use_native_certs=False
+        )
+        session = client.session(proxy=masque_proxy.url, http3_only=True)
+        resp = session.get(f"{h3_server_url}/get", timeout=_TIMEOUT)
+        assert resp.status_code == 200
+        assert len(masque_proxy.stats.connects) == 1
 
     async def test_async_client_goes_through_the_tunnel(
         self, masque_proxy, h3_server_url, server_ca

@@ -1,6 +1,6 @@
 [package]
 name = "lkrequest-py"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 # crate so we can `#[cfg(not(Py_LIMITED_API))]` gate code that uses raw-FFI
 # bits the stable ABI does not expose (e.g. the buffer protocol on PyResponse).
 [build-dependencies]
-pyo3-build-config = "0.23"
+pyo3-build-config = "0.30"
 
 # lkrequest core crates come from the git repo so this package is
 # self-contained (installable via `pip install git+...` / sdist). Pinned to a
@@ -21,23 +21,23 @@ pyo3-build-config = "0.23"
 # For local development, `.cargo/config.toml` [patch] redirects these to the
 # sibling `../lkrequest` checkout (that file is git-ignored, so it never ships).
 [dependencies]
-lkrequest = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
-lktls = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
-lkh2 = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
-lkprofile = { git = "https://github.com/EZ-XLabs/lkrequest-rs", branch = "main" }
+lkrequest = { git = "https://github.com/EZXLabs/lkrequest-rs", branch = "main" }
+lktls = { git = "https://github.com/EZXLabs/lkrequest-rs", branch = "main" }
+lkh2 = { git = "https://github.com/EZXLabs/lkrequest-rs", branch = "main" }
+lkprofile = { git = "https://github.com/EZXLabs/lkrequest-rs", branch = "main" }
 serde = "1"
 # abi3-py39: build a single stable-ABI wheel that works for Python 3.9+, so the
 # release matrix collapses from (OS × python-version) to just OS. The minimum
 # 3.9 matches `requires-python` in pyproject.toml.
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39", "multiple-pymethods"] }
-pyo3-async-runtimes = { version = "0.23", features = ["attributes", "tokio-runtime"] }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39", "multiple-pymethods"] }
+pyo3-async-runtimes = { version = "0.30", features = ["attributes", "tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 http = "1"
 hyper = "1"
 hyper-util = "0.1"
 bytes = "1"
-# Needed to implement upstream's `#[async_trait]` `DnsResolver` trait, which
-# `src/dns.rs` wraps to filter resolved addresses by family. Already in the tree
+# Needed to implement upstream's `#[async_trait]` `DnsResolver` trait for
+# `Client(dns=...)` given Python code (`src/resolver.rs`). Already in the tree
 # as a transitive dependency of lkrequest, so this adds no code to the build.
 async-trait = "0.1"
 # Charset decoding for `Response.text()`. A Content-Type charset may be any label

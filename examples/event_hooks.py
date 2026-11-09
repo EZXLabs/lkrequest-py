@@ -28,13 +28,13 @@ def sync_hooks():
     )
 
     print("发送 GET 请求:")
-    resp = session.get("https://httpbin.org/get")
+    session.get("https://httpbin.org/get")
 
     print("\n发送 POST 请求:")
-    resp = session.post("https://httpbin.org/post", json={"test": True})
+    session.post("https://httpbin.org/post", json={"test": True})
 
     # --- 动态添加 Hook ---
-    print(f"\n=== 动态添加 Hook ===")
+    print("\n=== 动态添加 Hook ===")
     client2 = BlockingClient.chrome_144()
     session2 = client2.session()
 
@@ -69,7 +69,7 @@ async def async_hooks():
 
     urls = [f"https://httpbin.org/get?id={i}" for i in range(3)]
     tasks = [session.get(url) for url in urls]
-    responses = await asyncio.gather(*tasks)
+    await asyncio.gather(*tasks)
 
     print(f"\n  延迟统计 ({len(latencies)} 请求):")
     if latencies:

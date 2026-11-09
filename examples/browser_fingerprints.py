@@ -16,6 +16,8 @@ def preset_fingerprints():
         ("Chrome 131", lkrequest.Client.chrome_131),
         ("Chrome 144", lkrequest.Client.chrome_144),
         ("Chrome 155", lkrequest.Client.chrome_155),
+        ("Chrome 156", lkrequest.Client.chrome_156),
+        ("Chrome 157", lkrequest.Client.chrome_157),
         ("Firefox 133", lkrequest.Client.firefox_133),
         ("Firefox 147", lkrequest.Client.firefox_147),
         ("Firefox 156", lkrequest.Client.firefox_156),
@@ -28,7 +30,9 @@ def preset_fingerprints():
         info = client.fingerprint_info()
         print(f"{name}:")
         print(f"  TLS: {info.get('tls_profile', 'N/A')}")
-        print(f"  H2:  settings={info.get('h2_settings_count', 'N/A')}, window_update={info.get('h2_window_update', 'N/A')}")
+        print(
+            f"  H2:  settings={info.get('h2_settings_count', 'N/A')}, window_update={info.get('h2_window_update', 'N/A')}"
+        )
         print(f"  TCP: {info.get('tcp_ja4t', 'N/A')}")
         print()
 

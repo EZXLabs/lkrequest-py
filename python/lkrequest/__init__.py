@@ -20,8 +20,6 @@ from lkrequest._lkrequest import (
     BlockingClient,
     BlockingSession,
     # Configuration
-    TimeoutConfig,
-    ResourceLimits,
     HttpVersion,
     AcceptEncoding,
     PoolStats,
@@ -38,6 +36,8 @@ from lkrequest._lkrequest import (
     # Proxy
     ProxyConfig,
     ProxyPool,
+    BlockingProxyPool,
+    ProxyLease,
     BadProxyConfig,
     HealthCheckConfig,
     # Session Pool
@@ -52,10 +52,15 @@ from lkrequest._lkrequest import (
     RequestPriority,
     # Protocol policy
     ProtocolPolicy,
+    AcquisitionPolicy,
+    RacePolicy,
+    UpgradePolicy,
+    FallbackPolicy,
     HttpIntent,
     PreferredHttpVersion,
     Idempotency,
     BrokenQuicPolicy,
+    BrokenQuicConfig,
     H3RetryMode,
     # HSTS / scheme-upgrade policy
     Hsts,
@@ -74,6 +79,7 @@ from lkrequest._lkrequest import (
     ExtensionSpec,
     GreaseConfig,
     PaddingStrategy,
+    EchMode,
     RandomizationConfig,
     TlsProfile,
     H2Setting,
@@ -102,6 +108,9 @@ from lkrequest._lkrequest import (
     pending_requests,
     drain_pending,
     blocking_drain_pending,
+    features,
+    list_presets,
+    trust_anchor_identity,
 )
 
 # QuicProfile is only present when built with the `quic-h3` feature
@@ -150,8 +159,6 @@ __all__ = [
     "BlockingSession",
     "BlockingStreamingResponse",
     # Configuration
-    "TimeoutConfig",
-    "ResourceLimits",
     "HttpVersion",
     "AcceptEncoding",
     "PoolStats",
@@ -168,6 +175,8 @@ __all__ = [
     # Proxy
     "ProxyConfig",
     "ProxyPool",
+    "BlockingProxyPool",
+    "ProxyLease",
     "BadProxyConfig",
     "HealthCheckConfig",
     # Session Pool
@@ -182,10 +191,15 @@ __all__ = [
     "RequestPriority",
     # Protocol policy
     "ProtocolPolicy",
+    "AcquisitionPolicy",
+    "RacePolicy",
+    "UpgradePolicy",
+    "FallbackPolicy",
     "HttpIntent",
     "PreferredHttpVersion",
     "Idempotency",
     "BrokenQuicPolicy",
+    "BrokenQuicConfig",
     "H3RetryMode",
     # HSTS / scheme-upgrade policy
     "Hsts",
@@ -204,6 +218,7 @@ __all__ = [
     "ExtensionSpec",
     "GreaseConfig",
     "PaddingStrategy",
+    "EchMode",
     "RandomizationConfig",
     "TlsProfile",
     "H2Setting",
@@ -232,6 +247,9 @@ __all__ = [
     "pending_requests",
     "drain_pending",
     "blocking_drain_pending",
+    "features",
+    "list_presets",
+    "trust_anchor_identity",
 ]
 
 # Feature-gated symbols: only export the ones that were actually importable so

@@ -18,7 +18,7 @@ def blocking_pool_stats():
 
     # 请求前的连接池状态
     stats = session.pool_stats()
-    print(f"请求前:")
+    print("请求前:")
     print(f"  h2_connections: {stats.h2_connections}")
     print(f"  h1_connections: {stats.h1_connections}")
     print(f"  total: {stats.total}")
@@ -29,20 +29,24 @@ def blocking_pool_stats():
     # 发送请求后
     session.get("https://httpbin.org/get")
     stats = session.pool_stats()
-    print(f"\n请求后:")
-    print(f"  h2: {stats.h2_connections}, h1: {stats.h1_connections}, total: {stats.total}")
+    print("\n请求后:")
+    print(
+        f"  h2: {stats.h2_connections}, h1: {stats.h1_connections}, total: {stats.total}"
+    )
 
     # 多次请求后
-    session.get("https://httpbin.org/post", json={"a": 1})
+    session.post("https://httpbin.org/post", json={"a": 1})
     session.get("https://httpbin.org/get")
     stats = session.pool_stats()
-    print(f"\n3 次请求后:")
-    print(f"  h2: {stats.h2_connections}, h1: {stats.h1_connections}, total: {stats.total}")
+    print("\n3 次请求后:")
+    print(
+        f"  h2: {stats.h2_connections}, h1: {stats.h1_connections}, total: {stats.total}"
+    )
 
 
 async def async_pool_stats():
     """异步连接池统计"""
-    print(f"\n=== 异步连接池统计 ===\n")
+    print("\n=== 异步连接池统计 ===\n")
 
     client = lkrequest.Client.chrome_144()
     session = client.session()

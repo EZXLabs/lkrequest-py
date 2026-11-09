@@ -1,4 +1,5 @@
-//! Address selection: `Client(ip_family=...)` and `Client(connect_to=...)`.
+//! Address selection: `Client(ip_family=...)` and `Client(connect_to=...)`,
+//! and the DNS server `Client(dns="ip:port")` names.
 //!
 //! Both are upstream's — `ClientBuilder::ip_family` restricts the endpoints this
 //! process picks (the target, a proxy's ingress, a SOCKS5 UDP relay, QUIC) to
@@ -32,8 +33,8 @@ pub(crate) fn parse_ip_family(name: &str) -> PyResult<IpFamily> {
     }
 }
 
-/// The `ip_family=` spelling, for error messages.
-fn family_label(family: IpFamily) -> &'static str {
+/// The `ip_family=` spelling.
+pub(crate) fn family_label(family: IpFamily) -> &'static str {
     match family {
         IpFamily::Any => "any",
         IpFamily::Ipv4 => "ipv4",
@@ -132,4 +133,15 @@ fn parse_address(key: &str, value: &str) -> PyResult<SocketAddr> {
 /// A port in 1..=65535; upstream rejects 0 with a panic.
 fn parse_port(text: &str) -> Option<u16> {
     text.parse::<u16>().ok().filter(|&port| port != 0)
+}
+
+/// A `dns=` that names a DNS server: `"ip"` for port 53, or `"ip:port"` with an
+/// IPv6 address in brackets (`"[2606:4700::1111]:53"`).
+pub(crate) fn parse_dns_server(text: &str) -> Option<SocketAddr> {
+    let server = text.parse::<SocketAddr>().ok().or_else(|| {
+        text.parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 53))
+    })?;
+    (server.port() != 0).then_some(server)
 }

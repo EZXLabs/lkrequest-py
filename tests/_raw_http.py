@@ -1,16 +1,18 @@
-"""A plain HTTP/1.1 server that answers with bytes the test chooses and records
-what it received.
+"""An HTTP/1.1 server, plain or over TLS, that answers with bytes the test
+chooses and records what it received.
 
 Some inputs cannot be produced through a real framework: a `Location` in raw
 UTF-8, a `Set-Cookie` with an empty `Max-Age`, a `deflate` body no encoder would
 write, a proxy that refuses a CONNECT. This server writes whatever bytes the
 test hands it and then closes the connection, and it keeps the headers of every
-request exactly as they arrived. It runs on a thread of its own.
+request exactly as they arrived, the spelling of their names included, along
+with a body sent with `Content-Length`. It runs on a thread of its own.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ssl
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,6 +26,10 @@ class Received:
     target: str
     # Header names are lower-cased; values and order are as they arrived.
     headers: list[tuple[str, str]]
+    # The header names as they were spelled on the wire, in order.
+    raw_names: list[str]
+    # A `Content-Length` body; a chunked one is not read.
+    body: bytes = b""
 
     def values(self, name: str) -> list[str]:
         return [value for key, value in self.headers if key == name.lower()]
@@ -31,18 +37,23 @@ class Received:
 
 class RawHttpServer:
     """Answers each request with `reply(request)`, written in `chunk_size`-byte
-    pieces when given, then closes the connection."""
+    pieces when given, then closes the connection. Given an `ssl` context, it
+    speaks TLS and its `url` is `https://`."""
 
     def __init__(
         self,
         reply: Callable[[Received], bytes],
         *,
         chunk_size: int | None = None,
+        ssl: ssl.SSLContext | None = None,
     ) -> None:
         self.requests: list[Received] = []
+        # Connections accepted, whether or not a request arrived on them.
+        self.connections = 0
         self.port = 0
         self._reply = reply
         self._chunk_size = chunk_size
+        self._ssl = ssl
         self._writers: set[asyncio.StreamWriter] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server: asyncio.AbstractServer | None = None
@@ -50,7 +61,8 @@ class RawHttpServer:
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        scheme = "https" if self._ssl else "http"
+        return f"{scheme}://127.0.0.1:{self.port}"
 
     def start(self) -> None:
         started = threading.Event()
@@ -59,7 +71,9 @@ class RawHttpServer:
             loop = asyncio.new_event_loop()
             self._loop = loop
             self._server = loop.run_until_complete(
-                asyncio.start_server(self._handle, "127.0.0.1", 0, limit=MAX_HEAD)
+                asyncio.start_server(
+                    self._handle, "127.0.0.1", 0, limit=MAX_HEAD, ssl=self._ssl
+                )
             )
             self.port = self._server.sockets[0].getsockname()[1]
             started.set()
@@ -87,6 +101,7 @@ class RawHttpServer:
         self._thread.join(5)
 
     async def _handle(self, reader, writer) -> None:
+        self.connections += 1
         self._writers.add(writer)
         try:
             request = await self._read_request(reader)
@@ -108,16 +123,18 @@ class RawHttpServer:
         lines = head.decode("latin-1").split("\r\n")
         method, target, _version = lines[0].split(" ", 2)
         headers = []
+        raw_names = []
         for line in lines[1:]:
             if ":" in line:
                 name, _, value = line.partition(":")
                 headers.append((name.strip().lower(), value.strip()))
-        request = Received(method, target, headers)
+                raw_names.append(name.strip())
+        request = Received(method, target, headers, raw_names)
         # Read the body so closing the connection does not reset a client that
         # is still sending it.
         length = int((request.values("content-length") or ["0"])[0])
         if length:
-            await reader.readexactly(length)
+            request.body = await reader.readexactly(length)
         return request
 
     async def _write(self, writer, data: bytes) -> None:

@@ -26,7 +26,7 @@ def main():
         "https://httpbin.org/basic-auth/myuser/mypass",
         basic_auth=("myuser", "mypass"),
     )
-    print(f"\n[Basic Auth]")
+    print("\n[Basic Auth]")
     print(f"  状态码: {resp.status_code}")
     print(f"  authenticated: {resp.json()['authenticated']}")
     print(f"  user: {resp.json()['user']}")
@@ -36,7 +36,7 @@ def main():
         "https://httpbin.org/basic-auth/myuser/mypass",
         basic_auth=("wrong_user", "wrong_pass"),
     )
-    print(f"\n[Basic Auth 失败]")
+    print("\n[Basic Auth 失败]")
     print(f"  状态码: {resp.status_code}")  # 401
 
 

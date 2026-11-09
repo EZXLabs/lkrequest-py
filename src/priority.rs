@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 /// session.get(url, priority=RequestPriority.image())
 /// session.post(url, json=payload, priority=RequestPriority(1, incremental=True))
 /// ```
-#[pyclass(name = "RequestPriority")]
+#[pyclass(name = "RequestPriority", from_py_object)]
 #[derive(Clone, Copy)]
 pub struct PyRequestPriority {
     pub(crate) inner: lkh2::RequestPriority,

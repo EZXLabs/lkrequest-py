@@ -64,7 +64,9 @@ def sync_examples():
             "Accept-Language": "zh-CN,zh;q=0.9",
         },
     )
-    print(f"\n[Headers] X-Custom-Header: {resp.json()['headers'].get('X-Custom-Header')}")
+    print(
+        f"\n[Headers] X-Custom-Header: {resp.json()['headers'].get('X-Custom-Header')}"
+    )
 
 
 async def async_examples():

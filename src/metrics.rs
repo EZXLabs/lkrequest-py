@@ -107,16 +107,6 @@ pub struct PyMetricsCollector {
     inner: Arc<MetricsInner>,
 }
 
-impl PyMetricsCollector {
-    pub fn record(&self, url: &str, elapsed: f64, body_size: u64, is_error: bool) {
-        let host = url::Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-            .unwrap_or_else(|| "unknown".to_string());
-        self.inner.record(&host, elapsed, body_size, is_error);
-    }
-}
-
 #[pymethods]
 impl PyMetricsCollector {
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {

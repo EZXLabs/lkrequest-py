@@ -5,10 +5,9 @@
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::PyTraverseError;
-use std::collections::HashMap;
 
 use crate::client::blocking_runtime;
-use crate::error::to_py_err;
+use crate::error::{to_py_err, to_py_err_with_diagnostics};
 use crate::multipart::PyMultipart;
 use crate::priority::PyRequestPriority;
 use crate::protocol::{PyHttpIntent, PyIdempotency, PyPreferredHttpVersion, PyProtocolPolicy};
@@ -125,8 +124,8 @@ struct PreparedRequest {
     json_body: Option<String>,
     form_data: Option<Vec<(String, String)>>,
     raw_body: Option<Vec<u8>>,
-    cookies: Option<HashMap<String, String>>,
-    cookie_overrides: Option<HashMap<String, String>>,
+    cookies: Option<Vec<(String, String)>>,
+    cookie_overrides: Option<Vec<(String, String)>>,
     timeout: Option<f64>,
     bearer_auth: Option<String>,
     basic_auth: Option<(String, Option<String>)>,
@@ -273,6 +272,27 @@ fn apply_request_options(
     Ok(rb)
 }
 
+/// The upgrade request `ws_connect()` sends, for both session classes.
+fn ws_builder(
+    session: &lkrequest::Session,
+    url: &str,
+    headers: Option<StrPairs>,
+    protocols: Option<Vec<String>>,
+    extensions: Option<Vec<String>>,
+) -> lkrequest::ws::builder::WsBuilder {
+    let mut builder = session.websocket(url);
+    for (name, value) in headers.map(|h| h.0).unwrap_or_default() {
+        builder = builder.header(&name, &value);
+    }
+    for protocol in protocols.unwrap_or_default() {
+        builder = builder.protocol(&protocol);
+    }
+    for extension in extensions.unwrap_or_default() {
+        builder = builder.extension(&extension);
+    }
+    builder
+}
+
 async fn execute_request(
     session: lkrequest::Session,
     req: PreparedRequest,
@@ -293,8 +313,11 @@ async fn execute_request(
     let rb = apply_request_options(&session, req)?;
 
     let start = tokio::time::Instant::now();
+    // Boxed for the same reason as in `bridge::future_into_py`: upstream's
+    // request future is large enough that stack copies of it overflow a
+    // tokio worker in unoptimized builds.
     let (send_result, diagnostics) =
-        lkrequest::diagnostics::capture_request_diagnostics(rb.send()).await;
+        lkrequest::diagnostics::capture_request_diagnostics(Box::pin(rb.send())).await;
     let resp = match send_result {
         Ok(r) => r,
         Err(e) => {
@@ -306,7 +329,7 @@ async fn execute_request(
                 error = %e,
                 "request failed"
             );
-            return Err(to_py_err(e));
+            return Err(to_py_err_with_diagnostics(e, diagnostics));
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
@@ -383,20 +406,15 @@ fn resolve_base_url(base: &Option<String>, url: &str) -> String {
     }
 }
 
+/// Encode a fresh upstream form from `multipart`'s fields, leaving them in
+/// place so the same `Multipart` can be sent again.
 fn extract_multipart(
     py: Python<'_>,
     multipart: Option<Py<PyMultipart>>,
-) -> Option<lkrequest::multipart::Multipart> {
-    match multipart {
-        Some(mp_ref) => {
-            let mut guard = mp_ref.borrow_mut(py);
-            Some(std::mem::replace(
-                &mut guard.inner,
-                lkrequest::multipart::Multipart::new(),
-            ))
-        }
-        None => None,
-    }
+) -> PyResult<Option<lkrequest::multipart::Multipart>> {
+    multipart
+        .map(|form| Ok(form.try_borrow(py)?.build()))
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +440,8 @@ impl PySession {
         json_body: Option<String>,
         form_data: Option<StrPairs>,
         raw_body: Option<Vec<u8>>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_overrides: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_overrides: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -434,6 +452,8 @@ impl PySession {
         opts: RequestOpts,
     ) -> PyResult<Bound<'py, PyAny>> {
         let headers = headers.map(|p| p.0);
+        let cookies = cookies.map(|p| p.0);
+        let cookie_overrides = cookie_overrides.map(|p| p.0);
         let params = params.map(|p| p.0);
         let form_data = form_data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
@@ -487,8 +507,8 @@ impl PySession {
         url: String,
         headers: Option<StrPairs>,
         params: Option<StrPairs>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -552,8 +572,8 @@ impl PySession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -574,7 +594,7 @@ impl PySession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_request(
             py,
             "POST",
@@ -623,8 +643,8 @@ impl PySession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -645,7 +665,7 @@ impl PySession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_request(
             py,
             &method.to_uppercase(),
@@ -693,8 +713,8 @@ impl PySession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -715,7 +735,7 @@ impl PySession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_request(
             py,
             "PUT",
@@ -762,8 +782,8 @@ impl PySession {
         body: Option<Vec<u8>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -818,19 +838,25 @@ impl PySession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn head<'py>(
         &self,
         py: Python<'py>,
         url: String,
         headers: Option<StrPairs>,
         params: Option<StrPairs>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
         proxy: Option<String>,
+        no_decompress: bool,
+        accept_encoding: Option<PyAcceptEncoding>,
+        priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
+        preferred_http_version: Option<PyPreferredHttpVersion>,
+        idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -853,9 +879,13 @@ impl PySession {
             basic_auth,
             None,
             proxy,
-            false,
-            None,
+            no_decompress,
+            accept_encoding.map(|a| a.inner),
             RequestOpts {
+                priority: priority.map(|p| p.inner),
+                h2_priority_weight,
+                preferred_http_version: preferred_http_version.map(Into::into),
+                idempotency: idempotency.map(Into::into),
                 header_order,
                 cookie_order,
                 h3_header_order,
@@ -863,7 +893,6 @@ impl PySession {
                 http_intent: http_intent.map(|i| i.into()),
                 body_stream: None,
                 content_length: None,
-                ..Default::default()
             },
         )
     }
@@ -881,8 +910,8 @@ impl PySession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -903,7 +932,7 @@ impl PySession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_request(
             py,
             "PATCH",
@@ -938,19 +967,25 @@ impl PySession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn options<'py>(
         &self,
         py: Python<'py>,
         url: String,
         headers: Option<StrPairs>,
         params: Option<StrPairs>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
         proxy: Option<String>,
+        no_decompress: bool,
+        accept_encoding: Option<PyAcceptEncoding>,
+        priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
+        preferred_http_version: Option<PyPreferredHttpVersion>,
+        idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -973,9 +1008,13 @@ impl PySession {
             basic_auth,
             None,
             proxy,
-            false,
-            None,
+            no_decompress,
+            accept_encoding.map(|a| a.inner),
             RequestOpts {
+                priority: priority.map(|p| p.inner),
+                h2_priority_weight,
+                preferred_http_version: preferred_http_version.map(Into::into),
+                idempotency: idempotency.map(Into::into),
                 header_order,
                 cookie_order,
                 h3_header_order,
@@ -983,7 +1022,6 @@ impl PySession {
                 http_intent: http_intent.map(|i| i.into()),
                 body_stream: None,
                 content_length: None,
-                ..Default::default()
             },
         )
     }
@@ -1000,31 +1038,21 @@ impl PySession {
 
     // --- WebSocket -----------------------------------------------------------
 
-    #[pyo3(signature = (url, *, headers=None, protocols=None))]
+    #[pyo3(signature = (url, *, headers=None, protocols=None, extensions=None))]
     fn ws_connect<'py>(
         &self,
         py: Python<'py>,
         url: String,
         headers: Option<StrPairs>,
         protocols: Option<Vec<String>>,
+        extensions: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.state.ensure_open()?;
         let closing = self.state.closing();
-        let session = self.inner.clone();
+        let builder = ws_builder(&self.inner, &url, headers, protocols, extensions);
         crate::bridge::future_into_py(
             py,
             closing.guard(async move {
-                let mut builder = session.websocket(&url);
-                if let Some(h) = headers {
-                    for (k, v) in h.0 {
-                        builder = builder.header(&k, &v);
-                    }
-                }
-                if let Some(protos) = protocols {
-                    for p in protos {
-                        builder = builder.protocol(&p);
-                    }
-                }
                 let conn = builder.connect().await.map_err(to_py_err)?;
                 Ok(PyWsConnection::new(conn))
             }),
@@ -1124,7 +1152,7 @@ impl PySession {
             closing.guard(async move {
                 let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
                 let results = session.preconnect_many(&url_refs).await;
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let list: Vec<Py<pyo3::types::PyDict>> = results
                         .into_iter()
                         .zip(urls.iter())
@@ -1153,7 +1181,7 @@ impl PySession {
             closing.guard(async move {
                 let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
                 let results = session.prefetch(&url_refs).await;
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let list: Vec<Py<pyo3::types::PyDict>> = results
                         .iter()
                         .map(|r| {
@@ -1173,7 +1201,7 @@ impl PySession {
 
     // --- Streaming -----------------------------------------------------------
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, accept_encoding=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     #[allow(clippy::too_many_arguments)]
     fn send_streaming<'py>(
         &self,
@@ -1188,13 +1216,18 @@ impl PySession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
         proxy: Option<String>,
+        no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
+        priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
+        preferred_http_version: Option<PyPreferredHttpVersion>,
+        idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -1207,8 +1240,10 @@ impl PySession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         let headers = headers.map(|p| p.0);
+        let cookies = cookies.map(|p| p.0);
+        let cookie_override = cookie_override.map(|p| p.0);
         let params = params.map(|p| p.0);
         let data = data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
@@ -1229,9 +1264,13 @@ impl PySession {
             basic_auth,
             multipart: mp,
             proxy,
-            no_auto_decompress: false,
+            no_auto_decompress: no_decompress,
             accept_encoding: accept_encoding.map(|a| a.inner),
             opts: RequestOpts {
+                priority: priority.map(|p| p.inner),
+                h2_priority_weight,
+                preferred_http_version: preferred_http_version.map(Into::into),
+                idempotency: idempotency.map(Into::into),
                 header_order,
                 cookie_order,
                 h3_header_order,
@@ -1239,14 +1278,13 @@ impl PySession {
                 http_intent: http_intent.map(|i| i.into()),
                 body_stream: upload,
                 content_length,
-                ..Default::default()
             },
         };
         crate::bridge::future_into_py(
             py,
             closing.guard(async move {
                 let rb = apply_request_options(&session, prepared)?;
-                let resp = rb.send_streaming().await.map_err(to_py_err)?;
+                let resp = Box::pin(rb.send_streaming()).await.map_err(to_py_err)?;
                 Ok(crate::response::PyStreamingResponse::new(resp))
             }),
         )
@@ -1335,8 +1373,8 @@ impl PyBlockingSession {
         json_body: Option<String>,
         form_data: Option<StrPairs>,
         raw_body: Option<Vec<u8>>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_overrides: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_overrides: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -1347,6 +1385,8 @@ impl PyBlockingSession {
         opts: RequestOpts,
     ) -> PyResult<PyResponse> {
         let headers = headers.map(|p| p.0);
+        let cookies = cookies.map(|p| p.0);
+        let cookie_overrides = cookie_overrides.map(|p| p.0);
         let params = params.map(|p| p.0);
         let form_data = form_data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
@@ -1381,7 +1421,7 @@ impl PyBlockingSession {
             accept_encoding,
             opts,
         };
-        py.allow_threads(|| {
+        py.detach(|| {
             blocking_runtime().block_on(async move {
                 closing
                     .guard(execute_request(session, prepared, hooks))
@@ -1400,8 +1440,8 @@ impl PyBlockingSession {
         url: String,
         headers: Option<StrPairs>,
         params: Option<StrPairs>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -1465,8 +1505,8 @@ impl PyBlockingSession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -1487,7 +1527,7 @@ impl PyBlockingSession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_blocking_request(
             py,
             "POST",
@@ -1536,8 +1576,8 @@ impl PyBlockingSession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -1558,7 +1598,7 @@ impl PyBlockingSession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_blocking_request(
             py,
             &method.to_uppercase(),
@@ -1606,8 +1646,8 @@ impl PyBlockingSession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -1628,7 +1668,7 @@ impl PyBlockingSession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_blocking_request(
             py,
             "PUT",
@@ -1675,8 +1715,8 @@ impl PyBlockingSession {
         body: Option<Vec<u8>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -1731,19 +1771,25 @@ impl PyBlockingSession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn head(
         &self,
         py: Python<'_>,
         url: String,
         headers: Option<StrPairs>,
         params: Option<StrPairs>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
         proxy: Option<String>,
+        no_decompress: bool,
+        accept_encoding: Option<PyAcceptEncoding>,
+        priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
+        preferred_http_version: Option<PyPreferredHttpVersion>,
+        idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -1766,9 +1812,13 @@ impl PyBlockingSession {
             basic_auth,
             None,
             proxy,
-            false,
-            None,
+            no_decompress,
+            accept_encoding.map(|a| a.inner),
             RequestOpts {
+                priority: priority.map(|p| p.inner),
+                h2_priority_weight,
+                preferred_http_version: preferred_http_version.map(Into::into),
+                idempotency: idempotency.map(Into::into),
                 header_order,
                 cookie_order,
                 h3_header_order,
@@ -1776,7 +1826,6 @@ impl PyBlockingSession {
                 http_intent: http_intent.map(|i| i.into()),
                 body_stream: None,
                 content_length: None,
-                ..Default::default()
             },
         )
     }
@@ -1794,8 +1843,8 @@ impl PyBlockingSession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
@@ -1816,7 +1865,7 @@ impl PyBlockingSession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         self.make_blocking_request(
             py,
             "PATCH",
@@ -1851,19 +1900,25 @@ impl PyBlockingSession {
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     fn options(
         &self,
         py: Python<'_>,
         url: String,
         headers: Option<StrPairs>,
         params: Option<StrPairs>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
         proxy: Option<String>,
+        no_decompress: bool,
+        accept_encoding: Option<PyAcceptEncoding>,
+        priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
+        preferred_http_version: Option<PyPreferredHttpVersion>,
+        idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -1886,9 +1941,13 @@ impl PyBlockingSession {
             basic_auth,
             None,
             proxy,
-            false,
-            None,
+            no_decompress,
+            accept_encoding.map(|a| a.inner),
             RequestOpts {
+                priority: priority.map(|p| p.inner),
+                h2_priority_weight,
+                preferred_http_version: preferred_http_version.map(Into::into),
+                idempotency: idempotency.map(Into::into),
                 header_order,
                 cookie_order,
                 h3_header_order,
@@ -1896,7 +1955,6 @@ impl PyBlockingSession {
                 http_intent: http_intent.map(|i| i.into()),
                 body_stream: None,
                 content_length: None,
-                ..Default::default()
             },
         )
     }
@@ -1913,30 +1971,20 @@ impl PyBlockingSession {
 
     // --- WebSocket -----------------------------------------------------------
 
-    #[pyo3(signature = (url, *, headers=None, protocols=None))]
+    #[pyo3(signature = (url, *, headers=None, protocols=None, extensions=None))]
     fn ws_connect(
         &self,
         py: Python<'_>,
         url: String,
         headers: Option<StrPairs>,
         protocols: Option<Vec<String>>,
+        extensions: Option<Vec<String>>,
     ) -> PyResult<PyBlockingWsConnection> {
         self.state.ensure_open()?;
         let closing = self.state.closing();
-        let session = self.inner.clone();
-        py.allow_threads(|| {
+        let builder = ws_builder(&self.inner, &url, headers, protocols, extensions);
+        py.detach(|| {
             blocking_runtime().block_on(closing.guard(async move {
-                let mut builder = session.websocket(&url);
-                if let Some(h) = headers {
-                    for (k, v) in h.0 {
-                        builder = builder.header(&k, &v);
-                    }
-                }
-                if let Some(protos) = protocols {
-                    for p in protos {
-                        builder = builder.protocol(&p);
-                    }
-                }
                 let conn = builder.connect().await.map_err(to_py_err)?;
                 Ok(PyBlockingWsConnection::new(conn))
             }))
@@ -2014,7 +2062,7 @@ impl PyBlockingSession {
         self.state.ensure_open()?;
         let closing = self.state.closing();
         let session = self.inner.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             blocking_runtime().block_on(
                 closing.guard(async move { session.preconnect(&url).await.map_err(to_py_err) }),
             )
@@ -2029,11 +2077,11 @@ impl PyBlockingSession {
         self.state.ensure_open()?;
         let closing = self.state.closing();
         let session = self.inner.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             blocking_runtime().block_on(closing.guard(async move {
                 let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
                 let results = session.preconnect_many(&url_refs).await;
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     results
                         .into_iter()
                         .zip(urls.iter())
@@ -2060,11 +2108,11 @@ impl PyBlockingSession {
         self.state.ensure_open()?;
         let closing = self.state.closing();
         let session = self.inner.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             blocking_runtime().block_on(closing.guard(async move {
                 let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
                 let results = session.prefetch(&url_refs).await;
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     results
                         .iter()
                         .map(|r| {
@@ -2083,7 +2131,7 @@ impl PyBlockingSession {
 
     // --- Streaming -----------------------------------------------------------
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, accept_encoding=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
     #[allow(clippy::too_many_arguments)]
     fn send_streaming(
         &self,
@@ -2098,13 +2146,18 @@ impl PyBlockingSession {
         multipart: Option<Py<PyMultipart>>,
         body_stream: Option<Bound<'_, PyAny>>,
         content_length: Option<u64>,
-        cookies: Option<HashMap<String, String>>,
-        cookie_override: Option<HashMap<String, String>>,
+        cookies: Option<StrPairs>,
+        cookie_override: Option<StrPairs>,
         timeout: Option<f64>,
         bearer_auth: Option<String>,
         basic_auth: Option<(String, Option<String>)>,
         proxy: Option<String>,
+        no_decompress: bool,
         accept_encoding: Option<PyAcceptEncoding>,
+        priority: Option<PyRequestPriority>,
+        h2_priority_weight: Option<u8>,
+        preferred_http_version: Option<PyPreferredHttpVersion>,
+        idempotency: Option<PyIdempotency>,
         header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -2117,8 +2170,10 @@ impl PyBlockingSession {
         let upload = body_stream
             .map(|source| crate::upload::UploadSource::extract(&source))
             .transpose()?;
-        let mp = extract_multipart(py, multipart);
+        let mp = extract_multipart(py, multipart)?;
         let headers = headers.map(|p| p.0);
+        let cookies = cookies.map(|p| p.0);
+        let cookie_override = cookie_override.map(|p| p.0);
         let params = params.map(|p| p.0);
         let data = data.map(|p| p.0);
         let url = resolve_base_url(&self.base_url, &url);
@@ -2139,9 +2194,13 @@ impl PyBlockingSession {
             basic_auth,
             multipart: mp,
             proxy,
-            no_auto_decompress: false,
+            no_auto_decompress: no_decompress,
             accept_encoding: accept_encoding.map(|a| a.inner),
             opts: RequestOpts {
+                priority: priority.map(|p| p.inner),
+                h2_priority_weight,
+                preferred_http_version: preferred_http_version.map(Into::into),
+                idempotency: idempotency.map(Into::into),
                 header_order,
                 cookie_order,
                 h3_header_order,
@@ -2149,13 +2208,12 @@ impl PyBlockingSession {
                 http_intent: http_intent.map(|i| i.into()),
                 body_stream: upload,
                 content_length,
-                ..Default::default()
             },
         };
-        py.allow_threads(|| {
+        py.detach(|| {
             blocking_runtime().block_on(closing.guard(async move {
                 let rb = apply_request_options(&session, prepared)?;
-                let resp = rb.send_streaming().await.map_err(to_py_err)?;
+                let resp = Box::pin(rb.send_streaming()).await.map_err(to_py_err)?;
                 Ok(crate::response::PyBlockingStreamingResponse::new(resp))
             }))
         })

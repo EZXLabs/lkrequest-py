@@ -1,16 +1,18 @@
 //! Wire-format fingerprint pyclasses: `TlsProfile`, `H2Profile`, and
 //! `TcpFingerprint` (plus their building blocks such as `ExtensionSpec`,
-//! `GreaseConfig`, `PaddingStrategy`, and H2 settings/priority types) used to
+//! `GreaseConfig`, `PaddingStrategy`, `EchMode`, and H2 settings/priority types) used to
 //! mimic real browser TLS/HTTP2/TCP behaviour.
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use lktls::profile::types::{
-    self as tls_types, DelegatedCredentialConfig, ExtensionSource, GreaseConfig, PaddingStrategy,
-    RandomizationConfig,
+    self as tls_types, DelegatedCredentialConfig, EchGreaseConfig, EchMode, ExtensionSource,
+    GreaseConfig, PaddingStrategy, RandomizationConfig, TlsClientHelloStyle,
 };
 use lktls::profile::{ExtensionSpec, TlsProfile, TlsVersion};
+
+use crate::types::validated_duration;
 
 // ============================================================
 // Helper conversion functions
@@ -25,6 +27,21 @@ fn str_to_tls_version(s: &str) -> PyResult<TlsVersion> {
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Unknown TLS version: '{}'. Use: tls10, tls11, tls12, tls13",
             s
+        ))),
+    }
+}
+
+/// `tls_client_hello_style=`, by the name `to_dict()` gives it.
+fn str_to_hello_style(s: &str) -> PyResult<TlsClientHelloStyle> {
+    match s {
+        "generic" => Ok(TlsClientHelloStyle::Generic),
+        "chromium_boringssl" => Ok(TlsClientHelloStyle::ChromiumBoringssl),
+        "firefox_nss" => Ok(TlsClientHelloStyle::FirefoxNss),
+        "safari_cfnetwork" => Ok(TlsClientHelloStyle::SafariCfnetwork),
+        "java_jsse" => Ok(TlsClientHelloStyle::JavaJsse),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown tls_client_hello_style: '{s}'. Use: generic, chromium_boringssl, \
+             firefox_nss, safari_cfnetwork, java_jsse"
         ))),
     }
 }
@@ -128,7 +145,7 @@ impl PyExtType {
 // ExtensionSpec
 // ============================================================
 
-#[pyclass(name = "ExtensionSpec")]
+#[pyclass(name = "ExtensionSpec", from_py_object)]
 #[derive(Clone)]
 pub struct PyExtensionSpec {
     pub(crate) inner: ExtensionSpec,
@@ -205,7 +222,8 @@ impl PyExtensionSpec {
         }
     }
 
-    /// Whether a trust_anchor_ids source reshuffles on every ClientHello;
+    /// Whether a trust_anchor_ids source reshuffles its identifiers on every
+    /// new handshake (a HelloRetryRequest retry resends the first order);
     /// None for other sources.
     #[getter]
     fn shuffle(&self) -> Option<bool> {
@@ -228,7 +246,7 @@ impl PyExtensionSpec {
 // GreaseConfig
 // ============================================================
 
-#[pyclass(name = "GreaseConfig")]
+#[pyclass(name = "GreaseConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyGreaseConfig {
     pub(crate) inner: GreaseConfig,
@@ -276,7 +294,7 @@ impl PyGreaseConfig {
 // PaddingStrategy
 // ============================================================
 
-#[pyclass(name = "PaddingStrategy")]
+#[pyclass(name = "PaddingStrategy", from_py_object)]
 #[derive(Clone)]
 pub struct PyPaddingStrategy {
     pub(crate) inner: PaddingStrategy,
@@ -329,7 +347,7 @@ impl PyPaddingStrategy {
 // RandomizationConfig
 // ============================================================
 
-#[pyclass(name = "RandomizationConfig")]
+#[pyclass(name = "RandomizationConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyRandomizationConfig {
     pub(crate) inner: RandomizationConfig,
@@ -354,10 +372,96 @@ impl PyRandomizationConfig {
 }
 
 // ============================================================
+// EchMode
+// ============================================================
+
+/// The ECH extension (0xFE0D) a TLS profile sends.
+#[pyclass(name = "EchMode", from_py_object)]
+#[derive(Clone)]
+pub struct PyEchMode {
+    pub(crate) inner: EchMode,
+}
+
+#[pymethods]
+impl PyEchMode {
+    /// ECH GREASE, which browsers send to a site they have no ECH
+    /// configuration for: an extension that looks real and matches no server.
+    /// The defaults are Chrome's HPKE suite (HKDF-SHA256, AES-128-GCM) and
+    /// `enc` length; without a payload length, it follows the host name.
+    #[staticmethod]
+    #[pyo3(signature = (*, kdf_id=1, aead_id=1, enc_length=32, payload_length_min=None, payload_length_max=None))]
+    fn grease(
+        kdf_id: u16,
+        aead_id: u16,
+        enc_length: u16,
+        payload_length_min: Option<u16>,
+        payload_length_max: Option<u16>,
+    ) -> PyResult<Self> {
+        if let (Some(min), Some(max)) = (payload_length_min, payload_length_max) {
+            if min > max {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "payload_length_min ({min}) must not exceed payload_length_max ({max})"
+                )));
+            }
+        }
+        Ok(PyEchMode {
+            inner: EchMode::Grease(EchGreaseConfig {
+                kdf_id,
+                aead_id,
+                enc_length,
+                payload_length_min,
+                payload_length_max,
+            }),
+        })
+    }
+
+    /// Real ECH: the inner ClientHello encrypted with `ech_config_list`, an
+    /// ECHConfigList as a site's DNS HTTPS record carries it.
+    #[staticmethod]
+    fn real(py: Python<'_>, ech_config_list: &[u8]) -> PyResult<Self> {
+        // Upstream keeps the list base64-encoded, as in a profile's JSON.
+        let encoded = py
+            .import("base64")?
+            .call_method1("b64encode", (ech_config_list,))?
+            .call_method1("decode", ("ascii",))?
+            .extract()?;
+        Ok(PyEchMode {
+            inner: EchMode::Real {
+                ech_config_list: encoded,
+            },
+        })
+    }
+
+    /// No ECH extension.
+    #[staticmethod]
+    fn disabled() -> Self {
+        PyEchMode {
+            inner: EchMode::Disabled,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        let optional = |value: Option<u16>| value.map_or("None".to_owned(), |v| v.to_string());
+        match &self.inner {
+            EchMode::Grease(grease) => format!(
+                "EchMode.grease(kdf_id={}, aead_id={}, enc_length={}, payload_length_min={}, payload_length_max={})",
+                grease.kdf_id,
+                grease.aead_id,
+                grease.enc_length,
+                optional(grease.payload_length_min),
+                optional(grease.payload_length_max),
+            ),
+            EchMode::Real { .. } => "EchMode.real(...)".to_owned(),
+            EchMode::Disabled => "EchMode.disabled()".to_owned(),
+        }
+    }
+}
+
+// ============================================================
 // TlsProfile
 // ============================================================
 
-#[pyclass(name = "TlsProfile")]
+#[pyclass(name = "TlsProfile", from_py_object)]
 #[derive(Clone)]
 pub struct PyTlsProfile {
     pub(crate) inner: TlsProfile,
@@ -387,6 +491,9 @@ impl PyTlsProfile {
         delegated_credentials_sig_algs=None,
         session_id_length=32,
         randomization=None,
+        tls_client_hello_style=None,
+        ech=None,
+        ech_outer_extensions=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -409,6 +516,9 @@ impl PyTlsProfile {
         delegated_credentials_sig_algs: Option<Vec<u16>>,
         session_id_length: u8,
         randomization: Option<PyRandomizationConfig>,
+        tls_client_hello_style: Option<&str>,
+        ech: Option<PyEchMode>,
+        ech_outer_extensions: Option<Vec<u16>>,
     ) -> PyResult<Self> {
         let min_ver = match tls_min_version {
             Some(s) => str_to_tls_version(s)?,
@@ -449,9 +559,12 @@ impl PyTlsProfile {
                 .unwrap_or_else(|| vec!["h2".to_string(), "http/1.1".to_string()]),
             randomization: randomization.map(|r| r.inner),
             session_resumption: Default::default(),
-            tls_client_hello_style: Default::default(),
-            ech: None,
-            ech_outer_extensions: None,
+            tls_client_hello_style: tls_client_hello_style
+                .map(str_to_hello_style)
+                .transpose()?
+                .unwrap_or_default(),
+            ech: ech.map(|mode| mode.inner),
+            ech_outer_extensions,
         };
         Ok(PyTlsProfile { inner: profile })
     }
@@ -536,12 +649,30 @@ impl PyTlsProfile {
             inner: lktls::profile::presets::chrome_154(),
         }
     }
-    /// Chrome 155: the Chrome 155.0.8059.40 capture kept Chrome 154's TLS shape;
-    /// only the profile name differs.
+    /// Chrome 155: the Chrome 155.0.8059.40 capture kept Chrome 154's TLS shape,
+    /// but its 28 trust-anchor IDs go out in one fixed, sorted order, the order
+    /// Chromium encodes them in, instead of being shuffled on every handshake.
+    /// Extension order is still shuffled.
     #[staticmethod]
     fn chrome_155() -> Self {
         PyTlsProfile {
             inner: lktls::profile::presets::chrome_155(),
+        }
+    }
+    /// Chrome 156: the Chrome 156.0.8078.48 capture kept Chrome 155's TLS shape,
+    /// sorted trust-anchor IDs included; only the profile name differs.
+    #[staticmethod]
+    fn chrome_156() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_156(),
+        }
+    }
+    /// Chrome 157: the Chrome 157.0.8103.39 capture kept Chrome 156's TLS shape,
+    /// sorted trust-anchor IDs included; only the profile name differs.
+    #[staticmethod]
+    fn chrome_157() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_157(),
         }
     }
     /// Chrome 146 QUIC-TLS profile: the ClientHello Chrome sends *inside* QUIC,
@@ -591,12 +722,28 @@ impl PyTlsProfile {
             inner: lktls::profile::presets::chrome_154_quic(),
         }
     }
-    /// Chrome 155 QUIC-TLS profile: Chrome 154's QUIC ClientHello under the
-    /// new name.
+    /// Chrome 155 QUIC-TLS profile: Chrome 154's QUIC ClientHello with the
+    /// trust-anchor IDs in the fixed, sorted order of the Chrome 155 TLS profile.
     #[staticmethod]
     fn chrome_155_quic() -> Self {
         PyTlsProfile {
             inner: lktls::profile::presets::chrome_155_quic(),
+        }
+    }
+    /// Chrome 156 QUIC-TLS profile: derived from the Chrome 156 TLS profile the
+    /// way Chrome 155's is, so it matches Chrome 155's QUIC ClientHello.
+    #[staticmethod]
+    fn chrome_156_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_156_quic(),
+        }
+    }
+    /// Chrome 157 QUIC-TLS profile: derived from the Chrome 157 TLS profile the
+    /// way Chrome 156's is, so it matches Chrome 156's QUIC ClientHello.
+    #[staticmethod]
+    fn chrome_157_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_157_quic(),
         }
     }
     #[staticmethod]
@@ -679,7 +826,7 @@ impl PyTlsProfile {
         let json_str = self.to_json()?;
         let json_mod = py.import("json")?;
         let obj = json_mod.call_method1("loads", (&json_str,))?;
-        obj.downcast_into::<PyDict>().map_err(|e| {
+        obj.cast_into::<PyDict>().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Unexpected conversion error: {}", e))
         })
     }
@@ -726,7 +873,7 @@ impl PyTlsProfile {
 // H2Setting
 // ============================================================
 
-#[pyclass(name = "H2Setting")]
+#[pyclass(name = "H2Setting", from_py_object)]
 #[derive(Clone)]
 pub struct PyH2Setting {
     pub(crate) inner: lkh2::profile::H2Setting,
@@ -767,7 +914,7 @@ impl PyH2Setting {
 // HeadersPriority
 // ============================================================
 
-#[pyclass(name = "HeadersPriority")]
+#[pyclass(name = "HeadersPriority", from_py_object)]
 #[derive(Clone)]
 pub struct PyHeadersPriority {
     pub(crate) inner: lkh2::profile::HeadersPriority,
@@ -798,7 +945,7 @@ impl PyHeadersPriority {
 // PriorityFrame
 // ============================================================
 
-#[pyclass(name = "PriorityFrame")]
+#[pyclass(name = "PriorityFrame", from_py_object)]
 #[derive(Clone)]
 pub struct PyPriorityFrame {
     pub(crate) inner: lkh2::profile::ProfilePriorityFrame,
@@ -841,7 +988,7 @@ impl PyPriorityFrame {
 /// ```python
 /// H2Profile(settings, window_update, order, priority_config=PriorityConfig.chrome())
 /// ```
-#[pyclass(name = "PriorityConfig")]
+#[pyclass(name = "PriorityConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyPriorityConfig {
     pub(crate) inner: lkh2::profile::PriorityConfig,
@@ -1015,7 +1162,7 @@ impl PyPriorityConfig {
 // H2Profile
 // ============================================================
 
-#[pyclass(name = "H2Profile")]
+#[pyclass(name = "H2Profile", from_py_object)]
 #[derive(Clone)]
 pub struct PyH2Profile {
     pub(crate) inner: lkh2::profile::H2Profile,
@@ -1182,6 +1329,20 @@ impl PyH2Profile {
             inner: lkh2::profile::chrome_155_h2(),
         }
     }
+    /// Chrome 156 H2 profile: unchanged from Chrome 155.
+    #[staticmethod]
+    fn chrome_156() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_156_h2(),
+        }
+    }
+    /// Chrome 157 H2 profile: unchanged from Chrome 156.
+    #[staticmethod]
+    fn chrome_157() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_157_h2(),
+        }
+    }
     #[staticmethod]
     fn firefox_133() -> Self {
         PyH2Profile {
@@ -1272,8 +1433,17 @@ impl PyH2Profile {
         let json_str = self.to_json()?;
         let json_mod = py.import("json")?;
         let obj = json_mod.call_method1("loads", (&json_str,))?;
-        obj.downcast_into::<PyDict>().map_err(|e| {
+        obj.cast_into::<PyDict>().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Unexpected conversion error: {}", e))
+        })
+    }
+
+    /// Raise `ValueError` if the profile breaks a rule of HTTP/2 that a usable
+    /// fingerprint keeps. Nothing else checks: a client sends a profile that
+    /// breaks one as it is.
+    fn validate(&self) -> PyResult<()> {
+        lkh2::validate_h2_profile(&self.inner).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid H2Profile: {err}"))
         })
     }
 
@@ -1290,7 +1460,44 @@ impl PyH2Profile {
 // TcpFingerprint
 // ============================================================
 
-#[pyclass(name = "TcpFingerprint")]
+/// `tcp_options=`, given as the options' kind numbers.
+fn tcp_options_of(kinds: &[u8]) -> PyResult<Vec<lkrequest::TcpOption>> {
+    kinds
+        .iter()
+        .map(|&kind| {
+            lkrequest::TcpOption::from_kind(kind).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown TCP option kind {kind}: use 0 (EOL), 1 (NOP), 2 (MSS), 3 (window scale), 4 (SACK permitted) or 8 (timestamps)"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// `keepalive=`, `keepalive_idle=` and `keepalive_interval=`: either of the
+/// last two turns keep-alive on, and contradicts `keepalive=False`.
+fn tcp_keepalive(
+    enabled: Option<bool>,
+    idle: Option<f64>,
+    interval: Option<f64>,
+) -> PyResult<Option<lkrequest::tcp_fingerprint::TcpKeepalive>> {
+    let timed = idle.is_some() || interval.is_some();
+    if enabled == Some(false) && timed {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "keepalive_idle and keepalive_interval need keep-alive on, not keepalive=False",
+        ));
+    }
+    let Some(enabled) = enabled.or(timed.then_some(true)) else {
+        return Ok(None);
+    };
+    Ok(Some(lkrequest::tcp_fingerprint::TcpKeepalive {
+        enabled,
+        idle: idle.map(validated_duration).transpose()?,
+        interval: interval.map(validated_duration).transpose()?,
+    }))
+}
+
+#[pyclass(name = "TcpFingerprint", from_py_object)]
 #[derive(Clone)]
 pub struct PyTcpFingerprint {
     pub(crate) inner: lkrequest::TcpFingerprint,
@@ -1308,6 +1515,10 @@ impl PyTcpFingerprint {
         tcp_nodelay=None,
         recv_buf_size=None,
         send_buf_size=None,
+        tcp_options=None,
+        keepalive=None,
+        keepalive_idle=None,
+        keepalive_interval=None,
     ))]
     fn new(
         window_size: Option<u32>,
@@ -1317,8 +1528,18 @@ impl PyTcpFingerprint {
         tcp_nodelay: Option<bool>,
         recv_buf_size: Option<u32>,
         send_buf_size: Option<u32>,
-    ) -> Self {
+        tcp_options: Option<Vec<u8>>,
+        keepalive: Option<bool>,
+        keepalive_idle: Option<f64>,
+        keepalive_interval: Option<f64>,
+    ) -> PyResult<Self> {
         let mut fp = lkrequest::TcpFingerprint::none();
+        if let Some(kinds) = tcp_options {
+            fp = fp.with_tcp_options(tcp_options_of(&kinds)?);
+        }
+        if let Some(keepalive) = tcp_keepalive(keepalive, keepalive_idle, keepalive_interval)? {
+            fp = fp.with_keepalive(keepalive);
+        }
         if let Some(v) = window_size {
             fp = fp.with_window_size(v);
         }
@@ -1340,7 +1561,35 @@ impl PyTcpFingerprint {
         if let Some(v) = send_buf_size {
             fp = fp.with_send_buf_size(v);
         }
-        PyTcpFingerprint { inner: fp }
+        Ok(PyTcpFingerprint { inner: fp })
+    }
+
+    /// Every setting, as the constructor takes it: `None` for one left to the
+    /// OS, the TCP options as their kind numbers, durations in seconds.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let fp = &self.inner;
+        let d = PyDict::new(py);
+        d.set_item("window_size", fp.window_size)?;
+        d.set_item("mss", fp.mss)?;
+        d.set_item("window_scale", fp.window_scale)?;
+        d.set_item("ttl", fp.ttl)?;
+        d.set_item("tcp_nodelay", fp.tcp_nodelay)?;
+        d.set_item("recv_buf_size", fp.recv_buf_size)?;
+        d.set_item("send_buf_size", fp.send_buf_size)?;
+        // As numbers, not as `bytes`, which is what PyO3 makes of a `Vec<u8>`.
+        let options = fp.tcp_options.as_ref().map(|options| {
+            options
+                .iter()
+                .map(|o| u32::from(o.kind()))
+                .collect::<Vec<_>>()
+        });
+        d.set_item("tcp_options", options)?;
+        d.set_item("keepalive", fp.keepalive.as_ref().map(|k| k.enabled))?;
+        let idle = fp.keepalive.as_ref().and_then(|k| k.idle);
+        d.set_item("keepalive_idle", idle.map(|t| t.as_secs_f64()))?;
+        let interval = fp.keepalive.as_ref().and_then(|k| k.interval);
+        d.set_item("keepalive_interval", interval.map(|t| t.as_secs_f64()))?;
+        Ok(d)
     }
 
     // ---- JA4T ----
@@ -1359,6 +1608,14 @@ impl PyTcpFingerprint {
 
     // ---- Preset constructors ----
 
+    /// No settings at all: the OS's own, apart from `TCP_NODELAY`, which the
+    /// transport turns on regardless.
+    #[staticmethod]
+    fn none() -> Self {
+        PyTcpFingerprint {
+            inner: lkrequest::TcpFingerprint::none(),
+        }
+    }
     #[staticmethod]
     fn chrome() -> Self {
         PyTcpFingerprint {
@@ -1413,11 +1670,47 @@ impl PyTcpFingerprint {
             inner: lkrequest::TcpFingerprint::safari(),
         }
     }
-
-    fn __repr__(&self) -> String {
-        match self.inner.to_ja4t() {
-            Some(ja4t) => format!("TcpFingerprint(ja4t='{}')", ja4t),
-            None => "TcpFingerprint()".to_string(),
+    #[staticmethod]
+    fn safari_ios() -> Self {
+        PyTcpFingerprint {
+            inner: lkrequest::TcpFingerprint::safari_ios(),
         }
+    }
+
+    /// The settings that are set, by argument name; the four JA4T covers read
+    /// as one `ja4t=` when all of them are set.
+    fn __repr__(&self) -> String {
+        let fp = &self.inner;
+        let mut parts = Vec::new();
+        let mut push = |name: &str, value: Option<String>| {
+            if let Some(value) = value {
+                parts.push(format!("{name}={value}"));
+            }
+        };
+        let py_bool = |b: bool| if b { "True" } else { "False" }.to_owned();
+        match fp.to_ja4t() {
+            Some(ja4t) => push("ja4t", Some(format!("'{ja4t}'"))),
+            None => {
+                push("window_size", fp.window_size.map(|v| v.to_string()));
+                let kinds = fp.tcp_options.as_ref().map(|options| {
+                    let kinds: Vec<u8> = options.iter().map(|o| o.kind()).collect();
+                    format!("{kinds:?}")
+                });
+                push("tcp_options", kinds);
+                push("mss", fp.mss.map(|v| v.to_string()));
+                push("window_scale", fp.window_scale.map(|v| v.to_string()));
+            }
+        }
+        push("ttl", fp.ttl.map(|v| v.to_string()));
+        push("tcp_nodelay", fp.tcp_nodelay.map(py_bool));
+        push("recv_buf_size", fp.recv_buf_size.map(|v| v.to_string()));
+        push("send_buf_size", fp.send_buf_size.map(|v| v.to_string()));
+        if let Some(keepalive) = &fp.keepalive {
+            push("keepalive", Some(py_bool(keepalive.enabled)));
+            let secs = |t: std::time::Duration| format!("{:?}", t.as_secs_f64());
+            push("keepalive_idle", keepalive.idle.map(secs));
+            push("keepalive_interval", keepalive.interval.map(secs));
+        }
+        format!("TcpFingerprint({})", parts.join(", "))
     }
 }

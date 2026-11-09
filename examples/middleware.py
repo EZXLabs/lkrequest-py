@@ -15,7 +15,7 @@ def main():
     print(f"中间件: {repr(mw)}")
 
     # === 请求拦截中间件 ===
-    print(f"\n=== 请求拦截中间件 ===")
+    print("\n=== 请求拦截中间件 ===")
 
     def log_request(req_dict):
         """记录每个请求"""
@@ -40,7 +40,7 @@ def main():
     print(f"  最终状态码: {resp.status_code}")
 
     # === 请求修改中间件（注入 Header） ===
-    print(f"\n=== Header 注入中间件 ===")
+    print("\n=== Header 注入中间件 ===")
 
     def inject_headers(req_dict):
         """为每个请求注入自定义 Header"""
@@ -60,7 +60,7 @@ def main():
     print(f"  X-Request-Id: {received.get('X-Request-Id')}")
 
     # === 多层中间件（洋葱模型） ===
-    print(f"\n=== 多层中间件 ===")
+    print("\n=== 多层中间件 ===")
 
     def timing_request(req_dict):
         print(f"  [timing] 请求开始: {req_dict['method']} {req_dict['url']}")
@@ -71,7 +71,7 @@ def main():
         return resp_dict
 
     def auth_request(req_dict):
-        print(f"  [auth] 注入认证 Header")
+        print("  [auth] 注入认证 Header")
         return req_dict
 
     timing_mw = lkrequest.Middleware(
@@ -86,16 +86,20 @@ def main():
 
     # Client-level middleware must go through the constructor; the chrome_144()
     # preset factory takes no arguments. Pass the fingerprint as a preset name.
-    client3 = Client(tls_profile="chrome_144", h2_profile="chrome_144", middleware=[timing_mw])
+    client3 = Client(
+        tls_profile="chrome_144", h2_profile="chrome_144", middleware=[timing_mw]
+    )
     session3 = client3.session(middleware=[auth_mw])
     resp = session3.get("https://httpbin.org/get")
     print(f"  结果: {resp.status_code}")
 
     # === 仅响应中间件 ===
-    print(f"\n=== 仅响应中间件 ===")
+    print("\n=== 仅响应中间件 ===")
 
     def response_only(resp_dict):
-        print(f"  [resp_only] 状态: {resp_dict['status']}, URL: {resp_dict.get('url', 'N/A')}")
+        print(
+            f"  [resp_only] 状态: {resp_dict['status']}, URL: {resp_dict.get('url', 'N/A')}"
+        )
         return resp_dict
 
     resp_mw = lkrequest.Middleware("response_logger", on_response=response_only)

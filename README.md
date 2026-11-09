@@ -2,7 +2,7 @@
 
 A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for high performance.
 
-[English](https://github.com/EZ-XLabs/lkrequest-py/blob/main/README.md) | [简体中文](https://github.com/EZ-XLabs/lkrequest-py/blob/main/README-zh.md)
+[English](https://github.com/EZXLabs/lkrequest-py/blob/main/README.md) | [简体中文](https://github.com/EZXLabs/lkrequest-py/blob/main/README-zh.md)
 
 ## Features
 
@@ -22,20 +22,22 @@ A Python HTTP client with TLS/HTTP2/TCP fingerprint control. Powered by Rust for
 - **Event hooks** — Lightweight request/response callbacks
 - **Connection prewarming** — `preconnect()` / `prefetch()` to batch-establish connections
 - **Prometheus metrics** — Built-in request counters, latency histograms, exposition-format export
-- **Request diagnostics** — `response.diagnostics` exposes per-request phase timings (DNS/TCP/TLS/TTFB/total) plus remote_addr/protocol/cipher_suite
+- **Request diagnostics** — `response.diagnostics` exposes per-request phase timings (DNS/TCP/TLS/TTFB/total) plus remote_addr/protocol/cipher_suite and the trust-anchor negotiation
 - **Runtime metrics snapshot** — `metrics_snapshot()` pulls process-level wire bytes / connection / request counters (for host-side collection; real values require the `telemetry` feature)
 - **Zero-copy Response** — `bytes::Bytes` + PyBuffer protocol + text/json caching
 - **Automatic decompression** — Brotli / gzip / deflate / zstd, with controllable `AcceptEncoding`
 - **Certificate management** — Custom CA / disable verification / system certificates
 - **ECH** — Encrypted Client Hello support, including TLS/QUIC HelloRetryRequest handling
+- **Trust Anchor Identifiers** — Chrome 152+ presets advertise the roots they accept (extension `0xca34`); `Client(trust_anchor_advertisement="trusted", trust_anchor_recovery="once")` advertises the roots you trust and retries once with an ID the server names
 - **Request priority** — `RequestPriority` (RFC 9218 urgency/incremental), `session.get(url, priority=...)`; `h2_priority_weight=` sets the weight (0–255) in the legacy priority field of an HTTP/2 HEADERS frame, independently of the `priority` header
-- **Protocol policy** — `ProtocolPolicy` / `HttpIntent` control H2/H3 selection, acquisition, and fallback (client / session / request level)
+- **Protocol policy** — `ProtocolPolicy` / `HttpIntent` control H2/H3 selection, acquisition (including a tunable TCP/QUIC race), upgrade, and fallback (client / session / request level)
 - **Session resumption control** — `SessionResumptionConfig` controls TLS1.3 PSK / TLS1.2 ticket resumption (fingerprint shape); `Client(tls_session_resumption_policy=..., tls_session_cache_partition_policy=...)` controls whether tickets are *stored* and how the cache is keyed, and `session(network_partition_context=NetworkPartitionContext(top_level_site, frame_site))` reproduces the browser's per-site partitioning
 - **H2 DATA framing** — `Client(h2_data_frame_policy=H2DataFramePolicy.BROWSER_DEFAULT / PEER_MAX_FRAME_SIZE / fixed_payload(n) / socket_write_aligned(n))` chooses how request bodies are split into DATA frames
 - **Streaming uploads** — `session.post(url, body_stream=..., content_length=...)` uploads without buffering the body: a file-like object (`read(n)`), any iterable of `bytes`, or — on the async client — an async iterable. Omit `content_length` for an unknown-length body (chunked on HTTP/1.1, DATA frames on HTTP/2 and HTTP/3). The source is single-use, so it cannot be replayed for an automatic retry, a protocol fallback, or a redirect that must preserve the body
 - **TLS close_notify** — `Client(require_close_notify=True)` rejects a response whose body was truncated without a TLS close_notify alert
+- **HTTP/1.1 header casing** — `Client(http1_title_case_headers=False)` sends lowercase HTTP/1.1 header names (`content-type`) except for `Host`, which keeps its capital `H`. The default is Title-Case (`Content-Type`). Generated headers, requests, streamed requests, preconnected connections and WebSocket handshakes follow the same rule. HTTP/2 and HTTP/3 always send lowercase names
 - **Request-level protocol override** — `preferred_http_version` / `idempotency` (0-RTT replay-safety declaration)
-- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151/152/153/154/155 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
+- **QUIC / HTTP3** — Optional feature (`maturin develop --features quic-h3`): `session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`, or cooldowns of your own for an origin whose QUIC connection failed with `broken_quic_policy=BrokenQuicConfig(initial_cooldown=2.0, max_cooldown=30.0)`; `Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`; dedicated Chrome 146/150/151/152/153/154/155/156/157 `QuicProfile` presets (available only when the feature is enabled). The QUIC-specific ClientHello is a separate TLS profile — pass `quic_fingerprint=TlsProfile.chrome_151_quic()` when building a client manually, otherwise HTTP/3 reuses the main TLS profile
 - **HTTP/3 retries** — `session(h3_retry_mode=H3RetryMode.Chrome155ProtocolErrors)` retries selected HTTP/3 protocol errors up to twice, before response headers arrive, as Chrome 155 does. It replays buffered requests, **POST included**, so a request the server already processed can be processed again; send `idempotency=Idempotency.NotIdempotent` to opt a request out. Off by default (`H3RetryMode.Safe`); anything but `Safe` needs the `quic-h3` feature
 - **MASQUE proxies (experimental)** — Optional feature (`maturin develop --features masque`, implies `quic-h3`): `session(proxy="masque://proxy:443", http3_only=True)` carries the QUIC connection to the target over an RFC 9298 CONNECT-UDP tunnel; `Client(masque=MasqueConfig(...))` configures trust for the hop to the proxy, independently of `verify`; `HealthCheckConfig(tunnel_probe=True, masque=...)` probes MASQUE proxies in a pool with a real tunnel
 - **Synthetic fingerprints (advanced)** — Optional feature (`maturin develop --features synthetic-fp`): `Client(randomize=Randomize.recombine())` synthesizes a cross-layer (TLS+H2+H3) unique identity per session; `Randomize.full()` additionally draws out-of-corpus values for H2/QUIC; the `Layers` mask (e.g. `Randomize.recombine_layers(Layers.TLS | Layers.H2)`) restricts which layers are synthesized. Synthetic fingerprints match no real browser and are only for blocklist (negative-model) targets — against an allowlist they fail instantly
@@ -59,7 +61,7 @@ uv add lkrequest
 Using venv and pip:
 
 ```bash
-git clone https://github.com/EZ-XLabs/lkrequest-py
+git clone https://github.com/EZXLabs/lkrequest-py
 cd lkrequest-py
 python3 -m venv .venv                 # Linux/macOS
 # py -m venv .venv                    # Windows
@@ -73,7 +75,7 @@ python -m pip install -e ".[test,lint]"
 Using uv (creates and manages `.venv` automatically):
 
 ```bash
-git clone https://github.com/EZ-XLabs/lkrequest-py
+git clone https://github.com/EZXLabs/lkrequest-py
 cd lkrequest-py
 uv sync --extra test --extra lint
 ```
@@ -184,6 +186,15 @@ def my_retry(attempt: int, error: str | None, status: int | None) -> float | Non
     return None  # give up
 
 session = client.session(retry=my_retry)
+```
+
+A callable that also takes `exception=` is given the exception the failure raises, with the attributes listed under [Error handling](#error-handling), or `None` when it is a status being retried:
+
+```python
+def retry_when_worth_it(attempt, error, status, exception=None):
+    if exception is not None and exception.retryable and attempt < 3:
+        return 1.0
+    return None
 ```
 
 ### Middleware
@@ -301,6 +312,8 @@ saved jar back into a fresh session reproduces the same headers on the wire.
 mp = lkrequest.Multipart()
 mp.text("title", "File upload")
 mp.file("document", "report.pdf", "application/pdf", pdf_bytes)
+# A Part says what text() and file() cannot, such as bytes without a filename
+mp.part(lkrequest.Part("checksum", digest_bytes))
 resp = session.post("https://example.com/upload", multipart=mp)
 ```
 
@@ -395,6 +408,15 @@ ws.close()
 
 `send_text()`, `send_binary()` and `close()` can be called while another task (or, with the sync client, another thread) is waiting in `recv()`; closing hands that waiting `recv()` the closing handshake. Once a connection is closed, every operation on it raises `RuntimeError` and iterating it just ends.
 
+```python
+ws = await session.ws_connect(url, protocols=["chat"], extensions=["x-my-extension"])
+await ws.ping(b"heartbeat")    # the pong comes back through recv(); at most 125 bytes
+await ws.pong()                # an unsolicited pong
+ws.url                         # still readable after close()
+```
+
+`extensions` are offered in the upgrade's `Sec-WebSocket-Extensions` header, which is part of what a browser's handshake looks like. The frames are always read and written plain, so only an extension that leaves them alone can be used: once a server accepts `permessage-deflate`, the compression Chrome offers, every compressed message it sends fails to be received.
+
 ### Proxy
 
 ```python
@@ -422,10 +444,43 @@ pool = lkrequest.ProxyPool(
         interval=30.0, timeout=3.0, target_host="www.google.com", target_port=443,
     ),
 )
-proxy = await pool.acquire()
+async with await pool.acquire() as lease:
+    session = client.session(proxy=lease.proxy)  # a ProxyConfig, credentials included
+    resp = await session.get("https://example.com")
+    if resp.status_code == 403:
+        lease.mark_bad()
 ```
 
-A pool that has proxies never hands back "no proxy" (which a caller would take for a direct connection): `await pool.acquire()` waits while every proxy is cooling down, so bound the wait with `asyncio.wait_for` if you need to. It returns an empty string only for a pool created with an empty list.
+A proxy URL that does not parse raises `ValueError` wherever it is given — `session(proxy=...)`, a request's `proxy=`, `ProxyConfig(...)` or a pool's list — so a typo never leaves a session quietly connecting direct.
+
+`acquire()` hands out a `ProxyLease`. It holds one of the pool's `max_proxies` shares (default 100) until it is released — with `release()`, at the end of a `with` or `async with` block, or when it is garbage collected — so `max_proxies` caps how many proxies are in use at once, and `pool.max_concurrent` reads it back. `mark_bad()` on a lease, or `pool.mark_bad(proxy.identity())`, feeds the pool's failure counter; `acquire_fresh(lease)` does that, releases the lease and leases another proxy.
+
+A pool that has proxies never hands back "no proxy" (which a caller would take for a direct connection): `await pool.acquire()` waits while every proxy is cooling down, so bound the wait with `asyncio.wait_for` if you need to. Only a pool created with an empty list hands out a lease whose `proxy` is `None`.
+
+In place of the list, a pool takes a function, called for every proxy it hands out — the way to use a gateway that picks the exit by a session id in the username:
+
+```python
+pool = lkrequest.ProxyPool(
+    lambda: f"http://user-session-{uuid.uuid4().hex[:8]}:pass@gateway.example:7777",
+    max_proxies=50,
+    proxy_buffer=20,  # optional: keep 20 proxies made ahead of time
+)
+```
+
+The function returns a URL or a `ProxyConfig`, and must be a plain function rather than an `async def`. What it raises comes out of the `acquire()` that called it, and so does a `ValueError` for a URL that does not parse. Every proxy it makes is a new one, so `rotation`, `bad_proxy_config` and `health_check` do not apply: nothing is cooled down or checked. The async pools call it on a worker thread that waits for it, so keep it quick; `proxy_buffer=n` has `n` proxies made ahead of time on a thread of their own, where a failure is only logged and the function is called again a second later.
+
+`lkrequest.blocking.ProxyPool` takes the same arguments; its `acquire()` blocks, and hands out the same `ProxyLease`, released with `release()` or a `with` block.
+
+To check one proxy, without a pool, a client sets a tunnel up through it and says how long that took:
+
+```python
+latency = await client.check_proxy("socks5://user:pass@host:1080")   # seconds
+latency = blocking_client.check_proxy(proxy, "example.com", 443, timeout=3.0)
+```
+
+Nothing is sent through the tunnel. The defaults are a pool's health check's — `www.google.com:443`, 5 seconds — and names are resolved as the client resolves them, `dns=` included. A refused or unreachable proxy raises `ProxyError`, and one too slow `TimeoutError`.
+
+A `ProxyConfig` reads back as `host` and `port`, those of the hop that connects to the target, and `forbids_direct_fallback`, true for a MASQUE route, which never falls back to a direct connection.
 
 TCP-based HTTP supports mixed HTTP CONNECT and SOCKS5 hops. QUIC/HTTP3 requires
 every hop in the chain to be SOCKS5; a chain containing an HTTP hop falls back
@@ -441,7 +496,13 @@ proxy = (
     .with_auth_header("authorization")      # default: "proxy-authorization"
 )
 proxy = lkrequest.ProxyConfig("http://gateway:8080").with_user_pass("user", "pass")
+proxy = lkrequest.ProxyConfig("http://gateway:8080").with_custom_auth(
+    "account-1",                          # stable and not secret; part of identity()
+    lambda: f"Bearer {tokens.fresh()}",   # called for each connection
+)
 ```
+
+`with_custom_auth()` is for a credential that has to be worked out for each connection. The function returns the header's value or `None`, and runs on the thread setting the connection up, which waits for it; if it raises, the connection goes without a credential and a warning is logged.
 
 ### MASQUE proxy (experimental)
 
@@ -459,7 +520,7 @@ DNS is resolved proxy-side, as with `socks5h`.
 
 ```python
 masque = lkrequest.MasqueConfig(
-    ca_cert="proxy-ca.pem",      # or ca_cert_pem=b"...", server_name="proxy.example"
+    ca_cert="proxy-ca.pem",      # or ca_cert_pem=b"...", ca_cert_der=b"...", server_name="proxy.example"
     tunnel_idle_timeout=120.0,   # None: never retire an idle tunnel
     max_idle_tunnels=256,        # 0: no cap
 )
@@ -498,6 +559,8 @@ with pool.acquire() as session:
     resp = session.get("https://example.com")
 ```
 
+Both take `rotation=`, `bad_proxy_config=`, `health_check=` and `proxy_buffer=` as `ProxyPool` does, and a function in place of the list; `max_sessions` is its `max_proxies`.
+
 ### Client pool
 
 Automatically rotate across multiple fingerprints to reduce fingerprint correlation.
@@ -532,6 +595,8 @@ tls = lkrequest.TlsProfile(
     alpn_protocols=["h2", "http/1.1"],
     grease=lkrequest.GreaseConfig(extensions=True, key_share=True),
     padding=lkrequest.PaddingStrategy.block_align(128, 512),
+    tls_client_hello_style="chromium_boringssl",  # the TLS stack's own rules: generic (default), chromium_boringssl, firefox_nss, …
+    ech=lkrequest.EchMode.grease(payload_length_min=128, payload_length_max=224),  # ECH GREASE as Chrome sends it; also EchMode.real(config_list), EchMode.disabled()
 )
 
 # Custom H2 Profile
@@ -546,11 +611,21 @@ h2 = lkrequest.H2Profile(
     headers_priority=lkrequest.HeadersPriority(0, 255, True),
     initial_stream_id=1,  # the first request's stream: odd, 1 for most browsers, 3 for Firefox 156
 )
+h2.validate()  # raises ValueError if it breaks a rule of HTTP/2; nothing else checks
 
 # Custom TCP Fingerprint. These are socket settings the library asks the OS for, on
 # new direct connections and the hop to the first proxy; the OS still builds the SYN,
 # so window size/scale only steer the receive buffer and MSS is applied on Linux only.
 tcp = lkrequest.TcpFingerprint(window_size=65535, mss=1460, window_scale=8, ttl=128)
+# The SYN's option order (JA4T part B, as kind numbers) only describes the target
+# and shows in to_ja4t(); keep-alive is set on the socket.
+tcp = lkrequest.TcpFingerprint(
+    window_size=64240, tcp_options=[2, 1, 3, 1, 1, 4], mss=1460, window_scale=8,
+    keepalive_idle=30.0, keepalive_interval=5.0,
+)
+tcp.to_ja4t()   # "64240_2-1-3-1-1-4_1460_8"
+tcp.to_dict()   # every setting, None where the OS decides
+lkrequest.TcpFingerprint.safari_ios(), lkrequest.TcpFingerprint.none()
 
 # Combine them
 client = lkrequest.Client(tls_profile=tls, h2_profile=h2, tcp_fingerprint=tcp)
@@ -559,7 +634,8 @@ client = lkrequest.Client(tls_profile=tls, h2_profile=h2, tcp_fingerprint=tcp)
 json_str = tls.to_json()
 restored = lkrequest.TlsProfile.from_json(json_str)
 
-# Fingerprint randomization
+# Fingerprint randomization: a copy whose TLS profile shuffles its extensions per
+# connection; every other option of the client carries over
 randomized = client.randomize_fingerprint(shuffle_extensions=True)
 
 # Randomization strategy (Randomize): pass to Client(randomize=...)
@@ -599,12 +675,6 @@ client = lkrequest.Client(
 
 # Request-level timeout override
 resp = session.get("https://example.com", timeout=5.0)
-
-# TimeoutConfig object
-tc = lkrequest.TimeoutConfig(total=30.0, tcp_connect=10.0)
-
-# ResourceLimits
-rl = lkrequest.ResourceLimits(max_response_body_size=10*1024*1024, max_connections_per_session=16)
 ```
 
 ### AcceptEncoding control
@@ -685,15 +755,23 @@ hosts. The default (no `hsts`) is a stateless "first visit" that performs no upg
 is suffix-based (equivalent to HSTS `includeSubDomains`).
 
 ```python
-# Dynamically learn HSTS hosts within the session from response Strict-Transport-Security headers (like a long-running browser)
-session = client.session(hsts=lkrequest.Hsts.dynamic())
+# Dynamically learn HSTS hosts from response Strict-Transport-Security headers (like a long-running browser)
+hsts = lkrequest.Hsts.dynamic()
+session = client.session(hsts=hsts)
+other = client.session(hsts=hsts)     # shares what `session` learns, as one browser profile does
+hsts.should_upgrade("example.com")    # what a session would decide now
 
 # Seed known HSTS hosts (e.g. replay state learned in a previous session)
 session = client.session(hsts=lkrequest.Hsts.dynamic(seed=["example.com"]))
 
 # Fixed allowlist; preloaded_tlds=True also upgrades Chrome's fully-preloaded gTLDs (.dev/.app/…)
 session = client.session(hsts=lkrequest.Hsts.static_(["example.com"], preloaded_tlds=True))
+
+# A policy of your own; record_sts(host, header) is optional
+session = client.session(hsts=lkrequest.Hsts.custom(lambda host: host.endswith(".internal")))
 ```
+
+The functions of `Hsts.custom()` run on the thread running the request, which waits for them: `should_upgrade` for each `http://` URL, and `record_sts` for each `Strict-Transport-Security` header received over HTTPS from a host that is not an IP address. They must be plain functions; one that raises is logged as a warning, and the URL is not upgraded.
 
 ### Request-level protocol override
 
@@ -708,6 +786,20 @@ resp = await session.get(
 ```
 
 `h3_header_order` can also be set on `Client(...)` and `session(...)` (same three levels as `header_order`).
+
+A policy has four axes — the intent, how a new connection is acquired, whether to upgrade to HTTP/3, and whether to fall back from it — each of which can be read and replaced on a copy:
+
+```python
+policy = (
+    lkrequest.ProtocolPolicy.chrome_conservative()
+    .with_acquisition(lkrequest.RacePolicy(tcp_delay=0.1))   # or AcquisitionPolicy.EstablishBestAvailable
+    .with_upgrade(lkrequest.UpgradePolicy.ProbeOnly)
+    .with_fallback(lkrequest.FallbackPolicy.NoFallback)
+)
+policy.acquisition, policy.upgrade, policy.fallback
+```
+
+A `RacePolicy` races TCP against QUIC; what it leaves out keeps `RacePolicy.chrome_like()`, which starts QUIC at once and TCP 0.3 s later, for an origin that has advertised HTTP/3. Axes that contradict one another — an H3-only intent that falls back, a race of neither TCP nor QUIC — raise `ValueError` from `policy.validate()`, and from the client, session or request the policy is given to, before anything is sent.
 
 ### Prometheus metrics
 
@@ -731,6 +823,8 @@ print(resp.diagnostics)
 #  'remote_addr': '93.184.216.34:443', 'protocol': 'h2', 'cipher_suite': '0x1301'}
 # dns_ms/tcp_ms/tls_ms are None on a reused connection (that phase did not occur)
 ```
+
+`diagnostics["trust_anchor"]` describes the [Trust Anchor Identifiers](#trust-anchor-identifiers) negotiation of the TLS connection a request opened, and is `None` on a reused one.
 
 `metrics_snapshot()` pulls process-level runtime counters for you to feed into your own Prometheus / OTel pipeline:
 
@@ -765,6 +859,58 @@ client = lkrequest.Client(verify=False)                      # disable verificat
 client = lkrequest.Client(use_native_certs=True)             # system certificates
 client = lkrequest.Client(ech_config=ech_bytes)              # ECH support
 ```
+
+### Trust Anchor Identifiers
+
+Chrome 152 and later tell the server which roots they accept, as IDs in the `trust_anchors` ClientHello extension (`0xca34`, draft-ietf-tls-trust-anchor-ids), so that it can pick a certificate chain ending in one of them. `Client.chrome_155()` to `Client.chrome_157()`, and so the default fingerprint, send their 28 IDs in one fixed, sorted order, as those Chrome versions do; the Chrome 152 to 154 presets shuffle them on every handshake. Three client options change what is sent and what happens next:
+
+```python
+root = open("private-root.der", "rb").read()
+client = lkrequest.Client(
+    tls_profile="chrome_157",
+    h2_profile="chrome_157",
+    ca_cert_der=root,
+    trust_anchor_advertisement="trusted",  # the sorted IDs of the roots this client trusts
+    trust_anchor_recovery="once",          # one more try with an ID the server names
+    trust_anchor_bindings={"81fd5901": lkrequest.trust_anchor_identity(root)},
+)
+```
+
+- `trust_anchor_advertisement`: `"profile"` (the default) sends the IDs the TLS profile lists, in its order; `"trusted"` sends the sorted IDs of the roots this client trusts instead: the bundled IDs of Chrome 157's root store for the roots that have one, plus `trust_anchor_bindings`.
+- `trust_anchor_recovery`: with `"once"`, when a server lists the IDs it can serve and then its certificate chain fails to verify, or it ends the handshake, the client opens one more connection asking for the first of those IDs it trusts. That happens at most once per request, sends no HTTP bytes on the rejected connection and turns 0-RTT off; it needs `verify` on and cannot be combined with `proxy_fallback_direct=True`. `"disabled"` is the default.
+- `trust_anchor_bindings`: `{id: anchor_identity}` for roots of your own, the ID in hex as your CA assigned it, bound to `lkrequest.trust_anchor_identity(root_der)`. The root still has to be loaded with `ca_cert*`.
+
+The IDs never change which certificates are trusted. Only the profiles that have the extension (Chrome 152–157) accept `"trusted"` or `"once"`, and TLS synthesis (`Randomize.recombine()` / `Randomize.full()`) refuses them; a setting upstream rejects raises `ValueError`. `diagnostics["trust_anchor"]` shows what a new connection requested, what the server offered, which root verified it and, after a recovery, the first attempt.
+
+### DNS
+
+```python
+client = lkrequest.Client(dns="cloudflare")         # or "google", "quad9", "cloudflare_https", ...
+client = lkrequest.Client(dns="192.168.1.1")        # a DNS server of your own, port 53
+client = lkrequest.Client(dns="[2606:4700::1111]:53")
+```
+
+`dns` defaults to `"system"`, the operating system's resolver. The named public resolvers are asked over UDP (and TCP for long answers), the `*_https` variants over DNS-over-HTTPS (the `doh` build feature). Any other value is the address of a DNS server, `"ip"` for port 53 or `"ip:port"`, an IPv6 address with a port in brackets. A DNS server, unlike the system resolver, also answers HTTPS records, which is how the client learns a site's ECH configuration and HTTP/3 support from DNS.
+
+`dns` may also be Python code that looks names up:
+
+```python
+def resolve(host: str, port: int) -> list[str]:
+    return ["192.0.2.10"]        # each an IP, or "ip:port" to dial another port
+
+client = lkrequest.Client(dns=resolve)
+
+class Resolver:                  # or an object, which may answer HTTPS records too
+    def resolve(self, host, port):
+        return ["192.0.2.10"]
+
+    def lookup_https(self, host):   # optional; None for no record
+        return {"alpn": ["h3", "h2"], "ech_config_list": ech_bytes}
+
+client = lkrequest.Client(dns=Resolver())
+```
+
+A record may hold `alpn`, `no_default_alpn`, `target`, `port`, `ech_config_list`, `ipv4_hints` and `ipv6_hints`. The code must be synchronous — an `async def` raises `TypeError` — and runs on a thread of the runtime's blocking pool, so a slow lookup holds up no other request. `dns_timeout` bounds each call and `ip_family` filters the answers. What `resolve` raises becomes the `__cause__` of the request's `ConnectionError`, so its traceback shows where it failed; a failing `lookup_https` is logged and counts as no record.
 
 ### Address family
 
@@ -855,7 +1001,10 @@ lkrequest.set_log_level("info")                          # global level
 lkrequest.set_log_level("lkrequest=debug,lktls=trace")   # module filter
 lkrequest.set_log_level("info", format="compact")        # log format
 lkrequest.set_log_level("off")                           # disable
+lkrequest.set_log_level("debug", format="logging")       # to Python's logging
 ```
+
+Only the first call in a process takes effect; later ones return `False`. `"compact"`, `"full"` and `"json"` write to stderr. `"logging"` hands every event that passes the level to Python's `logging`, on the logger `lkrequest.` followed by the event's Rust target (`lkrequest.lkrequest.session`, `lkrequest.lktls.handshake`), so configuring `logging.getLogger("lkrequest")` covers them all. The level given here decides what is passed on at all, so keep it as narrow as you need: the loggers' own levels and handlers only apply after that. The events are queued and passed on from a thread of their own, so a request never waits for the GIL to log; a queue that fills up drops events.
 
 ### Error handling
 
@@ -877,6 +1026,21 @@ except lkrequest.RequestError as e:
     print(f"request error: {e}")
 ```
 
+Every `RequestError` also says what the Rust library knows about the failure:
+
+```python
+except lkrequest.RequestError as e:
+    e.phase             # "tcp_connect", "proxy_tunnel", "tls_handshake", ... or None
+    e.retryable         # whether trying again could succeed
+    e.safe_to_replay    # whether the server cannot have processed it, so even a POST can be resent
+    e.status_code       # HttpStatusError: the status
+    e.proxy_error_kind  # ProxyError: "authentication_required", "tunnel_refused", ...
+    e.tls_alert         # TlsError: the alert the handshake ended in, e.g. "handshake_failure"
+    e.diagnostics       # the timings and transport so far, as Response.diagnostics gives them
+```
+
+An attribute that does not apply is `None` (`False` for the two flags), on an error built by hand as well. `diagnostics` comes with a failed request of the HTTP methods or `request()`, and with `error_for_status()`; not with a streamed request, a WebSocket or `preconnect()`.
+
 ## Available Browser Fingerprints
 
 | Method | TLS | HTTP/2 | TCP |
@@ -894,6 +1058,8 @@ except lkrequest.RequestError as e:
 | `Client.chrome_153()` | Chrome 153 | Chrome 153 | Chrome |
 | `Client.chrome_154()` | Chrome 154 | Chrome 154 | Chrome |
 | `Client.chrome_155()` | Chrome 155 | Chrome 155 | Chrome |
+| `Client.chrome_156()` | Chrome 156 | Chrome 156 | Chrome |
+| `Client.chrome_157()` | Chrome 157 | Chrome 157 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.firefox_156()` | Firefox 156 | Firefox 156 | Firefox |
@@ -919,9 +1085,10 @@ A preset sets the header **order**, not header values: a request from `Client.ch
 | `tls_profile` | TLS fingerprint (string name or `TlsProfile` object) |
 | `h2_profile` | HTTP/2 fingerprint (string name or `H2Profile` object) |
 | `tcp_fingerprint` | TCP fingerprint (string name or `TcpFingerprint` object) |
-| `default_headers` | Default request headers. A redirect that leaves the origin does not carry along a default `Authorization`, `Cookie` or `Host`, and one from https to http drops a default `Referer` |
+| `default_headers` | Default request headers, as a `dict` or a list of `(name, value)` pairs. They go on the wire in the order given wherever `header_order` does not place them. A redirect that leaves the origin does not carry along a default `Authorization`, `Cookie` or `Host`, and one from https to http drops a default `Referer` |
 | `header_order` | Header send order |
 | `cookie_order` | Cookie send order |
+| `http1_title_case_headers` | Spelling of HTTP/1.1 header names: `True` (the default) sends `Content-Type`, `False` sends `content-type` but keeps `Host` capitalized, including generated headers. The spelling a header was given in is not kept; HTTP/2 and HTTP/3 always send lowercase names |
 | `dns_timeout` / `tcp_connect_timeout` / `tls_handshake_timeout` / `ttfb_timeout` / `total_timeout` / `quic_connect_timeout` | Timeout control |
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | Resource limits / DoS protection |
 | `max_pending_h2_requests` | Cap HTTP/2 requests queued for a remote stream slot (default: unbounded) |
@@ -932,19 +1099,23 @@ A preset sets the header **order**, not header values: a request from `Client.ch
 | `tls_session_resumption_policy` / `tls_session_cache_partition_policy` | Whether TLS tickets are stored, and how the ticket cache is keyed |
 | `middleware` | Middleware list |
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | Certificate configuration |
+| `trust_anchor_advertisement` / `trust_anchor_recovery` / `trust_anchor_bindings` | [Trust Anchor Identifiers](#trust-anchor-identifiers): which IDs to send, one more try with an ID the server names, IDs for roots of your own |
 | `ech_config` | ECH configuration |
-| `dns` | Custom DNS |
+| `dns` | Where names are looked up: `"system"` (default), `"google"`, `"cloudflare"`, `"quad9"`, their `"*_https"` DoH variants, a DNS server as `"ip"` / `"ip:port"`, or Python code; see [DNS](#dns) |
 | `ip_family` | Restrict connections to one address family: `"any"` (default), `"ipv4"`, `"ipv6"` |
 | `connect_to` | Dial a fixed address for an origin, `{"host:port": "ip:port"}`; TLS, `Host` and cookies keep the original name |
 | `system_dns_cache_ttl` / `system_dns_cache_max_entries` | Cache successful OS-resolver lookups for `ttl` seconds (TTL `0` disables caching but keeps in-flight coalescing; cannot be combined with `dns`) |
-| `keylog` | TLS key log file path |
+| `keylog` | TLS secrets in the NSS key log format Wireshark reads: a file path to append them to, or a function called with each line on the thread doing the handshake |
 | `masque` | `MasqueConfig` for the hop to a `masque://` proxy (requires the `masque` feature) |
 
 | Method | Description |
 |------|------|
 | `session(...)` | Create a session (`network_partition_context=...` partitions the TLS ticket cache per site; `h3_retry_mode=...` selects HTTP/3 retries, see Features) |
 | `fingerprint_info()` | Return a fingerprint info dict |
-| `randomize_fingerprint(shuffle_extensions=True)` | Return a new Client with a randomized fingerprint |
+| `randomize_fingerprint(shuffle_extensions=True)` | Return a copy of the Client whose TLS profile shuffles its extensions per connection; every other option carries over |
+| `get(url, **kwargs)` / `post` / `put` / `delete` / `head` / `patch` / `options` | `session().get(url, **kwargs)` and so on: the request from a session made for the call and dropped after it, so no connection or cookie is kept from one call to the next. For more than one request, make a session |
+| `check_proxy(proxy, target_host="www.google.com", target_port=443, timeout=5.0)` | Set a tunnel up through a proxy and return the seconds it took; see [Proxy](#proxy) |
+| `tls_profile` / `h2_profile` / `tcp_fingerprint` / `default_headers` / `header_order` / `h3_header_order` / `cookie_order` / `timeouts` / `resource_limits` / `protocol_policy` / `verify` / `ip_family` / `h2_fallback_h1` / `proxy_fallback_direct` / `max_pending_h2_requests` / `ech_config` | Read-only: what the client was built with, a preset applied and the defaults included, mostly under the name of the argument that sets each. `timeouts` and `resource_limits` are dicts keyed by those names |
 
 ### Session
 
@@ -955,7 +1126,7 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `headers` | Request headers |
 | `params` | URL query params |
 | `json` / `data` / `body` / `multipart` | Request body |
-| `cookies` / `cookie_override` | Cookie control |
+| `cookies` / `cookie_override` | Cookies for this request, as a `dict` or a list of `(name, value)` pairs. They follow the session's own cookies in the order given, overrides last; `cookie_override` drops the session's cookies of the same name, and a name given twice in `cookies` is sent twice |
 | `timeout` | Request timeout (seconds) |
 | `bearer_auth` / `basic_auth` | Authentication |
 | `proxy` | Request-level proxy override |
@@ -964,7 +1135,7 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 
 | Method | Description |
 |------|------|
-| `send_streaming(method, url, ...)` | Streaming request |
+| `send_streaming(method, url, ...)` | Streaming request, with the same parameters as the HTTP methods |
 | `ws_connect(url, *, headers, protocols)` | WebSocket connection |
 | `preconnect(url)` / `preconnect_many(urls)` / `prefetch(urls)` | Connection prewarming |
 | `pool_stats()` / `pool_clear()` | Connection pool stats (`PoolStats`) / close all pooled connections, keeping the session usable |
@@ -992,7 +1163,7 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `cookies` | Response cookies |
 | `encoding` | Charset declared in `Content-Type` |
 | `elapsed` | Request duration (seconds) |
-| `diagnostics` | Per-phase timing dict: `dns_ms`/`tcp_ms`/`tls_ms`/`ttfb_ms`/`total_ms` + `remote_addr`/`protocol`/`cipher_suite` (None for phases not measured) |
+| `diagnostics` | Per-phase timing dict: `dns_ms`/`tcp_ms`/`tls_ms`/`ttfb_ms`/`total_ms` + `remote_addr`/`protocol`/`cipher_suite` (None for phases not measured) + `trust_anchor`, the trust-anchor negotiation of a connection the request opened |
 | `was_redirected` | Whether it went through a redirect |
 | `history` | Redirect chain (`list[RedirectRecord]`) |
 | `error_for_status()` | Raise `HttpStatusError` on 4xx/5xx |
@@ -1036,6 +1207,9 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `enable_metrics()` | Enable Prometheus metrics, returns a `MetricsCollector` |
 | `metrics_snapshot()` | Pull a process-level runtime counter dict (real values require the `telemetry` feature) |
 | `validate_fingerprint_consistency(...)` | Validate fingerprint-combination consistency |
+| `features()` | Which optional features this build has, as `{"quic-h3": True, ...}` by Cargo name; the PyPI wheels have them all |
+| `list_presets()` | The browser presets, each `{"name": "chrome_155", "browser": "chrome", "http3": True}`; a name is what `Client.<name>()`, `tls_profile=` and `h2_profile=` take |
+| `trust_anchor_identity(der)` | The identity of a DER root certificate, to bind a trust anchor ID to with `Client(trust_anchor_bindings=...)` |
 
 ### Exceptions
 
@@ -1050,6 +1224,8 @@ All HTTP methods (get/post/put/delete/head/patch/options) support:
 | `TooManyRedirectsError` | Too many redirects |
 | `ResourceLimitError` | Resource limit exceeded |
 | `JsonDecodeError` | `json()` got a body that is not JSON (also a `json.JSONDecodeError`) |
+
+All of them carry `phase`, `retryable`, `safe_to_replay`, `status_code`, `proxy_error_kind`, `tls_alert` and `diagnostics`; see [Error handling](#error-handling).
 
 ## Examples
 
@@ -1067,7 +1243,7 @@ The `examples/` directory contains complete examples for every feature:
 | `middleware.py` | Request/response interception, header injection, multi-layer onion model |
 | `retry_strategies.py` | ExponentialBackoff / FixedInterval / callable / lambda |
 | `event_hooks.py` | on_request/on_response callbacks |
-| `proxy_pool.py` | Single proxies, multi-hop chains, BadProxyConfig, HealthCheckConfig, ProxyPool |
+| `proxy_pool.py` | Single proxies, multi-hop chains, BadProxyConfig, HealthCheckConfig, ProxyPool, proxies from a function |
 | `session_pool.py` | SessionPool / BlockingSessionPool |
 | `client_pool.py` | ClientPool multi-fingerprint rotation |
 | `browser_fingerprints.py` | 6 preset fingerprints, string specification, fingerprint randomization |
@@ -1077,7 +1253,7 @@ The `examples/` directory contains complete examples for every feature:
 | `streaming_upload.py` | body_stream file-like / generator / async iterable, content_length |
 | `connection_prewarming.py` | preconnect / preconnect_many / prefetch |
 | `metrics.py` | enable_metrics / snapshot / prometheus_text |
-| `timeout_config.py` | Timeout configuration, ResourceLimits |
+| `timeout_config.py` | Client- and request-level timeouts, resource limits |
 | `accept_encoding.py` | AcceptEncoding control, no_decompress |
 | `certificate_config.py` | CA cert PEM/DER/file, verify, ECH |
 | `ip_family.py` | `ip_family=` address-family selection, offline and against a live dual-stack host |

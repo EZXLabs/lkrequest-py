@@ -15,6 +15,15 @@ from lkrequest.blocking import Client as BlockingClient
 # so requests in this module never depend on the public httpbin.org.
 BASE = "https://httpbin.org"
 
+# A `raw_http` reply for tests that only look at what was sent.
+RAW_OK = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+
+
+def boundary(request) -> bytes:
+    """The multipart boundary a request recorded by `raw_http` declared."""
+    [content_type] = request.values("content-type")
+    return content_type.partition("boundary=")[2].encode()
+
 
 @pytest.fixture(autouse=True)
 def _redirect_to_local_server(server_url):
@@ -1188,11 +1197,69 @@ class TestMultipartAdvanced:
         mp.text("description", "two files")
         assert repr(mp) == "<Multipart>"
 
-    def test_part_class(self):
-        part = lkrequest.Part("data", b"binary content")
-        part.filename("report.pdf")
-        part.content_type("application/pdf")
-        assert part is not None
+    def test_a_part_goes_out_with_its_filename_and_type(self, raw_http):
+        server = raw_http(lambda request: RAW_OK)
+        report = lkrequest.Part("report", b"%PDF-1.7\x00\xff")
+        report.filename("report.pdf")
+        report.content_type("application/pdf")
+        mp = lkrequest.Multipart()
+        mp.text("name", "test_file")
+        mp.part(report)
+        # What `text()` and `file()` cannot say: bytes without a filename.
+        mp.part(lkrequest.Part("raw", b"\x00\x01"))
+        BlockingClient().session().post(f"{server.url}/upload", multipart=mp)
+        [request] = server.requests
+        body = request.body
+        assert (
+            b'Content-Disposition: form-data; name="report"; filename="report.pdf"\r\n'
+            b"Content-Type: application/pdf\r\n\r\n%PDF-1.7\x00\xff\r\n"
+        ) in body
+        assert b'Content-Disposition: form-data; name="raw"\r\n\r\n\x00\x01\r\n' in body
+        assert body.index(b'name="name"') < body.index(b'name="report"')
+        assert body.index(b'name="report"') < body.index(b'name="raw"')
+
+    def test_a_part_can_go_into_several_forms(self, raw_http):
+        server = raw_http(lambda request: RAW_OK)
+        part = lkrequest.Part("data", b"shared")
+        session = BlockingClient().session()
+        for _ in range(2):
+            mp = lkrequest.Multipart()
+            mp.part(part)
+            session.post(f"{server.url}/upload", multipart=mp)
+        sent = [b'name="data"\r\n\r\nshared\r\n' in r.body for r in server.requests]
+        assert sent == [True, True]
+
+    def test_a_form_can_be_sent_again(self, raw_http):
+        server = raw_http(lambda request: RAW_OK)
+        mp = lkrequest.Multipart()
+        mp.text("field", "value")
+        mp.file("upload", "a.txt", "text/plain", b"file content")
+        mp.part(lkrequest.Part("raw", b"\x00\x01"))
+        session = BlockingClient().session()
+        for _ in range(2):
+            session.post(f"{server.url}/upload", multipart=mp)
+        first, second = server.requests
+        # Sending used to empty the form: the second body was the closing
+        # boundary alone.
+        assert second.body.replace(boundary(second), b"") == first.body.replace(
+            boundary(first), b""
+        )
+        assert b'name="field"\r\n\r\nvalue\r\n' in second.body
+        # Each submission gets a boundary of its own, as in a browser.
+        assert boundary(first) != boundary(second)
+
+    async def test_a_field_added_after_a_send_goes_out_next_time(self, raw_http):
+        server = raw_http(lambda request: RAW_OK)
+        mp = lkrequest.Multipart()
+        mp.text("first", "1")
+        session = lkrequest.Client().session()
+        await session.post(f"{server.url}/upload", multipart=mp)
+        mp.text("second", "2")
+        await session.post(f"{server.url}/upload", multipart=mp)
+        first, second = server.requests
+        assert b'name="second"' not in first.body
+        assert b'name="first"' in second.body
+        assert b'name="second"' in second.body
 
     def test_multipart_upload(self):
         client = BlockingClient(

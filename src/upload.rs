@@ -155,7 +155,7 @@ impl Stream for BlockingSource {
                 let source = Arc::clone(&this.source);
                 let kind = this.kind;
                 tokio::task::spawn_blocking(move || {
-                    Python::with_gil(|py| match kind {
+                    Python::attach(|py| match kind {
                         BlockingKind::Reader => pull_reader(py, &source),
                         BlockingKind::SyncIter => pull_sync_iter(py, &source),
                     })
@@ -213,7 +213,7 @@ fn pull_sync_iter(py: Python<'_>, iterator: &Py<PyAny>) -> PyResult<Option<Bytes
 // Asynchronous sources
 // ---------------------------------------------------------------------------
 
-type PendingChunk = Pin<Box<dyn Future<Output = PyResult<PyObject>> + Send>>;
+type PendingChunk = Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>;
 
 /// Pulls from a Python async iterator by awaiting `__anext__()` on the event
 /// loop that was running when the request was made.
@@ -250,7 +250,7 @@ impl Stream for AsyncSource {
         let mut pending = match this.pending.take() {
             Some(future) => future,
             None => {
-                let started = Python::with_gil(|py| {
+                let started = Python::attach(|py| {
                     let awaitable = this.iterator.bind(py).call_method0("__anext__")?;
                     pyo3_async_runtimes::into_future_with_locals(&this.locals, awaitable)
                 });
@@ -273,7 +273,7 @@ impl Stream for AsyncSource {
                 this.done = true;
                 Poll::Ready(end_or_error(error))
             }
-            Poll::Ready(Ok(item)) => match Python::with_gil(|py| extract_chunk(item.bind(py))) {
+            Poll::Ready(Ok(item)) => match Python::attach(|py| extract_chunk(item.bind(py))) {
                 Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
                 Err(error) => {
                     this.done = true;
@@ -286,7 +286,7 @@ impl Stream for AsyncSource {
 
 /// `StopAsyncIteration` ends the stream; anything else is a producer failure.
 fn end_or_error(error: PyErr) -> Option<io::Result<Bytes>> {
-    if Python::with_gil(|py| error.is_instance_of::<PyStopAsyncIteration>(py)) {
+    if Python::attach(|py| error.is_instance_of::<PyStopAsyncIteration>(py)) {
         None
     } else {
         Some(Err(producer_error(error)))
@@ -299,7 +299,7 @@ fn end_or_error(error: PyErr) -> Option<io::Result<Bytes>> {
 
 /// Convert one produced chunk into `Bytes`.
 fn extract_chunk(chunk: &Bound<'_, PyAny>) -> PyResult<Bytes> {
-    if let Ok(bytes) = chunk.downcast::<PyBytes>() {
+    if let Ok(bytes) = chunk.cast::<PyBytes>() {
         return Ok(Bytes::copy_from_slice(bytes.as_bytes()));
     }
     // A text-mode file or a str generator is by far the likeliest mistake, so

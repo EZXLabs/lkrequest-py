@@ -62,7 +62,9 @@ def main():
         print(f"\nmemoryview 长度: {len(mv)} bytes (零拷贝)")
     except TypeError:
         # abi3 wheels omit the raw buffer protocol; .content still works.
-        print(f"\nmemoryview: abi3 wheel 不支持, 用 resp.content ({len(resp.content)} bytes)")
+        print(
+            f"\nmemoryview: abi3 wheel 不支持, 用 resp.content ({len(resp.content)} bytes)"
+        )
 
     # --- Headers (HeaderMap) ---
     print("\n=== Headers (HeaderMap) ===")
@@ -80,7 +82,7 @@ def main():
     d = headers.to_dict()
     print(f"to_dict() 类型: {type(d).__name__}, 键数: {len(d)}")
 
-    print(f"\nitems() 示例:")
+    print("\nitems() 示例:")
     for k, v in headers.items()[:3]:
         print(f"  {k}: {v}")
 
@@ -93,7 +95,7 @@ def main():
 
     # --- 重定向历史 ---
     resp2 = session.get("https://httpbin.org/redirect/2")
-    print(f"\n=== 重定向历史 ===")
+    print("\n=== 重定向历史 ===")
     print(f"最终 URL   : {resp2.url}")
     print(f"was_redirected: {resp2.was_redirected}")
     print(f"history 长度: {len(resp2.history)}")
@@ -101,7 +103,7 @@ def main():
         print(f"  [{i}] {hop.status_code} {hop.url} → {hop.redirect_to}")
 
     # --- error_for_status ---
-    print(f"\n=== error_for_status ===")
+    print("\n=== error_for_status ===")
     resp_ok = session.get("https://httpbin.org/status/200")
     resp_ok.error_for_status()  # 不抛异常
     print("200: OK (no exception)")

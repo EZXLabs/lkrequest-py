@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 
 /// A fingerprint randomization policy. Build one with a named tier constructor
 /// and pass it to `Client(randomize=...)` / `BlockingClient(randomize=...)`.
-#[pyclass(name = "Randomize")]
+#[pyclass(name = "Randomize", from_py_object)]
 #[derive(Clone)]
 pub struct PyRandomize {
     pub(crate) inner: lkrequest::Randomize,
@@ -139,7 +139,7 @@ impl PyRandomize {
 /// (e.g. ``Layers.TLS | Layers.H2``). Only available when the extension is built
 /// with the ``synthetic-fp`` feature.
 #[cfg(feature = "synthetic-fp")]
-#[pyclass(name = "Layers", eq)]
+#[pyclass(name = "Layers", eq, from_py_object)]
 #[derive(Clone, Copy, PartialEq)]
 pub struct PyLayers {
     pub(crate) inner: lkrequest::Layers,
@@ -190,7 +190,7 @@ impl PyLayers {
 /// handshake. Pass to [`Randomize.negotiability`](PyRandomize::negotiability).
 /// Only available when the extension is built with the ``synthetic-fp`` feature.
 #[cfg(feature = "synthetic-fp")]
-#[pyclass(name = "NegotiabilityFloor", eq)]
+#[pyclass(name = "NegotiabilityFloor", eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyNegotiabilityFloor {
     pub(crate) inner: lkrequest::NegotiabilityFloor,

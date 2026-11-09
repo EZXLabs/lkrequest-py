@@ -12,7 +12,8 @@ enum RotationStrategy {
 }
 
 struct ClientPoolInner {
-    clients: Vec<lkrequest::Client>,
+    // Whole `PyClient`s, so one handed out can still `randomize_fingerprint()`.
+    clients: Vec<PyClient>,
     index: usize,
     strategy: RotationStrategy,
 }
@@ -44,7 +45,7 @@ impl PyClientPool {
         };
         Ok(PyClientPool {
             inner: Arc::new(Mutex::new(ClientPoolInner {
-                clients: clients.into_iter().map(|c| c.inner).collect(),
+                clients,
                 index: 0,
                 strategy,
             })),
@@ -74,7 +75,7 @@ impl PyClientPool {
             total = pool.clients.len(),
             "client_pool.acquire"
         );
-        Ok(PyClient { inner: client })
+        Ok(client)
     }
 
     fn add(&self, client: PyClient) -> PyResult<()> {
@@ -82,7 +83,7 @@ impl PyClientPool {
             .inner
             .lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock poisoned"))?;
-        pool.clients.push(client.inner);
+        pool.clients.push(client);
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 """Type stubs for the lkrequest native extension module."""
 
 import json
+import os
 from typing import (
     Any,
     AsyncIterable,
@@ -17,12 +18,53 @@ class _SupportsRead(Protocol):
 
     def read(self, size: int = ..., /) -> bytes: ...
 
+class _DnsResolver(Protocol):
+    """An object ``dns=`` takes; it may also have ``lookup_https(host)``."""
+
+    def resolve(self, host: str, port: int, /) -> list[str]: ...
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
 
 class RequestError(Exception):
-    """Base class for all lkrequest errors."""
+    """Base class for all lkrequest errors.
+
+    A raised error also says what the Rust library knows about the failure; an
+    error built by hand, or one an attribute does not apply to, has its
+    default (``None``, or ``False`` for the two flags):
+
+    - ``phase``: where the connection failed — ``"dns_resolution"``,
+      ``"tcp_connect"``, ``"proxy_tunnel"``, ``"tls_handshake"``,
+      ``"h2_negotiation"``, ``"h2c_upgrade"``, ``"quic_handshake"``,
+      ``"h3_negotiation"``, ``"quic_fallback"`` or ``"http_request"``.
+    - ``retryable``: whether trying again could succeed — a timeout, a network,
+      proxy or TLS failure, a 5xx status — as opposed to a 4xx, a malformed
+      URL or a body over its limit.
+    - ``safe_to_replay``: whether the server cannot have processed the request,
+      because it failed before being sent or the server refused its stream, so
+      that sending it again cannot repeat a side effect, even for a POST.
+    - ``status_code``: the status of an ``HttpStatusError``.
+    - ``proxy_error_kind``: for a ``ProxyError``, ``"tcp_connect_failed"``,
+      ``"authentication_required"``, ``"authentication_failed"``,
+      ``"tunnel_refused"``, ``"socks5_error"``, ``"protocol_error"`` or
+      ``"io_error"``.
+    - ``tls_alert``: for a ``TlsError`` that ended in a TLS alert, its name,
+      such as ``"handshake_failure"``; the message says whether the server
+      sent it or the client did.
+    - ``diagnostics``: for a request that failed, its timings and transport so
+      far, in the form of ``Response.diagnostics``; for ``error_for_status()``,
+      the response's own. ``None`` for a streamed request, a WebSocket and
+      ``preconnect()``.
+    """
+
+    phase: Optional[str]
+    retryable: bool
+    safe_to_replay: bool
+    status_code: Optional[int]
+    proxy_error_kind: Optional[str]
+    tls_alert: Optional[str]
+    diagnostics: Optional[dict[str, Any]]
 
 class TlsError(RequestError):
     """Raised when the TLS handshake fails."""
@@ -65,31 +107,6 @@ class HttpVersion:
     H2: int
     Unknown: int
     H3: int
-
-class TimeoutConfig:
-    """Per-phase timeout settings (DNS, TCP connect, TLS handshake, TTFB, total) in seconds."""
-
-    def __init__(
-        self,
-        *,
-        dns: Optional[float] = None,
-        tcp_connect: Optional[float] = None,
-        tls_handshake: Optional[float] = None,
-        ttfb: Optional[float] = None,
-        total: Optional[float] = None,
-    ) -> None: ...
-
-class ResourceLimits:
-    """Resource caps such as max response body size, connections per session, and transfer rate."""
-
-    def __init__(
-        self,
-        *,
-        max_response_body_size: Optional[int] = None,
-        max_connections_per_session: Optional[int] = None,
-        min_transfer_rate: Optional[int] = None,
-        transfer_rate_window: Optional[float] = None,
-    ) -> None: ...
 
 class SessionResumptionConfig:
     """Controls TLS session resumption: TLS 1.3 PSK and TLS 1.2 session tickets."""
@@ -204,16 +221,25 @@ class SessionPoolStats:
 # ---------------------------------------------------------------------------
 
 class Multipart:
-    """Builder for ``multipart/form-data`` request bodies (text and file parts)."""
+    """Builder for ``multipart/form-data`` request bodies (text and file parts).
+
+    A form can be sent any number of times: each request encodes its fields
+    afresh, with a boundary of its own, and a field added after a request goes
+    out with the next one.
+    """
 
     def __init__(self) -> None: ...
     def text(self, name: str, value: str) -> None:
         """Add a text field."""
     def file(self, name: str, filename: str, content_type: str, data: bytes) -> None:
         """Add a file part with the given filename, content type, and bytes."""
+    def part(self, part: Part) -> None:
+        """Add a ``Part`` as it is now, for what ``text()`` and ``file()`` cannot
+        say, such as binary data without a filename. The same ``Part`` can be
+        added to any number of forms."""
 
 class Part:
-    """A single multipart part with fine-grained filename/content-type control."""
+    """A single multipart part with fine-grained filename/content-type control; add it with ``Multipart.part()``."""
 
     def __init__(self, name: str, body: bytes) -> None: ...
     def filename(self, filename: str) -> None:
@@ -281,7 +307,16 @@ class HttpIntent:
     ReuseExistingProtocol: HttpIntent
 
 class ProtocolPolicy:
-    """Policy controlling HTTP/2 vs HTTP/3 selection, acquisition, and fallback."""
+    """Policy controlling HTTP/2 vs HTTP/3 selection, acquisition, and fallback.
+
+    Four axes: the ``intent``, how a new connection is acquired, whether to
+    upgrade to HTTP/3, and whether to fall back from it. Start from a preset
+    and change one axis at a time with the ``with_*`` methods, each of which
+    returns a copy. A combination whose axes contradict one another (an
+    H3-only intent that falls back to TCP, a race of neither TCP nor QUIC)
+    raises ``ValueError`` from ``validate()``, and from the session or client
+    it is given to.
+    """
 
     @staticmethod
     def chrome_standard() -> ProtocolPolicy:
@@ -297,8 +332,94 @@ class ProtocolPolicy:
         """Policy requiring HTTP/3."""
     def with_intent(self, intent: HttpIntent) -> ProtocolPolicy:
         """Return a copy of this policy with the given protocol intent."""
+    def with_acquisition(
+        self, acquisition: AcquisitionPolicy | RacePolicy
+    ) -> ProtocolPolicy:
+        """Return a copy acquiring connections as ``acquisition`` says; a ``RacePolicy`` races TCP against QUIC."""
+    def with_upgrade(self, upgrade: UpgradePolicy) -> ProtocolPolicy:
+        """Return a copy with the upgrade policy replaced."""
+    def with_fallback(self, fallback: FallbackPolicy) -> ProtocolPolicy:
+        """Return a copy with the fallback policy replaced."""
+    def validate(self) -> None:
+        """Raise ``ValueError`` if the axes contradict one another."""
     @property
     def intent(self) -> HttpIntent: ...
+    @property
+    def acquisition(self) -> AcquisitionPolicy | RacePolicy:
+        """An ``AcquisitionPolicy``, or the ``RacePolicy`` of a TCP/QUIC race."""
+    @property
+    def upgrade(self) -> UpgradePolicy: ...
+    @property
+    def fallback(self) -> FallbackPolicy: ...
+
+class AcquisitionPolicy:
+    """How a request acquires a transport when no pooled connection is selected.
+
+    ``ReuseExistingFirst`` reuses a healthy connection first and opens no new
+    HTTP/3 path just to upgrade; ``EstablishBestAvailable`` establishes the
+    best protocol currently known. The third way, racing TCP against QUIC, is
+    a ``RacePolicy``.
+    """
+
+    ReuseExistingFirst: AcquisitionPolicy
+    EstablishBestAvailable: AcquisitionPolicy
+
+class RacePolicy:
+    """The timing of a TCP-versus-QUIC race, for ``ProtocolPolicy.with_acquisition()``.
+
+    Every value left out keeps that of ``RacePolicy.chrome_like()``: both
+    attempts enabled, QUIC at once, TCP 0.3 s later, and only for an origin
+    that has advertised HTTP/3. Delays are in seconds; one that is negative or
+    not finite raises ``ValueError``.
+    """
+
+    def __init__(
+        self,
+        *,
+        enable_tcp: Optional[bool] = None,
+        enable_quic: Optional[bool] = None,
+        tcp_delay: Optional[float] = None,
+        quic_delay: Optional[float] = None,
+        only_when_h3_advertised: Optional[bool] = None,
+    ) -> None: ...
+    @staticmethod
+    def chrome_like() -> RacePolicy:
+        """Chrome's race timing."""
+    @property
+    def enable_tcp(self) -> bool: ...
+    @property
+    def enable_quic(self) -> bool: ...
+    @property
+    def tcp_delay(self) -> float: ...
+    @property
+    def quic_delay(self) -> float: ...
+    @property
+    def only_when_h3_advertised(self) -> bool: ...
+
+class UpgradePolicy:
+    """How a session upgrades from TCP-based HTTP to HTTP/3 once an origin may support it.
+
+    ``Off`` never upgrades; ``ProbeOnly`` probes for HTTP/3 in the background
+    but keeps requests on TCP; ``ProbeAndMigrate`` moves new requests over
+    once HTTP/3 has proved healthy; ``ForceForNewRequests`` puts new requests
+    on HTTP/3 as soon as the origin is known to support it.
+    """
+
+    Off: UpgradePolicy
+    ProbeOnly: UpgradePolicy
+    ProbeAndMigrate: UpgradePolicy
+    ForceForNewRequests: UpgradePolicy
+
+class FallbackPolicy:
+    """Whether a failure over QUIC/HTTP3 may fall back to TCP-based HTTP.
+
+    ``AllowFallbackOnNetworkErrors`` falls back on network failures only, not
+    on protocol errors; ``NoFallback`` raises the failure.
+    """
+
+    AllowFallback: FallbackPolicy
+    AllowFallbackOnNetworkErrors: FallbackPolicy
+    NoFallback: FallbackPolicy
 
 class PreferredHttpVersion:
     """Per-request HTTP version preference passed via ``preferred_http_version=``."""
@@ -317,11 +438,62 @@ class Idempotency:
     NotIdempotent: Idempotency
 
 class BrokenQuicPolicy:
-    """Policy for handling broken QUIC/HTTP3 connections (strict, resilient, or disabled)."""
+    """How long a session keeps an origin whose QUIC/HTTP3 connection failed on TCP.
+
+    ``Strict``, the default, keeps it there 5 minutes after the first failure,
+    up to an hour after repeated ones. ``Resilient`` keeps it 1 second, up to 10,
+    for a transparent proxy or a UDP relay whose failures pass quickly.
+    ``Disabled`` never keeps it there, so every request tries HTTP/3 again. For
+    other cooldowns, pass a ``BrokenQuicConfig`` instead.
+    """
 
     Strict: BrokenQuicPolicy
     Resilient: BrokenQuicPolicy
     Disabled: BrokenQuicPolicy
+
+class BrokenQuicConfig:
+    """Cooldowns for origins whose QUIC/HTTP3 connection failed, for when none of
+    the ``BrokenQuicPolicy`` presets fits; pass it as ``broken_quic_policy=``.
+
+    Durations are in seconds, and each value left out keeps that of
+    ``BrokenQuicPolicy.Strict``. To never keep an origin on TCP, use
+    ``BrokenQuicPolicy.Disabled``.
+
+    ``initial_cooldown`` (300) is how long an origin stays on TCP after its
+    first failure. The cooldown grows evenly with each failure in a row, up to
+    ``max_cooldown`` (3600) at ``failure_escalation_threshold`` (4) failures.
+    ``route_cooldown`` (1800) is how long a whole proxy route that cannot carry
+    QUIC, such as a SOCKS5 proxy that refuses UDP, stays on TCP.
+    ``max_entries`` (1024) and ``max_route_entries`` (256) cap how many origins
+    and routes are remembered; past the cap, the one that failed longest ago is
+    forgotten.
+
+    Raises ``ValueError`` for a duration that is negative, NaN or infinite, for
+    an ``initial_cooldown`` above ``max_cooldown`` and for a count of zero.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial_cooldown: Optional[float] = None,
+        max_cooldown: Optional[float] = None,
+        failure_escalation_threshold: Optional[int] = None,
+        route_cooldown: Optional[float] = None,
+        max_entries: Optional[int] = None,
+        max_route_entries: Optional[int] = None,
+    ) -> None: ...
+    @property
+    def initial_cooldown(self) -> float: ...
+    @property
+    def max_cooldown(self) -> float: ...
+    @property
+    def failure_escalation_threshold(self) -> int: ...
+    @property
+    def route_cooldown(self) -> float: ...
+    @property
+    def max_entries(self) -> int: ...
+    @property
+    def max_route_entries(self) -> int: ...
 
 class H3RetryMode:
     """Whether a session replays a request after selected HTTP/3 protocol errors.
@@ -351,6 +523,11 @@ class Hsts:
     upgrades (equivalent to :meth:`none`). Plug a policy in to mirror Chrome's
     preloaded gTLDs, replay a session that already learned HSTS, or enforce your
     own rules. Host matching is suffix-aware (HSTS ``includeSubDomains``).
+
+    An ``Hsts`` object holds one policy, shared by every session it is given
+    to: what a dynamic one learns in one session applies in all of them, as in
+    one browser profile. Give each session an object of its own to keep what
+    they learn apart.
     """
 
     @staticmethod
@@ -363,8 +540,28 @@ class Hsts:
         ``.app``, …)."""
     @staticmethod
     def dynamic(seed: list[str] | None = None) -> Hsts:
-        """Learn HSTS hosts from ``Strict-Transport-Security`` response headers
-        during the session, optionally pre-seeded with known HSTS hosts."""
+        """Learn HSTS hosts from ``Strict-Transport-Security`` response headers,
+        for every session given this object, optionally pre-seeded with known
+        HSTS hosts."""
+    @staticmethod
+    def custom(
+        should_upgrade: Callable[[str], bool],
+        record_sts: Optional[Callable[[str, str], None]] = None,
+    ) -> Hsts:
+        """A policy written in Python.
+
+        ``should_upgrade(host)`` says whether an ``http://`` URL to ``host``, a
+        redirect's included, is upgraded; its answer is taken for its truth.
+        ``record_sts(host, header)``, if given, is told the value of each
+        ``Strict-Transport-Security`` header received over HTTPS from a host
+        that is not an IP address. Both are called on the thread running the
+        request, which waits for them, and must be plain functions; an
+        ``async def`` raises ``TypeError``. One that raises is logged as a
+        warning, and the URL is not upgraded.
+        """
+    def should_upgrade(self, host: str) -> bool:
+        """Whether a request to ``host`` would be upgraded now, as a session
+        would ask the policy: for a dynamic one, after what it has learned."""
 
 # ---------------------------------------------------------------------------
 # Fingerprint randomization
@@ -468,6 +665,22 @@ class QuicProfile:
         inherited.
         """
     @staticmethod
+    def chrome_156() -> QuicProfile:
+        """Chrome 156 QUIC fingerprint preset, identical to Chrome 155.
+
+        The capture confirmed its transport values, H3 SETTINGS and priority
+        updates; timing, loss and resumption behaviour carry over from Chrome 155
+        without being observed again.
+        """
+    @staticmethod
+    def chrome_157() -> QuicProfile:
+        """Chrome 157 QUIC fingerprint preset, identical to Chrome 156.
+
+        The capture confirmed its transport values, H3 SETTINGS and
+        navigation/favicon priority; timing, loss and resumption behaviour carry
+        over from Chrome 156 without being observed again.
+        """
+    @staticmethod
     def from_json(json_str: str) -> QuicProfile:
         """Build a QuicProfile from a JSON string."""
     def to_json(self) -> str:
@@ -492,8 +705,11 @@ class MasqueConfig:
 
     Trust is configured here separately from the client's ``verify`` /
     ``ca_cert*`` options, and neither inherits from the other. ``ca_cert`` is a
-    PEM file path and ``ca_cert_pem`` PEM bytes; a bundle that is malformed or
-    holds no certificate raises ``ValueError``. ``verify=False`` skips outer
+    PEM file path, ``ca_cert_pem`` PEM bytes and ``ca_cert_der`` one DER
+    certificate; a bundle that is malformed or holds no certificate, and DER
+    bytes that are not a usable certificate, raise ``ValueError``. Given more
+    than one, the proxy may present a certificate from any of them.
+    ``verify=False`` skips outer
     certificate verification entirely and is for development only: anything
     answering on the proxy's address then sees every tunnel's target.
 
@@ -511,6 +727,7 @@ class MasqueConfig:
         server_name: Optional[str] = None,
         ca_cert: Optional[str] = None,
         ca_cert_pem: Optional[bytes] = None,
+        ca_cert_der: Optional[bytes] = None,
         use_native_certs: bool = True,
         verify: bool = True,
         tunnel_idle_timeout: Optional[float] = 120.0,
@@ -524,7 +741,7 @@ class MasqueConfig:
     def verify(self) -> bool: ...
     @property
     def ca_cert_count(self) -> int:
-        """Number of extra trust anchors loaded from ``ca_cert`` / ``ca_cert_pem``."""
+        """Number of extra trust anchors loaded from ``ca_cert`` / ``ca_cert_pem`` / ``ca_cert_der``."""
     @property
     def tunnel_idle_timeout(self) -> Optional[float]: ...
     @property
@@ -585,6 +802,29 @@ class ProxyConfig:
         credential already set. Raises ``ValueError`` on a SOCKS5 proxy, which
         has no header to carry it in.
         """
+    def with_custom_auth(
+        self, identity: str, authorize: Callable[[], Optional[str]]
+    ) -> ProxyConfig:
+        """Return a new config whose credential ``authorize()`` works out for each
+        connection through this hop, such as a short-lived token.
+
+        ``authorize`` takes no arguments and returns the header's value, such
+        as ``"Bearer <token>"``, or ``None`` to send no credential. It is called
+        on the thread setting the connection up, which waits for it, and more
+        than once for a connection the proxy challenges with a 407, not every
+        answer being sent. It must be a plain function; an ``async def`` raises
+        ``TypeError``. If it raises or returns something other than a string,
+        the connection goes without a credential and a warning is logged, so
+        the request fails with what the proxy answers.
+
+        ``identity`` is a stable string, not a secret, that tells this
+        credential apart from others on the same proxy address. It becomes
+        part of ``identity()``, which pools track failures by, so that one
+        failing credential does not cool down another.
+
+        Replaces any credential already set. Raises ``ValueError`` on a SOCKS5
+        proxy, which has no header to carry it in.
+        """
     def with_auth_header(self, header: str) -> ProxyConfig:
         """Return a new config that sends the credential in ``header``.
 
@@ -595,6 +835,20 @@ class ProxyConfig:
         """
     def hop_count(self) -> int:
         """Return the total number of proxy hops."""
+    @property
+    def host(self) -> str:
+        """Host of the proxy the client talks to last: the only one, or a chain's
+        final hop, which connects to the target. An IPv6 address is in
+        brackets, as in the URL."""
+    @property
+    def port(self) -> int:
+        """Port of the proxy the client talks to last, the scheme's own when the
+        URL gives none."""
+    @property
+    def forbids_direct_fallback(self) -> bool:
+        """Whether a failed tunnel never falls back to a direct connection, even
+        with ``proxy_fallback_direct``: true when a MASQUE hop is involved, as
+        falling back would reveal the address it hides."""
     def identity(self) -> str:
         """Return the stable identity used for pooling and failure tracking."""
     def __str__(self) -> str: ...
@@ -633,27 +887,122 @@ class HealthCheckConfig:
         """
 
 class ProxyPool:
-    """Pool of proxies with rotation, bad-proxy cooldown, and optional health checks."""
+    """Pool of proxies with rotation, bad-proxy cooldown, and optional health checks.
+
+    ``proxies`` is a list of proxies, or a function called with no arguments
+    for every proxy the pool hands out, returning a URL or a ``ProxyConfig``:
+    the way to use a gateway that picks the exit by a session id in the
+    username, with a new id each time. Every proxy from a function is a new
+    one, so ``rotation``, ``bad_proxy_config`` and ``health_check`` do not
+    apply to them: they are neither cooled down nor checked. The function must
+    be a plain one (an ``async def`` raises ``TypeError``) and should be quick:
+    the async pools call it on a worker thread of the runtime, which waits for
+    it. ``proxy_buffer`` has that many proxies made ahead of time, on a thread
+    of their own.
+
+    ``max_proxies`` (default 100) caps how many leases can be out at once; a
+    further ``acquire()`` waits until one is released.
+    """
 
     def __init__(
         self,
-        proxies: Iterable[str | ProxyConfig],
+        proxies: Iterable[str | ProxyConfig] | Callable[[], str | ProxyConfig],
         *,
         max_proxies: Optional[int] = None,
         rotation: Optional[str] = None,
         bad_proxy_config: Optional[BadProxyConfig] = None,
         health_check: Optional[HealthCheckConfig] = None,
-    ) -> None: ...
-    async def acquire(self) -> str:
-        """Acquire the next available proxy according to the rotation policy.
+        proxy_buffer: Optional[int] = None,
+    ) -> None:
+        """``proxy_buffer`` applies only when ``proxies`` is a function
+        (``ValueError`` otherwise); 0 makes none ahead of time."""
+    async def acquire(self) -> ProxyLease:
+        """Lease the next available proxy according to the rotation policy.
+
+        Pass ``lease.proxy`` to ``session(proxy=...)``, and release the lease
+        when done with it: ``release()``, or a ``with`` / ``async with`` block.
 
         A pool that has proxies never answers with "no proxy" (which a caller
         would take for a direct connection): while every proxy is cooling down
         this waits for one to recover, so bound it with ``asyncio.wait_for`` if
-        needed. Only a pool created with an empty list returns ``""``.
+        needed. Only a pool created with an empty list hands out a lease whose
+        ``proxy`` is ``None``.
+
+        When ``proxies`` is a function, this raises what the function raised
+        when it called it: its own exception, ``ValueError`` for a URL that
+        does not parse, or ``TypeError`` for anything but a URL or a
+        ``ProxyConfig``. A failure while making proxies ahead of time is only
+        logged, and the function is called again a second later.
+        """
+    async def acquire_fresh(self, lease: ProxyLease) -> ProxyLease:
+        """Record a failure of ``lease``'s proxy, release ``lease`` and lease another proxy.
+
+        Releasing first means a pool whose ``max_proxies`` are all taken does
+        not wait on the share the old lease held.
         """
     def mark_bad(self, identity: str) -> None:
-        """Mark a proxy as failing so it is cooled down."""
+        """Mark the proxy whose ``ProxyConfig.identity()`` this is as failing, so it is cooled down."""
+    @property
+    def max_concurrent(self) -> int:
+        """How many leases can be out at once (``max_proxies``)."""
+
+class BlockingProxyPool:
+    """Synchronous ``ProxyPool``, exported as ``lkrequest.blocking.ProxyPool``.
+
+    It takes the same arguments, and hands out the same ``ProxyLease``: release
+    it with ``release()`` or a ``with`` block.
+    """
+
+    def __init__(
+        self,
+        proxies: Iterable[str | ProxyConfig] | Callable[[], str | ProxyConfig],
+        *,
+        max_proxies: Optional[int] = None,
+        rotation: Optional[str] = None,
+        bad_proxy_config: Optional[BadProxyConfig] = None,
+        health_check: Optional[HealthCheckConfig] = None,
+        proxy_buffer: Optional[int] = None,
+    ) -> None: ...
+    def acquire(self) -> ProxyLease:
+        """As ``ProxyPool.acquire()``, blocking until a proxy is leased."""
+    def acquire_fresh(self, lease: ProxyLease) -> ProxyLease:
+        """As ``ProxyPool.acquire_fresh()``, blocking until a proxy is leased."""
+    def mark_bad(self, identity: str) -> None:
+        """Mark the proxy whose ``ProxyConfig.identity()`` this is as failing, so it is cooled down."""
+    @property
+    def max_concurrent(self) -> int:
+        """How many leases can be out at once (``max_proxies``)."""
+
+class ProxyLease:
+    """A proxy leased from a ``ProxyPool`` or ``BlockingProxyPool``, holding one of the pool's ``max_proxies`` shares.
+
+    The share goes back to the pool on ``release()``, at the end of a ``with``
+    or ``async with`` block, or when the lease is garbage collected.
+    """
+
+    @property
+    def proxy(self) -> Optional[ProxyConfig]:
+        """The proxy, credentials included, to pass to ``session(proxy=...)``.
+
+        ``None`` only from a pool created with an empty list, which means a
+        direct connection.
+        """
+    @property
+    def released(self) -> bool:
+        """Whether the share has gone back to the pool."""
+    def mark_bad(self) -> None:
+        """Record a failure of this proxy, as ``ProxyPool.mark_bad()`` does; also works after release."""
+    def release(self) -> None:
+        """Give the share back to the pool. Releasing twice is harmless."""
+    def __enter__(self) -> ProxyLease: ...
+    def __exit__(
+        self,
+        exc_type: Optional[type] = None,
+        exc_val: Optional[BaseException] = None,
+        exc_tb: Optional[Any] = None,
+    ) -> bool: ...
+    async def __aenter__(self) -> ProxyLease: ...
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool: ...
 
 # ---------------------------------------------------------------------------
 # Response
@@ -765,7 +1114,18 @@ class Response:
         """The chain of redirects that led to this response."""
     @property
     def diagnostics(self) -> dict[str, Any]:
-        """Per-phase timings (dns/tcp/tls/ttfb/total ms) plus remote_addr/protocol/cipher_suite."""
+        """Per-phase timings (dns/tcp/tls/ttfb/total ms) plus remote_addr/protocol/cipher_suite.
+
+        ``trust_anchor`` is the Trust Anchor Identifiers negotiation of the TLS
+        connection the request opened, ``None`` if it opened none, as on a
+        pooled connection: a dict of ``requested_ids`` and ``available_ids``
+        (hex; the server's are unverified until ``authenticated``),
+        ``matched_request``, ``verified_anchor`` (the
+        :func:`trust_anchor_identity` of the root that verified the chain),
+        ``authenticated``, ``ech_rejected``, ``recovered``, ``failure``,
+        ``recovery_eligible`` and, after a recovery, the first attempt as
+        ``previous_attempt``.
+        """
     @property
     def content(self) -> bytes:
         """The raw response body bytes."""
@@ -907,6 +1267,18 @@ class WsMessage:
 class WsConnection:
     """An open async WebSocket connection; iterate it to receive messages."""
 
+    @property
+    def url(self) -> str:
+        """The URL the connection was opened to; still there once it is closed."""
+    async def ping(self, data: bytes = b"") -> None:
+        """Send a ping; the peer answers with a pong carrying the same ``data``, which ``recv()`` returns.
+
+        A ping or pong carries at most 125 bytes (``ValueError`` beyond that,
+        before anything is sent). Pings from the peer are answered
+        automatically, and ``recv()`` returns them too.
+        """
+    async def pong(self, data: bytes = b"") -> None:
+        """Send a pong the peer did not ask for, as a heartbeat it need not answer."""
     async def send_text(self, text: str) -> None:
         """Send a text message."""
     async def send_binary(self, data: bytes) -> None:
@@ -921,6 +1293,13 @@ class WsConnection:
 class BlockingWsConnection:
     """An open synchronous WebSocket connection; iterate it to receive messages."""
 
+    @property
+    def url(self) -> str:
+        """As ``WsConnection.url``."""
+    def ping(self, data: bytes = b"") -> None:
+        """As ``WsConnection.ping()``."""
+    def pong(self, data: bytes = b"") -> None:
+        """As ``WsConnection.pong()``."""
     def send_text(self, text: str) -> None:
         """Send a text message."""
     def send_binary(self, data: bytes) -> None:
@@ -945,8 +1324,8 @@ class Session:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         params: Optional[dict[str, str] | list[tuple[str, str]]] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -978,8 +1357,8 @@ class Session:
             _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
         ] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1012,8 +1391,8 @@ class Session:
             _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
         ] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1045,8 +1424,8 @@ class Session:
             _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
         ] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1077,8 +1456,8 @@ class Session:
             _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
         ] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1102,12 +1481,18 @@ class Session:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         params: Optional[dict[str, str] | list[tuple[str, str]]] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
         proxy: Optional[str] = None,
+        no_decompress: bool = False,
+        accept_encoding: Optional[AcceptEncoding] = None,
+        priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
+        preferred_http_version: Optional[PreferredHttpVersion] = None,
+        idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -1129,8 +1514,8 @@ class Session:
             _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
         ] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1154,12 +1539,18 @@ class Session:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         params: Optional[dict[str, str] | list[tuple[str, str]]] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
         proxy: Optional[str] = None,
+        no_decompress: bool = False,
+        accept_encoding: Optional[AcceptEncoding] = None,
+        priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
+        preferred_http_version: Optional[PreferredHttpVersion] = None,
+        idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -1177,8 +1568,17 @@ class Session:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         protocols: Optional[list[str]] = None,
+        extensions: Optional[list[str]] = None,
     ) -> WsConnection:
-        """Open a WebSocket connection (preserving the session's fingerprint)."""
+        """Open a WebSocket connection (preserving the session's fingerprint).
+
+        ``extensions`` are offered, in the order given, in the upgrade's
+        ``Sec-WebSocket-Extensions`` header, which is part of what a browser's
+        handshake looks like. The frames themselves are always read and written
+        plain, so only an extension that leaves them alone can be used: once a
+        server accepts ``permessage-deflate``, the compression Chrome offers,
+        every compressed message it sends fails to be received.
+        """
     def set_cookie(self, url: str, name: str, value: str) -> None:
         """Set a cookie for the given URL in the session's cookie jar."""
     def set_cookie_with_attrs(
@@ -1258,13 +1658,18 @@ class Session:
             _SupportsRead | Iterable[bytes] | AsyncIterable[bytes]
         ] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
         proxy: Optional[str] = None,
+        no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
+        priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
+        preferred_http_version: Optional[PreferredHttpVersion] = None,
+        idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -1302,8 +1707,8 @@ class BlockingSession:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         params: Optional[dict[str, str] | list[tuple[str, str]]] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1333,8 +1738,8 @@ class BlockingSession:
         multipart: Optional[Multipart] = None,
         body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1365,8 +1770,8 @@ class BlockingSession:
         multipart: Optional[Multipart] = None,
         body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1396,8 +1801,8 @@ class BlockingSession:
         multipart: Optional[Multipart] = None,
         body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1426,8 +1831,8 @@ class BlockingSession:
         body: Optional[bytes] = None,
         body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1451,12 +1856,18 @@ class BlockingSession:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         params: Optional[dict[str, str] | list[tuple[str, str]]] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
         proxy: Optional[str] = None,
+        no_decompress: bool = False,
+        accept_encoding: Optional[AcceptEncoding] = None,
+        priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
+        preferred_http_version: Optional[PreferredHttpVersion] = None,
+        idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -1476,8 +1887,8 @@ class BlockingSession:
         multipart: Optional[Multipart] = None,
         body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
@@ -1501,12 +1912,18 @@ class BlockingSession:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         params: Optional[dict[str, str] | list[tuple[str, str]]] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
         proxy: Optional[str] = None,
+        no_decompress: bool = False,
+        accept_encoding: Optional[AcceptEncoding] = None,
+        priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
+        preferred_http_version: Optional[PreferredHttpVersion] = None,
+        idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -1524,8 +1941,9 @@ class BlockingSession:
         *,
         headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         protocols: Optional[list[str]] = None,
+        extensions: Optional[list[str]] = None,
     ) -> BlockingWsConnection:
-        """Open a WebSocket connection (preserving the session's fingerprint)."""
+        """Open a WebSocket connection (preserving the session's fingerprint); see ``Session.ws_connect()`` on ``extensions``."""
     def set_cookie(self, url: str, name: str, value: str) -> None:
         """Set a cookie for the given URL in the session's cookie jar."""
     def set_cookie_with_attrs(
@@ -1603,13 +2021,18 @@ class BlockingSession:
         multipart: Optional[Multipart] = None,
         body_stream: Optional[_SupportsRead | Iterable[bytes]] = None,
         content_length: Optional[int] = None,
-        cookies: Optional[dict[str, str]] = None,
-        cookie_override: Optional[dict[str, str]] = None,
+        cookies: Optional[dict[str, str] | list[tuple[str, str]]] = None,
+        cookie_override: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         timeout: Optional[float] = None,
         bearer_auth: Optional[str] = None,
         basic_auth: Optional[tuple[str, Optional[str]]] = None,
         proxy: Optional[str] = None,
+        no_decompress: bool = False,
         accept_encoding: Optional[AcceptEncoding] = None,
+        priority: Optional[RequestPriority] = None,
+        h2_priority_weight: Optional[int] = None,
+        preferred_http_version: Optional[PreferredHttpVersion] = None,
+        idempotency: Optional[Idempotency] = None,
         header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -1651,10 +2074,11 @@ class Client:
         tls_profile: Optional[str | TlsProfile] = None,
         h2_profile: Optional[str | H2Profile] = None,
         tcp_fingerprint: Optional[str | TcpFingerprint] = None,
-        default_headers: Optional[dict[str, str]] = None,
+        default_headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         header_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
+        http1_title_case_headers: Optional[bool] = None,
         dns_timeout: Optional[float] = None,
         tcp_connect_timeout: Optional[float] = None,
         tls_handshake_timeout: Optional[float] = None,
@@ -1679,13 +2103,16 @@ class Client:
         ca_cert_der: Optional[bytes] = None,
         verify: Optional[bool] = None,
         use_native_certs: bool = False,
+        trust_anchor_advertisement: Optional[str] = None,
+        trust_anchor_recovery: Optional[str] = None,
+        trust_anchor_bindings: Optional[dict[str, str]] = None,
         ech_config: Optional[bytes] = None,
-        dns: Optional[str] = None,
+        dns: Optional[str | Callable[[str, int], list[str]] | _DnsResolver] = None,
         ip_family: Optional[str] = None,
         connect_to: Optional[dict[str, str]] = None,
         system_dns_cache_ttl: Optional[float] = None,
         system_dns_cache_max_entries: Optional[int] = None,
-        keylog: Optional[str] = None,
+        keylog: Optional[str | os.PathLike[str] | Callable[[str], None]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         session_resumption: Optional[SessionResumptionConfig] = None,
         disable_http3: bool = False,
@@ -1701,6 +2128,28 @@ class Client:
         masque: Optional[MasqueConfig] = None,
     ) -> None:
         """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options.
+
+        ``dns`` picks where names are looked up: ``"system"`` (the operating
+        system's resolver, the default), ``"google"``, ``"cloudflare"`` or
+        ``"quad9"`` over UDP, their ``"*_https"`` DNS-over-HTTPS variants (the
+        ``doh`` feature), or a DNS server of your own as ``"ip"`` (port 53) or
+        ``"ip:port"``, an IPv6 address with a port in brackets
+        (``"[2606:4700::1111]:53"``). A DNS server, unlike the system resolver,
+        also answers HTTPS records, which is how the client learns a site's ECH
+        configuration and HTTP/3 support from DNS.
+
+        ``dns`` may also be Python code that looks names up: a function
+        ``resolve(host, port)`` returning a list of addresses, each an IP,
+        which takes the requested port, or ``"ip:port"``; or an object with
+        that ``resolve`` method and, optionally, ``lookup_https(host)``, which
+        returns ``None`` or the host's HTTPS record as a dict of any of
+        ``alpn``, ``no_default_alpn``, ``target``, ``port``,
+        ``ech_config_list`` (bytes), ``ipv4_hints`` and ``ipv6_hints``. The
+        code must be synchronous (an ``async def`` raises ``TypeError``) and
+        runs on the runtime's blocking pool; ``dns_timeout`` bounds each call,
+        and ``ip_family`` filters the answers. What ``resolve`` raises becomes
+        the ``__cause__`` of the request's error; a ``lookup_https`` that fails
+        is logged, and counts as no record.
 
         ``ip_family`` restricts which address family this client connects over:
         ``"any"`` (the default) keeps the resolver's own order, which on a
@@ -1729,9 +2178,46 @@ class Client:
         malformed entry, a zero port, the same origin listed twice, or an
         address ``ip_family`` excludes raises ``ValueError``.
 
+        ``http1_title_case_headers`` picks the casing of HTTP/1.1 header names:
+        ``None`` or ``True`` sends ``Content-Type``, ``False`` sends
+        ``content-type``, including generated headers (``content-length``),
+        except for ``Host``, which keeps its capital ``H`` in either mode.
+        It covers ordinary and streaming requests,
+        preconnected connections and WebSocket handshakes. The spelling a header
+        was given in is not kept, and HTTP/2 and HTTP/3 always send lowercase
+        names.
+
         ``masque`` configures the hop to a ``masque://`` proxy (requires the
         ``masque`` feature). It is independent of ``verify`` and ``ca_cert*``,
         which only govern the tunneled connection to the origin.
+
+        ``keylog`` takes the TLS secrets of every handshake, a line each in the
+        NSS key log format Wireshark reads: a file path, which is appended to,
+        or a function called with each line, without its newline. The function
+        runs on the thread doing the handshake, which waits for it, and is
+        called several times per handshake; it must be a plain function (an
+        ``async def`` raises ``TypeError``), and one that raises is logged as a
+        warning. Anyone holding these lines can decrypt the traffic.
+
+        ``trust_anchor_advertisement``, ``trust_anchor_recovery`` and
+        ``trust_anchor_bindings`` negotiate Trust Anchor Identifiers
+        (draft-ietf-tls-trust-anchor-ids): IDs of the roots a client accepts,
+        which a ClientHello carries in extension ``0xca34``. Only the Chrome 152
+        to 157 profiles have that extension; a profile without it refuses
+        ``"trusted"`` and ``"once"``. ``"profile"``, the default, sends the IDs
+        the TLS profile lists, in its order; ``"trusted"`` sends the sorted IDs
+        of the roots this client trusts instead. ``trust_anchor_recovery="once"``
+        dials once more when a server lists the IDs it can serve and then its
+        certificate chain fails to verify, or it ends the handshake: the second
+        connection asks for the first of those IDs this client trusts. It needs
+        ``verify`` on and cannot be combined with ``proxy_fallback_direct=True``;
+        ``"disabled"`` is the default. A second connection that fails too raises
+        the error of its cause, with a message beginning ``trust anchor recovery
+        failed``, and is not retried. ``trust_anchor_bindings`` maps more IDs, in
+        hex, to the :func:`trust_anchor_identity` of roots loaded with
+        ``ca_cert*``; the bundled IDs of the Mozilla roots need no binding. None
+        of this changes which certificates are trusted. A setting upstream
+        rejects raises ``ValueError``.
         """
     @staticmethod
     def chrome_131() -> Client:
@@ -1771,6 +2257,12 @@ class Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def chrome_155() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_156() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_157() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_133() -> Client:
@@ -1813,7 +2305,7 @@ class Client:
         on_response: Optional[Callable[..., Any]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
-        broken_quic_policy: Optional[BrokenQuicPolicy] = None,
+        broken_quic_policy: Optional[BrokenQuicPolicy | BrokenQuicConfig] = None,
         h3_retry_mode: Optional[H3RetryMode] = None,
         header_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -1824,6 +2316,17 @@ class Client:
         network_partition_context: Optional[NetworkPartitionContext] = None,
     ) -> Session:
         """Create a new session, optionally overriding proxy, retry, protocol, and hook settings.
+
+        ``proxy`` takes a URL or a ``ProxyConfig``; a URL that does not parse
+        raises ``ValueError`` rather than leaving the session without a proxy.
+
+        A ``retry`` callable is called as ``retry(attempt, error, status)``,
+        with the error's message or ``None`` and the response status or
+        ``None``, and returns the seconds to wait before the next attempt, or
+        ``None`` to stop. One that also takes ``exception=`` (or ``**kwargs``)
+        is given the exception the failure raises, with its ``retryable``,
+        ``phase`` and other attributes, or ``None`` when it is the status that
+        is being retried.
 
         Set ``allow_redirects=False`` to stop following 3xx redirects and return
         the redirect response as-is; it takes precedence over ``max_redirects``.
@@ -1837,18 +2340,117 @@ class Client:
         """Ready HTTP/2 requests coalesced into one driver write turn (default 1)."""
 
     @property
+    def http1_title_case_headers(self) -> bool:
+        """Whether HTTP/1.1 header names use Title-Case (default True); ``Host`` stays capitalized in either mode."""
+
+    @property
     def require_close_notify(self) -> bool:
         """Whether a bare socket EOF without TLS ``close_notify`` is treated as an error."""
 
     @property
     def tls_session_resumption_policy(self) -> TlsSessionResumptionPolicy:
         """The TLS session-ticket resumption policy in effect for this client."""
+    # What the client was built with, a preset applied: mostly under the name
+    # of the constructor argument that sets each.
+    @property
+    def tls_profile(self) -> TlsProfile:
+        """The TLS profile its ClientHello is built from."""
+    @property
+    def h2_profile(self) -> H2Profile: ...
+    @property
+    def tcp_fingerprint(self) -> Optional[TcpFingerprint]:
+        """``None`` leaves sockets as the OS sets them up."""
+    @property
+    def default_headers(self) -> list[tuple[str, str]]:
+        """The default headers, names lowercased, in the order they go out
+        wherever ``header_order`` does not place them."""
+    @property
+    def header_order(self) -> Optional[list[str]]: ...
+    @property
+    def h3_header_order(self) -> Optional[list[str]]: ...
+    @property
+    def cookie_order(self) -> Optional[list[str]]: ...
+    @property
+    def timeouts(self) -> dict[str, Optional[float]]:
+        """``dns_timeout``, ``tcp_connect_timeout``, ``tls_handshake_timeout``,
+        ``ttfb_timeout``, ``total_timeout`` and ``quic_connect_timeout``, in
+        seconds, the defaults included; ``None`` where there is none."""
+    @property
+    def resource_limits(self) -> dict[str, Any]:
+        """``max_response_body_size``, ``max_connections_per_session`` (``None``
+        for no cap), ``max_header_count``, ``max_header_size``,
+        ``max_headers_total_size``, ``min_transfer_rate`` and
+        ``min_transfer_rate_window`` (seconds), the defaults included."""
+    @property
+    def protocol_policy(self) -> ProtocolPolicy:
+        """The protocol policy its sessions start from."""
+    @property
+    def verify(self) -> bool: ...
+    @property
+    def ip_family(self) -> str:
+        """``"any"``, ``"ipv4"`` or ``"ipv6"``."""
+    @property
+    def h2_fallback_h1(self) -> bool: ...
+    @property
+    def proxy_fallback_direct(self) -> bool: ...
+    @property
+    def max_pending_h2_requests(self) -> Optional[int]: ...
+    @property
+    def ech_config(self) -> Optional[bytes]: ...
     def randomize_fingerprint(
         self,
         *,
         shuffle_extensions: bool = True,
     ) -> Client:
-        """Return a new client with a randomized fingerprint variant to reduce correlation."""
+        """Return a copy of this client whose TLS profile shuffles its extensions per connection.
+
+        Everything else carries over: the copy is built again from the same
+        options, or the same preset, with only the TLS profile's
+        ``randomization`` replaced (``shuffle_extensions=False`` sets it
+        explicitly off). A CA file named by ``ca_cert`` is read again.
+        """
+    async def check_proxy(
+        self,
+        proxy: str | ProxyConfig,
+        target_host: str = "www.google.com",
+        target_port: int = 443,
+        timeout: float = 5.0,
+    ) -> float:
+        """Set a tunnel up to ``target_host:target_port`` through ``proxy``, and
+        return the seconds that took.
+
+        A health check, as a ``ProxyPool`` given ``health_check=`` runs in the
+        background, made once: nothing is sent through the tunnel, and its
+        defaults are a pool's. The proxy's address, and the target's for a
+        SOCKS5 proxy that leaves the lookup to the client, are resolved as this
+        client resolves names, so ``dns=`` applies. Every hop of a chain is
+        gone through, with the credentials each carries. Raises ``ProxyError``
+        when the proxy refuses the tunnel or cannot be reached, and
+        ``TimeoutError`` when it is not set up within ``timeout`` seconds. A
+        MASQUE proxy carries no TCP, so checking one raises ``ProxyError``; a
+        pool's ``HealthCheckConfig(tunnel_probe=True)`` checks those.
+        """
+    async def get(self, url: str, **kwargs: Any) -> Response:
+        """``session().get(url, **kwargs)``: a GET from a session of its own.
+
+        Takes what ``Session.get()`` takes. The session is made for the
+        call and dropped after it, so no connection or cookie is kept from one
+        call to the next, and the options of ``session()`` (``proxy``,
+        ``retry``, ``hsts``, ...) keep their defaults. For more than one
+        request, make a session.
+        """
+    async def post(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().post(url, **kwargs)``."""
+    async def put(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().put(url, **kwargs)``."""
+    async def delete(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().delete(url, **kwargs)``."""
+    async def head(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().head(url, **kwargs)``."""
+    async def patch(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().patch(url, **kwargs)``."""
+    async def options(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().options(url, **kwargs)``."""
 
 class BlockingClient:
     """Synchronous HTTP client holding shared TLS/HTTP2/TCP fingerprint and connection configuration; create sessions via ``session()``."""
@@ -1859,10 +2461,11 @@ class BlockingClient:
         tls_profile: Optional[str | TlsProfile] = None,
         h2_profile: Optional[str | H2Profile] = None,
         tcp_fingerprint: Optional[str | TcpFingerprint] = None,
-        default_headers: Optional[dict[str, str]] = None,
+        default_headers: Optional[dict[str, str] | list[tuple[str, str]]] = None,
         header_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
         cookie_order: Optional[list[str]] = None,
+        http1_title_case_headers: Optional[bool] = None,
         dns_timeout: Optional[float] = None,
         tcp_connect_timeout: Optional[float] = None,
         tls_handshake_timeout: Optional[float] = None,
@@ -1887,13 +2490,16 @@ class BlockingClient:
         ca_cert_der: Optional[bytes] = None,
         verify: Optional[bool] = None,
         use_native_certs: bool = False,
+        trust_anchor_advertisement: Optional[str] = None,
+        trust_anchor_recovery: Optional[str] = None,
+        trust_anchor_bindings: Optional[dict[str, str]] = None,
         ech_config: Optional[bytes] = None,
-        dns: Optional[str] = None,
+        dns: Optional[str | Callable[[str, int], list[str]] | _DnsResolver] = None,
         ip_family: Optional[str] = None,
         connect_to: Optional[dict[str, str]] = None,
         system_dns_cache_ttl: Optional[float] = None,
         system_dns_cache_max_entries: Optional[int] = None,
-        keylog: Optional[str] = None,
+        keylog: Optional[str | os.PathLike[str] | Callable[[str], None]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         session_resumption: Optional[SessionResumptionConfig] = None,
         disable_http3: bool = False,
@@ -1909,6 +2515,28 @@ class BlockingClient:
         masque: Optional[MasqueConfig] = None,
     ) -> None:
         """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options.
+
+        ``dns`` picks where names are looked up: ``"system"`` (the operating
+        system's resolver, the default), ``"google"``, ``"cloudflare"`` or
+        ``"quad9"`` over UDP, their ``"*_https"`` DNS-over-HTTPS variants (the
+        ``doh`` feature), or a DNS server of your own as ``"ip"`` (port 53) or
+        ``"ip:port"``, an IPv6 address with a port in brackets
+        (``"[2606:4700::1111]:53"``). A DNS server, unlike the system resolver,
+        also answers HTTPS records, which is how the client learns a site's ECH
+        configuration and HTTP/3 support from DNS.
+
+        ``dns`` may also be Python code that looks names up: a function
+        ``resolve(host, port)`` returning a list of addresses, each an IP,
+        which takes the requested port, or ``"ip:port"``; or an object with
+        that ``resolve`` method and, optionally, ``lookup_https(host)``, which
+        returns ``None`` or the host's HTTPS record as a dict of any of
+        ``alpn``, ``no_default_alpn``, ``target``, ``port``,
+        ``ech_config_list`` (bytes), ``ipv4_hints`` and ``ipv6_hints``. The
+        code must be synchronous (an ``async def`` raises ``TypeError``) and
+        runs on the runtime's blocking pool; ``dns_timeout`` bounds each call,
+        and ``ip_family`` filters the answers. What ``resolve`` raises becomes
+        the ``__cause__`` of the request's error; a ``lookup_https`` that fails
+        is logged, and counts as no record.
 
         ``ip_family`` restricts which address family this client connects over:
         ``"any"`` (the default) keeps the resolver's own order, which on a
@@ -1937,9 +2565,38 @@ class BlockingClient:
         malformed entry, a zero port, the same origin listed twice, or an
         address ``ip_family`` excludes raises ``ValueError``.
 
+        ``http1_title_case_headers`` picks the casing of HTTP/1.1 header names:
+        ``None`` or ``True`` sends ``Content-Type``, ``False`` sends
+        ``content-type``, including generated headers (``content-length``),
+        except for ``Host``, which keeps its capital ``H`` in either mode.
+        It covers ordinary and streaming requests,
+        preconnected connections and WebSocket handshakes. The spelling a header
+        was given in is not kept, and HTTP/2 and HTTP/3 always send lowercase
+        names.
+
         ``masque`` configures the hop to a ``masque://`` proxy (requires the
         ``masque`` feature). It is independent of ``verify`` and ``ca_cert*``,
         which only govern the tunneled connection to the origin.
+
+        ``trust_anchor_advertisement``, ``trust_anchor_recovery`` and
+        ``trust_anchor_bindings`` negotiate Trust Anchor Identifiers
+        (draft-ietf-tls-trust-anchor-ids): IDs of the roots a client accepts,
+        which a ClientHello carries in extension ``0xca34``. Only the Chrome 152
+        to 157 profiles have that extension; a profile without it refuses
+        ``"trusted"`` and ``"once"``. ``"profile"``, the default, sends the IDs
+        the TLS profile lists, in its order; ``"trusted"`` sends the sorted IDs
+        of the roots this client trusts instead. ``trust_anchor_recovery="once"``
+        dials once more when a server lists the IDs it can serve and then its
+        certificate chain fails to verify, or it ends the handshake: the second
+        connection asks for the first of those IDs this client trusts. It needs
+        ``verify`` on and cannot be combined with ``proxy_fallback_direct=True``;
+        ``"disabled"`` is the default. A second connection that fails too raises
+        the error of its cause, with a message beginning ``trust anchor recovery
+        failed``, and is not retried. ``trust_anchor_bindings`` maps more IDs, in
+        hex, to the :func:`trust_anchor_identity` of roots loaded with
+        ``ca_cert*``; the bundled IDs of the Mozilla roots need no binding. None
+        of this changes which certificates are trusted. A setting upstream
+        rejects raises ``ValueError``.
         """
     @staticmethod
     def chrome_131() -> BlockingClient:
@@ -1979,6 +2636,12 @@ class BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def chrome_155() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_156() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def chrome_157() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
     def firefox_133() -> BlockingClient:
@@ -2021,7 +2684,7 @@ class BlockingClient:
         on_response: Optional[Callable[..., Any]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
-        broken_quic_policy: Optional[BrokenQuicPolicy] = None,
+        broken_quic_policy: Optional[BrokenQuicPolicy | BrokenQuicConfig] = None,
         h3_retry_mode: Optional[H3RetryMode] = None,
         header_order: Optional[list[str]] = None,
         h3_header_order: Optional[list[str]] = None,
@@ -2032,6 +2695,17 @@ class BlockingClient:
         network_partition_context: Optional[NetworkPartitionContext] = None,
     ) -> BlockingSession:
         """Create a new session, optionally overriding proxy, retry, protocol, and hook settings.
+
+        ``proxy`` takes a URL or a ``ProxyConfig``; a URL that does not parse
+        raises ``ValueError`` rather than leaving the session without a proxy.
+
+        A ``retry`` callable is called as ``retry(attempt, error, status)``,
+        with the error's message or ``None`` and the response status or
+        ``None``, and returns the seconds to wait before the next attempt, or
+        ``None`` to stop. One that also takes ``exception=`` (or ``**kwargs``)
+        is given the exception the failure raises, with its ``retryable``,
+        ``phase`` and other attributes, or ``None`` when it is the status that
+        is being retried.
 
         Set ``allow_redirects=False`` to stop following 3xx redirects and return
         the redirect response as-is; it takes precedence over ``max_redirects``.
@@ -2045,37 +2719,134 @@ class BlockingClient:
         """Ready HTTP/2 requests coalesced into one driver write turn (default 1)."""
 
     @property
+    def http1_title_case_headers(self) -> bool:
+        """Whether HTTP/1.1 header names use Title-Case (default True); ``Host`` stays capitalized in either mode."""
+
+    @property
     def require_close_notify(self) -> bool:
         """Whether a bare socket EOF without TLS ``close_notify`` is treated as an error."""
 
     @property
     def tls_session_resumption_policy(self) -> TlsSessionResumptionPolicy:
         """The TLS session-ticket resumption policy in effect for this client."""
+    # What the client was built with, a preset applied: mostly under the name
+    # of the constructor argument that sets each.
+    @property
+    def tls_profile(self) -> TlsProfile:
+        """The TLS profile its ClientHello is built from."""
+    @property
+    def h2_profile(self) -> H2Profile: ...
+    @property
+    def tcp_fingerprint(self) -> Optional[TcpFingerprint]:
+        """``None`` leaves sockets as the OS sets them up."""
+    @property
+    def default_headers(self) -> list[tuple[str, str]]:
+        """The default headers, names lowercased, in the order they go out
+        wherever ``header_order`` does not place them."""
+    @property
+    def header_order(self) -> Optional[list[str]]: ...
+    @property
+    def h3_header_order(self) -> Optional[list[str]]: ...
+    @property
+    def cookie_order(self) -> Optional[list[str]]: ...
+    @property
+    def timeouts(self) -> dict[str, Optional[float]]:
+        """``dns_timeout``, ``tcp_connect_timeout``, ``tls_handshake_timeout``,
+        ``ttfb_timeout``, ``total_timeout`` and ``quic_connect_timeout``, in
+        seconds, the defaults included; ``None`` where there is none."""
+    @property
+    def resource_limits(self) -> dict[str, Any]:
+        """``max_response_body_size``, ``max_connections_per_session`` (``None``
+        for no cap), ``max_header_count``, ``max_header_size``,
+        ``max_headers_total_size``, ``min_transfer_rate`` and
+        ``min_transfer_rate_window`` (seconds), the defaults included."""
+    @property
+    def protocol_policy(self) -> ProtocolPolicy:
+        """The protocol policy its sessions start from."""
+    @property
+    def verify(self) -> bool: ...
+    @property
+    def ip_family(self) -> str:
+        """``"any"``, ``"ipv4"`` or ``"ipv6"``."""
+    @property
+    def h2_fallback_h1(self) -> bool: ...
+    @property
+    def proxy_fallback_direct(self) -> bool: ...
+    @property
+    def max_pending_h2_requests(self) -> Optional[int]: ...
+    @property
+    def ech_config(self) -> Optional[bytes]: ...
     def randomize_fingerprint(
         self,
         *,
         shuffle_extensions: bool = True,
     ) -> BlockingClient:
-        """Return a new client with a randomized fingerprint variant to reduce correlation."""
+        """Return a copy of this client whose TLS profile shuffles its extensions per connection.
+
+        Everything else carries over: the copy is built again from the same
+        options, or the same preset, with only the TLS profile's
+        ``randomization`` replaced (``shuffle_extensions=False`` sets it
+        explicitly off). A CA file named by ``ca_cert`` is read again.
+        """
+    def check_proxy(
+        self,
+        proxy: str | ProxyConfig,
+        target_host: str = "www.google.com",
+        target_port: int = 443,
+        timeout: float = 5.0,
+    ) -> float:
+        """As ``Client.check_proxy()``, blocking until the check is done."""
+    def get(self, url: str, **kwargs: Any) -> Response:
+        """``session().get(url, **kwargs)``: a GET from a session of its own.
+
+        Takes what ``BlockingSession.get()`` takes. The session is made for the
+        call and dropped after it, so no connection or cookie is kept from one
+        call to the next, and the options of ``session()`` (``proxy``,
+        ``retry``, ``hsts``, ...) keep their defaults. For more than one
+        request, make a session.
+        """
+    def post(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().post(url, **kwargs)``."""
+    def put(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().put(url, **kwargs)``."""
+    def delete(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().delete(url, **kwargs)``."""
+    def head(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().head(url, **kwargs)``."""
+    def patch(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().patch(url, **kwargs)``."""
+    def options(self, url: str, **kwargs: Any) -> Response:
+        """As ``get()``, for ``session().options(url, **kwargs)``."""
 
 # ---------------------------------------------------------------------------
 # Session Pool
 # ---------------------------------------------------------------------------
 
 class SessionPool:
-    """Async pool of sessions over a set of proxies, with rotation and bad-session handling."""
+    """Async pool of sessions over a set of proxies, with rotation and bad-session handling.
+
+    ``proxies``, ``rotation``, ``bad_proxy_config``, ``health_check`` and
+    ``proxy_buffer`` work as they do in ``ProxyPool``, a function included;
+    ``max_sessions`` is its ``max_proxies``.
+    """
 
     def __init__(
         self,
         client: Client,
-        proxies: Iterable[str | ProxyConfig],
+        proxies: Iterable[str | ProxyConfig] | Callable[[], str | ProxyConfig],
         *,
         max_sessions: Optional[int] = None,
         idle_timeout: Optional[float] = None,
         rotation: Optional[str] = None,
+        bad_proxy_config: Optional[BadProxyConfig] = None,
+        health_check: Optional[HealthCheckConfig] = None,
+        proxy_buffer: Optional[int] = None,
     ) -> None: ...
     async def acquire(self) -> SessionGuard:
-        """Acquire a session guard for use as an async context manager."""
+        """Acquire a session guard for use as an async context manager.
+
+        Raises what a ``proxies`` function raised, as ``ProxyPool.acquire()`` does.
+        """
     async def acquire_fresh(self, bad_guard: SessionGuard) -> SessionGuard:
         """Replace a bad session with a fresh one and return its guard."""
     async def mark_bad(self, session_guard: SessionGuard) -> None:
@@ -2092,19 +2863,28 @@ class SessionGuard:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool: ...
 
 class BlockingSessionPool:
-    """Synchronous pool of sessions over a set of proxies, with rotation and bad-session handling."""
+    """Synchronous pool of sessions over a set of proxies, with rotation and bad-session handling.
+
+    Takes the same arguments as ``SessionPool``.
+    """
 
     def __init__(
         self,
         client: BlockingClient,
-        proxies: Iterable[str | ProxyConfig],
+        proxies: Iterable[str | ProxyConfig] | Callable[[], str | ProxyConfig],
         *,
         max_sessions: Optional[int] = None,
         idle_timeout: Optional[float] = None,
         rotation: Optional[str] = None,
+        bad_proxy_config: Optional[BadProxyConfig] = None,
+        health_check: Optional[HealthCheckConfig] = None,
+        proxy_buffer: Optional[int] = None,
     ) -> None: ...
     def acquire(self) -> BlockingSessionGuard:
-        """Acquire a session guard for use as a context manager."""
+        """Acquire a session guard for use as a context manager.
+
+        Raises what a ``proxies`` function raised, as ``ProxyPool.acquire()`` does.
+        """
     def acquire_fresh(self, bad_guard: BlockingSessionGuard) -> BlockingSessionGuard:
         """Replace a bad session with a fresh one and return its guard."""
     def mark_bad(self, session_guard: BlockingSessionGuard) -> None:
@@ -2193,7 +2973,7 @@ class ExtensionSpec:
 
     @property
     def shuffle(self) -> Optional[bool]:
-        """Whether the identifiers are shuffled per ClientHello, else None."""
+        """Whether the identifiers are reshuffled on every new handshake (a HelloRetryRequest retry resends the first order), else None."""
 
 class GreaseConfig:
     """Controls which TLS ClientHello fields receive GREASE values."""
@@ -2221,6 +3001,34 @@ class PaddingStrategy:
     @staticmethod
     def no_padding() -> PaddingStrategy:
         """Disable padding."""
+
+class EchMode:
+    """The ECH extension (0xFE0D) a ``TlsProfile`` sends, passed as ``TlsProfile(ech=...)``."""
+
+    @staticmethod
+    def grease(
+        *,
+        kdf_id: int = 1,
+        aead_id: int = 1,
+        enc_length: int = 32,
+        payload_length_min: Optional[int] = None,
+        payload_length_max: Optional[int] = None,
+    ) -> EchMode:
+        """ECH GREASE, which browsers send to a site they have no ECH
+        configuration for: an extension that looks real and matches no server.
+
+        The defaults are Chrome's HPKE suite (HKDF-SHA256, AES-128-GCM) and
+        ``enc`` length. Without a payload length the payload follows the host
+        name; Chrome keeps it from 128 to 224 bytes, Firefox at 240. A minimum
+        above the maximum raises ``ValueError``.
+        """
+    @staticmethod
+    def real(ech_config_list: bytes) -> EchMode:
+        """Real ECH: the inner ClientHello encrypted with ``ech_config_list``, an
+        ECHConfigList as a site's DNS HTTPS record carries it."""
+    @staticmethod
+    def disabled() -> EchMode:
+        """No ECH extension."""
 
 class RandomizationConfig:
     """Configures fingerprint randomization, such as shuffling TLS extensions."""
@@ -2256,7 +3064,23 @@ class TlsProfile:
         delegated_credentials_sig_algs: Optional[list[int]] = None,
         session_id_length: int = 32,
         randomization: Optional[RandomizationConfig] = None,
-    ) -> None: ...
+        tls_client_hello_style: Optional[str] = None,
+        ech: Optional[EchMode] = None,
+        ech_outer_extensions: Optional[list[int]] = None,
+    ) -> None:
+        """``tls_client_hello_style`` is the TLS stack the ClientHello copies,
+        for the rules no list can say, such as where GREASE goes and which
+        extensions may be permuted: ``"generic"`` (the default, none of them),
+        ``"chromium_boringssl"``, ``"firefox_nss"``, ``"safari_cfnetwork"`` or
+        ``"java_jsse"``; anything else raises ``ValueError``.
+
+        ``ech`` is the ECH extension to send, an ``EchMode``; without it none is
+        sent unless ``extensions`` carries one. ``ech_outer_extensions`` lists
+        the extension types an inner ClientHello compresses under real ECH;
+        without it, ``key_share`` (51) alone.
+
+        ``TlsProfile.from_json()`` takes all three as well.
+        """
     @staticmethod
     def chrome_131() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
@@ -2295,7 +3119,13 @@ class TlsProfile:
         """Chrome 154: the capture kept Chrome 153's TLS shape; only the profile name differs."""
     @staticmethod
     def chrome_155() -> TlsProfile:
-        """Chrome 155: the capture kept Chrome 154's TLS shape; only the profile name differs."""
+        """Chrome 155: the capture kept Chrome 154's TLS shape, but its trust-anchor IDs go out in one fixed, sorted order instead of shuffled on every handshake."""
+    @staticmethod
+    def chrome_156() -> TlsProfile:
+        """Chrome 156: the capture kept Chrome 155's TLS shape, sorted trust-anchor IDs included; only the profile name differs."""
+    @staticmethod
+    def chrome_157() -> TlsProfile:
+        """Chrome 157: the capture kept Chrome 156's TLS shape, sorted trust-anchor IDs included; only the profile name differs."""
     @staticmethod
     def chrome_146_quic() -> TlsProfile:
         """Chrome 146 QUIC-TLS preset (the ClientHello sent inside QUIC), for ``Client(quic_fingerprint=...)``."""
@@ -2316,7 +3146,13 @@ class TlsProfile:
         """Chrome 154 QUIC-TLS preset: Chrome 153's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
     @staticmethod
     def chrome_155_quic() -> TlsProfile:
-        """Chrome 155 QUIC-TLS preset: Chrome 154's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
+        """Chrome 155 QUIC-TLS preset: Chrome 154's QUIC ClientHello with the trust-anchor IDs in a fixed, sorted order, for ``Client(quic_fingerprint=...)``."""
+    @staticmethod
+    def chrome_156_quic() -> TlsProfile:
+        """Chrome 156 QUIC-TLS preset: Chrome 155's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
+    @staticmethod
+    def chrome_157_quic() -> TlsProfile:
+        """Chrome 157 QUIC-TLS preset: Chrome 156's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
     @staticmethod
     def firefox_133() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
@@ -2486,6 +3322,12 @@ class H2Profile:
     def chrome_155() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 154)."""
     @staticmethod
+    def chrome_156() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 155)."""
+    @staticmethod
+    def chrome_157() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 156)."""
+    @staticmethod
     def firefox_133() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
     @staticmethod
@@ -2514,6 +3356,16 @@ class H2Profile:
         """Serialize this profile to a JSON string."""
     def to_dict(self) -> dict[str, Any]:
         """Serialize this profile to a dict."""
+    def validate(self) -> None:
+        """Raise ``ValueError`` if the profile breaks a rule of HTTP/2 that a
+        usable fingerprint keeps: the four pseudo-headers once each, no SETTINGS
+        id twice, ``ENABLE_PUSH`` 0 or 1, ``INITIAL_WINDOW_SIZE`` at most
+        2**31 - 1, ``MAX_FRAME_SIZE`` from 16384 to 16777215, and a
+        ``window_update`` that keeps the connection window at most 2**31 - 1.
+
+        Nothing else checks: a client sends a profile that breaks one, made by
+        hand or read from JSON, as it is.
+        """
 
 class TcpFingerprint:
     """TCP-layer fingerprint (window size, MSS, scale, TTL, buffers); supports OS presets and JA4T.
@@ -2522,6 +3374,16 @@ class TcpFingerprint:
     connections and on the hop to the first proxy. The OS still builds the SYN, so
     a JA4T match is not guaranteed: window size and scale only steer the receive
     buffer, MSS is applied on Linux only, and TCP options are descriptive.
+
+    ``tcp_options`` is the SYN's option order as kind numbers, JA4T's second
+    part: 0 (EOL), 1 (NOP), 2 (MSS), 3 (window scale), 4 (SACK permitted), 8
+    (timestamps); any other number raises ``ValueError``. Being descriptive, it
+    shows in ``to_ja4t()`` and nowhere on the wire. Keep-alive, unlike it, is set
+    on the socket: ``keepalive=True`` turns it on with the OS's timing,
+    ``keepalive_idle`` and ``keepalive_interval`` (seconds) give the idle time
+    before the first probe and the time between probes and turn it on as well,
+    and ``keepalive=False`` turns it off, which together with either timing
+    raises ``ValueError``.
     """
 
     def __init__(
@@ -2534,12 +3396,21 @@ class TcpFingerprint:
         tcp_nodelay: Optional[bool] = None,
         recv_buf_size: Optional[int] = None,
         send_buf_size: Optional[int] = None,
+        tcp_options: Optional[list[int]] = None,
+        keepalive: Optional[bool] = None,
+        keepalive_idle: Optional[float] = None,
+        keepalive_interval: Optional[float] = None,
     ) -> None: ...
     @staticmethod
     def from_ja4t(ja4t: str) -> TcpFingerprint:
         """Build a TcpFingerprint from a JA4T fingerprint string."""
     def to_ja4t(self) -> Optional[str]:
         """Render this fingerprint as a JA4T string, if possible."""
+    def to_dict(self) -> dict[str, Any]:
+        """Every setting under its constructor argument's name: ``None`` for one left to the OS, options as kind numbers, times in seconds."""
+    @staticmethod
+    def none() -> TcpFingerprint:
+        """No settings at all: the OS's own, apart from ``TCP_NODELAY``, which the transport turns on regardless."""
     @staticmethod
     def chrome() -> TcpFingerprint:
         """TCP fingerprint preset for this browser/OS."""
@@ -2566,6 +3437,9 @@ class TcpFingerprint:
         """TCP fingerprint preset for this browser/OS."""
     @staticmethod
     def safari() -> TcpFingerprint:
+        """TCP fingerprint preset for this browser/OS."""
+    @staticmethod
+    def safari_ios() -> TcpFingerprint:
         """TCP fingerprint preset for this browser/OS."""
 
 # ---------------------------------------------------------------------------
@@ -2601,7 +3475,20 @@ def blocking_drain_pending(timeout: Optional[float] = None) -> bool:
     """Blocking counterpart of :func:`drain_pending`."""
 
 def set_log_level(level: str, *, format: str = "compact") -> bool:
-    """Set the global log level (e.g. ``"info"`` or a filter like ``"lkrequest=debug"``); ``format`` selects the output style."""
+    """Set the global log level (e.g. ``"info"`` or a filter like ``"lkrequest=debug"``); ``format`` selects the output style.
+
+    ``"compact"``, ``"full"`` and ``"json"`` write to stderr. ``"logging"``
+    hands every event that passes ``level`` to Python's ``logging``, on the
+    logger ``lkrequest.`` followed by the event's Rust target with ``::`` as
+    ``.`` (``lkrequest.lkrequest.session``, ``lkrequest.lktls.handshake``), so
+    ``logging.getLogger("lkrequest")`` takes them all; the message carries the
+    event's fields as ``name=value``, and a TRACE event has level 5. The events
+    are queued and passed on from a thread of their own, so a request never
+    waits for the GIL to log, and a full queue drops events.
+
+    Only the first call in a process takes effect: it returns ``True``, and
+    every later call ``False``.
+    """
 
 def enable_metrics() -> MetricsCollector:
     """Enable Prometheus metrics collection and return the ``MetricsCollector``."""
@@ -2616,3 +3503,30 @@ def validate_fingerprint_consistency(
 
 def metrics_snapshot() -> dict[str, Any]:
     """Return a process-level counters dict (bytes in/out, requests, connections); requires the ``telemetry`` feature for real values."""
+
+def features() -> dict[str, bool]:
+    """Which optional features this build has, by their Cargo names: ``quic-h3``,
+    ``masque``, ``doh``, ``telemetry`` and ``synthetic-fp``.
+
+    The wheels on PyPI have every one. A build from source may lack some, and
+    then the classes a feature brings are missing and the options it brings
+    are refused.
+    """
+
+def list_presets() -> list[dict[str, Any]]:
+    """The browser presets this build knows, in a stable order.
+
+    Each is a dict of ``name`` (``"chrome_155"``), ``browser`` (``"chrome"``,
+    ``"firefox"`` or ``"safari"``) and ``http3``, whether the preset's client
+    speaks HTTP/3 in this build. A name is what ``Client.<name>()``,
+    ``tls_profile=`` and ``h2_profile=`` take.
+    """
+
+def trust_anchor_identity(der: bytes) -> str:
+    """The identity of a DER root certificate, for ``Client(trust_anchor_bindings=...)``.
+
+    64 lowercase hex digits over the root's subject, key and name constraints,
+    as ``diagnostics["trust_anchor"]["verified_anchor"]`` names the root that
+    verified a connection. It adds no trust: the root must still be loaded with
+    ``ca_cert*``. Bytes that are not a usable certificate raise ``ValueError``.
+    """

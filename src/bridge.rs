@@ -5,9 +5,10 @@
 //! `event_loop.call_soon_threadsafe(...)`. On a closed loop that raises
 //! `RuntimeError: Event loop is closed`, and the bridge does not propagate it —
 //! it calls `print_and_set_sys_last_vars`, dumping a traceback to stderr from
-//! whichever tokio worker thread the task landed on. With many tasks finishing
-//! late, every worker writes to stderr at once; during interpreter shutdown they
-//! contend for the `BufferedWriter` lock and CPython aborts the process with
+//! the tokio thread delivering the result (a blocking-pool thread since
+//! pyo3-async-runtimes 0.27). With many tasks finishing late, every such thread
+//! writes to stderr at once; during interpreter shutdown they contend for the
+//! `BufferedWriter` lock and CPython aborts the process with
 //! `Fatal Python error: _enter_buffered_busy`.
 //!
 //! The bridge only ever calls two methods on the object it is handed as the
@@ -113,7 +114,7 @@ fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// `call_soon_threadsafe` instead of letting it raise (see module docs).
 #[pyclass]
 pub struct GuardedEventLoop {
-    inner: PyObject,
+    inner: Py<PyAny>,
     /// Filled by a tracked wrapper future when it completes; empty for
     /// untracked bridges. Released at the end of `call_soon_threadsafe`.
     handoff: Handoff,
@@ -124,7 +125,7 @@ impl GuardedEventLoop {
     /// Forwarded verbatim: the bridge calls this to allocate the Python future
     /// it hands back to the caller, and that must be a real asyncio future
     /// belonging to the real loop.
-    fn create_future(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn create_future(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.inner.bind(py).call_method0("create_future")?.unbind())
     }
 
@@ -163,7 +164,7 @@ impl GuardedEventLoop {
     /// take (`into_future` wants `create_task`, for one), and a future version
     /// may reach for more. Forwarding by default keeps the proxy a proxy: only
     /// `call_soon_threadsafe` above behaves differently.
-    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         Ok(self.inner.bind(py).getattr(name)?.unbind())
     }
 }
@@ -185,8 +186,12 @@ fn is_loop_closed_error(py: Python<'_>, err: &PyErr) -> bool {
 pub fn future_into_py<F, T>(py: Python<'_>, fut: F) -> PyResult<Bound<'_, PyAny>>
 where
     F: std::future::Future<Output = PyResult<T>> + Send + 'static,
-    T: for<'py> IntoPyObject<'py>,
+    T: for<'py> IntoPyObject<'py> + Send + 'static,
 {
+    // Boxed so each wrapper layer below holds a pointer, not the future itself:
+    // unoptimized builds give every layer's poll a stack copy of it, and those
+    // copies of a request future overflowed the 2 MiB tokio worker stack.
+    let fut = Box::pin(fut);
     let guard = InFlightGuard::register();
     let handoff: Handoff = Arc::new(Mutex::new(None));
     let transfer = handoff.clone();
@@ -209,7 +214,7 @@ where
 pub fn future_into_py_untracked<F, T>(py: Python<'_>, fut: F) -> PyResult<Bound<'_, PyAny>>
 where
     F: std::future::Future<Output = PyResult<T>> + Send + 'static,
-    T: for<'py> IntoPyObject<'py>,
+    T: for<'py> IntoPyObject<'py> + Send + 'static,
 {
     bridged_into_py(py, Arc::new(Mutex::new(None)), fut)
 }
@@ -219,7 +224,7 @@ where
 fn bridged_into_py<F, T>(py: Python<'_>, handoff: Handoff, fut: F) -> PyResult<Bound<'_, PyAny>>
 where
     F: std::future::Future<Output = PyResult<T>> + Send + 'static,
-    T: for<'py> IntoPyObject<'py>,
+    T: for<'py> IntoPyObject<'py> + Send + 'static,
 {
     let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
     let guarded = Py::new(
@@ -261,7 +266,7 @@ pub async fn drain(timeout: Option<std::time::Duration>) -> bool {
                 .await
                 .is_err()
             {
-                Python::with_gil(|_| ());
+                Python::attach(|_| ());
             }
         }
     };

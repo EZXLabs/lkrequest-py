@@ -4,20 +4,21 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::fingerprint::{PyH2Profile, PyTcpFingerprint, PyTlsProfile};
 use crate::hsts::PyHsts;
 use crate::middleware::{MiddlewareSlots, PyMiddleware, PyMiddlewareWrapper};
-use crate::protocol::{PyBrokenQuicPolicy, PyH3RetryMode, PyHttpIntent, PyProtocolPolicy};
-use crate::proxy::apply_session_proxy;
+use crate::protocol::{BrokenQuic, PyH3RetryMode, PyHttpIntent, PyProtocolPolicy};
+use crate::proxy::{apply_session_proxy, proxy_check};
 use crate::randomize::PyRandomize;
 use crate::retry::{PyCallableRetryPolicy, PyExponentialBackoff, PyFixedInterval};
 use crate::session::{PyBlockingSession, PySession};
 use crate::session_state::SessionState;
 use crate::types::{
     resolve_h2_profile, resolve_tcp_fingerprint, resolve_tls_profile, validated_duration,
-    PyAcceptEncoding, PySessionResumptionConfig,
+    PyAcceptEncoding, PySessionResumptionConfig, StrPairs,
 };
 
 fn resolve_tls_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lktls::profile::TlsProfile> {
@@ -46,7 +47,7 @@ fn resolve_h2_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkh2::profile::H2Prof
 
 /// Resolve a QUIC profile from a preset name (`"chrome"` / `"chrome_146"` /
 /// `"chrome_150"` / `"chrome_151"` / `"chrome_152"` / `"chrome_153"` /
-/// `"chrome_154"` / `"chrome_155"`) or a
+/// `"chrome_154"` / `"chrome_155"` / `"chrome_156"` / `"chrome_157"`) or a
 /// `QuicProfile` object. Requires the `quic-h3` feature; without it any value is
 /// rejected with a clear error.
 #[cfg(feature = "quic-h3")]
@@ -61,8 +62,10 @@ fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProf
             "chrome_153" => Ok(lkrequest::lkh3::chrome_153_quic()),
             "chrome_154" => Ok(lkrequest::lkh3::chrome_154_quic()),
             "chrome_155" => Ok(lkrequest::lkh3::chrome_155_quic()),
+            "chrome_156" => Ok(lkrequest::lkh3::chrome_156_quic()),
+            "chrome_157" => Ok(lkrequest::lkh3::chrome_157_quic()),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155",
+                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157",
                 s
             ))),
         }
@@ -128,8 +131,7 @@ fn apply_retry_policy(
     } else if let Ok(fi) = retry_obj.extract::<PyFixedInterval>() {
         Ok(builder.retry_policy(fi.inner))
     } else if retry_obj.is_callable() {
-        let callable = retry_obj.clone().unbind();
-        Ok(builder.retry_policy(PyCallableRetryPolicy::new(callable)))
+        Ok(builder.retry_policy(PyCallableRetryPolicy::new(retry_obj)))
     } else {
         Err(pyo3::exceptions::PyTypeError::new_err(
             "retry must be ExponentialBackoff, FixedInterval, or a callable(attempt, error, status) -> float | None",
@@ -179,11 +181,65 @@ fn resolve_dns_config(name: &str) -> PyResult<lkrequest::dns::DnsConfig> {
                 name
             )))
         }
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown DNS config: '{}'. Available: system, google, google_https, cloudflare, cloudflare_https, quad9, quad9_https",
-            name
-        ))),
+        _ => crate::dns::parse_dns_server(name)
+            .map(lkrequest::dns::DnsConfig::Custom)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown DNS config: '{}'. Available: system, google, google_https, cloudflare, cloudflare_https, quad9, quad9_https, or a DNS server as \"ip\" or \"ip:port\" (IPv6 as \"[2606:4700::1111]:53\")",
+                    name
+                ))
+            }),
     }
+}
+
+/// What `dns=` was given.
+#[derive(Clone)]
+enum Dns {
+    Config(lkrequest::dns::DnsConfig),
+    Resolver(Arc<crate::resolver::PyDnsResolver>),
+}
+
+/// Read `dns=`: a resolver's name or a DNS server's address, or Python code
+/// that looks names up.
+fn resolve_dns(dns: &Bound<'_, PyAny>) -> PyResult<Dns> {
+    if let Ok(name) = dns.extract::<String>() {
+        return resolve_dns_config(&name).map(Dns::Config);
+    }
+    let resolver = crate::resolver::PyDnsResolver::from_python(dns)?;
+    Ok(Dns::Resolver(Arc::new(resolver)))
+}
+
+/// What `keylog=` was given.
+#[derive(Clone)]
+enum Keylog {
+    /// A file the lines are appended to, opened when the client is built.
+    File(std::path::PathBuf),
+    /// A Python function called with each line.
+    Function(lkrequest::KeyLogCallback),
+}
+
+/// Read `keylog=`: a file path, or a function called with each line on the
+/// thread doing the handshake.
+fn resolve_keylog(keylog: &Bound<'_, PyAny>) -> PyResult<Keylog> {
+    if !keylog.is_callable() {
+        return keylog.extract().map(Keylog::File).map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "keylog must be a file path or a function taking each line",
+            )
+        });
+    }
+    if crate::types::is_async_function(keylog)? {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "keylog must be a plain function, not an async one",
+        ));
+    }
+    let function = keylog.clone().unbind();
+    Ok(Keylog::Function(Arc::new(move |line: &str| {
+        let outcome = Python::try_attach(|py| function.bind(py).call1((line,)).map(drop));
+        if let Some(Err(err)) = outcome {
+            tracing::warn!(error = %err, "tls.keylog_failed");
+        }
+    })))
 }
 
 /// All resolved options for constructing a [`lkrequest::Client`], grouped so
@@ -191,15 +247,16 @@ fn resolve_dns_config(name: &str) -> PyResult<lkrequest::dns::DnsConfig> {
 /// arguments. Adding a new option is a single named field set at each call
 /// site, which the compiler checks for completeness — there is no risk of
 /// mis-aligning two same-typed positional arguments.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ClientConfig {
     tls_profile: Option<lktls::profile::TlsProfile>,
     h2_profile: Option<lkh2::profile::H2Profile>,
     tcp_fingerprint: Option<lkrequest::TcpFingerprint>,
-    default_headers: Option<HashMap<String, String>>,
+    default_headers: Option<StrPairs>,
     header_order: Option<Vec<String>>,
     h3_header_order: Option<Vec<String>>,
     cookie_order: Option<Vec<String>>,
+    http1_title_case_headers: Option<bool>,
     dns_timeout: Option<f64>,
     tcp_connect_timeout: Option<f64>,
     tls_handshake_timeout: Option<f64>,
@@ -224,13 +281,15 @@ struct ClientConfig {
     ca_cert_der: Option<Vec<u8>>,
     verify: Option<bool>,
     use_native_certs: bool,
+    trust_anchor_policy: Option<lkrequest::TrustAnchorPolicy>,
+    trust_anchor_bindings: Option<Vec<lkrequest::TrustAnchorBinding>>,
     ech_config: Option<Vec<u8>>,
-    dns: Option<String>,
+    dns: Option<Dns>,
     ip_family: Option<String>,
     connect_to: Option<HashMap<String, String>>,
     system_dns_cache_ttl: Option<f64>,
     system_dns_cache_max_entries: Option<usize>,
-    keylog: Option<String>,
+    keylog: Option<Keylog>,
     protocol_policy: Option<lkrequest::ProtocolPolicy>,
     session_resumption: Option<lktls::profile::types::SessionResumptionConfig>,
     disable_http3: bool,
@@ -253,6 +312,7 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         header_order,
         h3_header_order,
         cookie_order,
+        http1_title_case_headers,
         dns_timeout,
         tcp_connect_timeout,
         tls_handshake_timeout,
@@ -277,6 +337,8 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         ca_cert_der,
         verify,
         use_native_certs,
+        trust_anchor_policy,
+        trust_anchor_bindings,
         ech_config,
         dns,
         ip_family,
@@ -309,7 +371,9 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         builder = builder.tcp_fingerprint(fp);
     }
     if let Some(headers) = default_headers {
-        for (k, v) in headers {
+        // In the caller's order: it is the order the defaults go on the wire
+        // in, wherever the header order does not place them itself.
+        for (k, v) in headers.0 {
             builder = builder.default_header(&k, &v);
         }
     }
@@ -324,6 +388,9 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
     if let Some(order) = cookie_order {
         let refs: Vec<&str> = order.iter().map(|s| s.as_str()).collect();
         builder = builder.cookie_order(refs);
+    }
+    if let Some(enabled) = http1_title_case_headers {
+        builder = builder.http1_title_case_headers(enabled);
     }
     // Timeouts and resource limits are gathered into a single TimeoutConfig /
     // ResourceLimits each (seeded from the defaults the builder would use) and
@@ -445,6 +512,12 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
     if use_native_certs {
         builder = builder.use_native_certs();
     }
+    if let Some(policy) = trust_anchor_policy {
+        builder = builder.trust_anchor_policy(policy);
+    }
+    for binding in trust_anchor_bindings.into_iter().flatten() {
+        builder = builder.trust_anchor_binding(binding);
+    }
     if let Some(ech) = ech_config {
         builder = builder.ech_config(ech);
     }
@@ -467,8 +540,11 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
             cache = cache.with_max_entries(n);
         }
         builder = builder.system_dns_cache(cache);
-    } else if let Some(ref dns_name) = dns {
-        builder = builder.dns(resolve_dns_config(dns_name)?);
+    } else if let Some(dns) = dns {
+        builder = match dns {
+            Dns::Config(config) => builder.dns(config),
+            Dns::Resolver(resolver) => builder.dns_resolver(resolver),
+        };
     }
     // Upstream applies the family policy to whichever resolver ends up
     // configured, so it composes with both options above regardless of order.
@@ -483,14 +559,19 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
             builder = builder.connect_to(&entry.host, entry.port, entry.address);
         }
     }
-    if let Some(ref path) = keylog {
-        let callback = lkrequest::keylog_to_file(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "Failed to open keylog file '{}': {}",
-                path, e
-            ))
-        })?;
-        builder = builder.keylog(callback);
+    match keylog {
+        Some(Keylog::File(path)) => {
+            let callback = lkrequest::keylog_to_file(&path).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!(
+                    "Failed to open keylog file '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            builder = builder.keylog(callback);
+        }
+        Some(Keylog::Function(callback)) => builder = builder.keylog(callback),
+        None => {}
     }
     if let Some(policy) = protocol_policy {
         builder = builder.protocol_policy(policy);
@@ -526,7 +607,9 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         builder = crate::masque::apply_to_client(builder, config);
     }
 
-    Ok(builder.build())
+    // `build()` panics on settings upstream rejects, such as trust-anchor
+    // recovery without verification; `try_build()` reports them instead.
+    builder.try_build().map_err(crate::error::to_py_err)
 }
 
 /// Build a `Client` from a high-level upstream preset bundle plus a TCP
@@ -540,21 +623,119 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
 fn build_preset_client(
     preset: lkrequest::preset::ClientPreset,
     tcp: lkrequest::TcpFingerprint,
+    tls_profile: Option<lktls::profile::TlsProfile>,
 ) -> lkrequest::Client {
-    lkrequest::Client::builder()
+    let mut builder = lkrequest::Client::builder()
         .preset(preset)
-        .tcp_fingerprint(tcp)
-        .build()
+        .tcp_fingerprint(tcp);
+    // A later `fingerprint()` replaces the preset's TLS profile and leaves the
+    // rest of the preset alone; `randomize_fingerprint()` relies on that.
+    if let Some(profile) = tls_profile {
+        builder = builder.fingerprint(profile);
+    }
+    builder.build()
+}
+
+/// How a client was built, kept so `randomize_fingerprint()` can build the
+/// same client again with only its TLS profile replaced: upstream's `Client`
+/// has no way back to a builder.
+// Built once per client and kept behind an `Arc`, so the size of the larger
+// variant costs nothing that boxing it would save.
+#[allow(clippy::large_enum_variant)]
+enum ClientRecipe {
+    /// From the constructor's options.
+    Options(ClientConfig),
+    /// From a browser preset method.
+    Preset {
+        preset: lkrequest::preset::ClientPreset,
+        tcp: lkrequest::TcpFingerprint,
+        /// The preset's own TLS profile until `randomize_fingerprint()`
+        /// replaces it.
+        tls_profile: Option<lktls::profile::TlsProfile>,
+    },
+}
+
+impl ClientRecipe {
+    fn preset(preset: lkrequest::preset::ClientPreset, tcp: lkrequest::TcpFingerprint) -> Self {
+        Self::Preset {
+            preset,
+            tcp,
+            tls_profile: None,
+        }
+    }
+
+    fn build(&self) -> PyResult<lkrequest::Client> {
+        match self {
+            Self::Options(config) => build_client(config.clone()),
+            Self::Preset {
+                preset,
+                tcp,
+                tls_profile,
+            } => Ok(build_preset_client(
+                preset.clone(),
+                tcp.clone(),
+                tls_profile.clone(),
+            )),
+        }
+    }
+
+    /// The same recipe with `profile` as the TLS profile.
+    fn with_tls_profile(&self, profile: lktls::profile::TlsProfile) -> Self {
+        match self {
+            Self::Options(config) => {
+                let mut config = config.clone();
+                config.tls_profile = Some(profile);
+                Self::Options(config)
+            }
+            Self::Preset { preset, tcp, .. } => Self::Preset {
+                preset: preset.clone(),
+                tcp: tcp.clone(),
+                tls_profile: Some(profile),
+            },
+        }
+    }
+}
+
+/// The TLS profile `client` uses, set to shuffle its extensions per connection
+/// (`shuffle_extensions=True`) or explicitly not to.
+fn randomized_tls_profile(
+    client: &lkrequest::Client,
+    shuffle_extensions: bool,
+) -> lktls::profile::TlsProfile {
+    let mut profile = client.tls_profile().clone();
+    profile.randomization = Some(lktls::profile::types::RandomizationConfig { shuffle_extensions });
+    profile
 }
 
 // ---------------------------------------------------------------------------
 // Async Client
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "Client")]
+#[pyclass(name = "Client", from_py_object)]
 #[derive(Clone)]
 pub struct PyClient {
     pub(crate) inner: lkrequest::Client,
+    /// How `inner` was built, for `randomize_fingerprint()`.
+    recipe: Arc<ClientRecipe>,
+}
+
+impl PyClient {
+    fn from_recipe(recipe: ClientRecipe) -> PyResult<Self> {
+        Ok(Self {
+            inner: recipe.build()?,
+            recipe: Arc::new(recipe),
+        })
+    }
+
+    fn from_preset(
+        preset: lkrequest::preset::ClientPreset,
+        tcp: lkrequest::TcpFingerprint,
+    ) -> Self {
+        Self {
+            inner: build_preset_client(preset.clone(), tcp.clone(), None),
+            recipe: Arc::new(ClientRecipe::preset(preset, tcp)),
+        }
+    }
 }
 
 #[pymethods]
@@ -569,6 +750,7 @@ impl PyClient {
         header_order=None,
         h3_header_order=None,
         cookie_order=None,
+        http1_title_case_headers=None,
         dns_timeout=None,
         tcp_connect_timeout=None,
         tls_handshake_timeout=None,
@@ -593,6 +775,9 @@ impl PyClient {
         ca_cert_der=None,
         verify=None,
         use_native_certs=false,
+        trust_anchor_advertisement=None,
+        trust_anchor_recovery=None,
+        trust_anchor_bindings=None,
         ech_config=None,
         dns=None,
         ip_family=None,
@@ -617,10 +802,11 @@ impl PyClient {
         tls_profile: Option<Bound<'py, PyAny>>,
         h2_profile: Option<Bound<'py, PyAny>>,
         tcp_fingerprint: Option<Bound<'py, PyAny>>,
-        default_headers: Option<HashMap<String, String>>,
+        default_headers: Option<StrPairs>,
         header_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
+        http1_title_case_headers: Option<bool>,
         dns_timeout: Option<f64>,
         tcp_connect_timeout: Option<f64>,
         tls_handshake_timeout: Option<f64>,
@@ -645,13 +831,16 @@ impl PyClient {
         ca_cert_der: Option<Vec<u8>>,
         verify: Option<bool>,
         use_native_certs: bool,
+        trust_anchor_advertisement: Option<String>,
+        trust_anchor_recovery: Option<String>,
+        trust_anchor_bindings: Option<BTreeMap<String, String>>,
         ech_config: Option<Vec<u8>>,
-        dns: Option<String>,
+        dns: Option<Bound<'_, PyAny>>,
         ip_family: Option<String>,
         connect_to: Option<HashMap<String, String>>,
         system_dns_cache_ttl: Option<f64>,
         system_dns_cache_max_entries: Option<usize>,
-        keylog: Option<String>,
+        keylog: Option<Bound<'_, PyAny>>,
         protocol_policy: Option<PyProtocolPolicy>,
         session_resumption: Option<PySessionResumptionConfig>,
         disable_http3: bool,
@@ -683,7 +872,7 @@ impl PyClient {
             .as_ref()
             .map(resolve_quic_from_any)
             .transpose()?;
-        let client = build_client(ClientConfig {
+        let config = ClientConfig {
             tls_profile: tls,
             h2_profile: h2,
             tcp_fingerprint: tcp,
@@ -691,6 +880,7 @@ impl PyClient {
             header_order,
             h3_header_order,
             cookie_order,
+            http1_title_case_headers,
             dns_timeout,
             tcp_connect_timeout,
             tls_handshake_timeout,
@@ -715,14 +905,23 @@ impl PyClient {
             ca_cert_der,
             verify,
             use_native_certs,
+            trust_anchor_policy: crate::trust_anchor::parse_policy(
+                trust_anchor_advertisement.as_deref(),
+                trust_anchor_recovery.as_deref(),
+            )?,
+            trust_anchor_bindings: trust_anchor_bindings
+                .map(crate::trust_anchor::parse_bindings)
+                .transpose()?,
             ech_config,
-            dns,
+            dns: dns.as_ref().map(resolve_dns).transpose()?,
             ip_family,
             connect_to,
             system_dns_cache_ttl,
             system_dns_cache_max_entries,
-            keylog,
-            protocol_policy: protocol_policy.map(|p| p.inner),
+            keylog: keylog.as_ref().map(resolve_keylog).transpose()?,
+            protocol_policy: protocol_policy
+                .map(PyProtocolPolicy::validated)
+                .transpose()?,
             session_resumption: session_resumption.map(|c| c.inner),
             disable_http3,
             quic_fingerprint: quic_fp,
@@ -733,189 +932,170 @@ impl PyClient {
             tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
             tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
             masque,
-        })?;
-        tracing::info!(tls = %client.tls_profile().name, "Client created");
-        Ok(PyClient { inner: client })
+        };
+        let client = Self::from_recipe(ClientRecipe::Options(config))?;
+        tracing::info!(tls = %client.inner.tls_profile().name, "Client created");
+        Ok(client)
     }
 
     #[staticmethod]
     fn chrome_131() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_131(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_131(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_144() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_144(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_144(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_145() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_145(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_145(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_146() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_146(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_146(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_147() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_147(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_147(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_148() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_148(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_148(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_149() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_149(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_149(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_150() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_150(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_150(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_151() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_151(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_151(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_152() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_152(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_152(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_153() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_153(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_153(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_154() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_154(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_154(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_155() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_155(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_155(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
+    }
+
+    #[staticmethod]
+    fn chrome_156() -> Self {
+        Self::from_preset(
+            lkrequest::preset::chrome_156(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
+    }
+
+    #[staticmethod]
+    fn chrome_157() -> Self {
+        Self::from_preset(
+            lkrequest::preset::chrome_157(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn firefox_133() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::firefox_133(),
-                lkrequest::TcpFingerprint::firefox(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::firefox_133(),
+            lkrequest::TcpFingerprint::firefox(),
+        )
     }
 
     #[staticmethod]
     fn firefox_147() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::firefox_147(),
-                lkrequest::TcpFingerprint::firefox(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::firefox_147(),
+            lkrequest::TcpFingerprint::firefox(),
+        )
     }
 
     #[staticmethod]
     fn firefox_156() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::firefox_156(),
-                lkrequest::TcpFingerprint::firefox(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::firefox_156(),
+            lkrequest::TcpFingerprint::firefox(),
+        )
     }
 
     #[staticmethod]
     fn safari_18() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::safari_18(),
-                lkrequest::TcpFingerprint::safari(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::safari_18(),
+            lkrequest::TcpFingerprint::safari(),
+        )
     }
 
     #[staticmethod]
     fn safari_26() -> Self {
-        PyClient {
-            inner: build_preset_client(
-                lkrequest::preset::safari_26(),
-                lkrequest::TcpFingerprint::safari(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::safari_26(),
+            lkrequest::TcpFingerprint::safari(),
+        )
     }
 
     #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
@@ -939,7 +1119,7 @@ impl PyClient {
         on_response: Option<Py<PyAny>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
-        broken_quic_policy: Option<PyBrokenQuicPolicy>,
+        broken_quic_policy: Option<BrokenQuic>,
         h3_retry_mode: Option<PyH3RetryMode>,
         header_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -993,13 +1173,13 @@ impl PyClient {
             builder = builder.idle_timeout(validated_duration(t)?);
         }
         if let Some(policy) = protocol_policy {
-            builder = builder.protocol_policy(policy.inner);
+            builder = builder.protocol_policy(policy.validated()?);
         }
         if let Some(intent) = http_intent {
             builder = builder.http_intent(intent.into());
         }
         if let Some(policy) = broken_quic_policy {
-            builder = builder.broken_quic_policy(policy.into());
+            builder = builder.broken_quic_policy(policy.0);
         }
         if let Some(mode) = h3_retry_mode {
             builder = apply_h3_retry_mode(builder, mode)?;
@@ -1067,6 +1247,16 @@ impl PyClient {
         self.inner.h2_dispatch_batch_size()
     }
 
+    /// Whether HTTP/1.1 requests send header names in Title-Case
+    /// (`Content-Type`) rather than lowercase (`content-type`). Readable because
+    /// the casing is on the wire. Host keeps its capital H in either mode.
+    /// HTTP/2 and HTTP/3 always send lowercase names.
+    /// Defaults to True.
+    #[getter]
+    fn http1_title_case_headers(&self) -> bool {
+        self.inner.http1_title_case_headers()
+    }
+
     /// The TLS session ticket resumption policy in effect for this client.
     #[getter]
     fn tls_session_resumption_policy(
@@ -1079,30 +1269,30 @@ impl PyClient {
 
     /// Return a copy of this client with TLS-extension randomization enabled.
     ///
-    /// Only the fingerprint layers are carried over (TLS profile + its QUIC
-    /// fingerprint, H2 profile, TCP fingerprint). Other client-level
-    /// configuration — timeouts, default headers, header/cookie order,
-    /// certificate/`verify` settings, protocol policy, DNS, proxy and resource
-    /// limits — is NOT preserved and reverts to builder defaults. To keep that
-    /// config, pass a randomized `TlsProfile` (with its `randomization` set)
-    /// to the `Client(...)` constructor instead of calling this afterwards.
+    /// The copy is built again from the same constructor options, or the same
+    /// preset, with only the TLS profile replaced: its `randomization` is set,
+    /// and the rest of the profile and every other option carry over. A CA file
+    /// the options name is read again, and a keylog file opened again for
+    /// appending.
     #[pyo3(signature = (*, shuffle_extensions=true))]
-    fn randomize_fingerprint(&self, shuffle_extensions: bool) -> Self {
-        let mut profile = self.inner.tls_profile().clone();
-        profile.randomization =
-            Some(lktls::profile::types::RandomizationConfig { shuffle_extensions });
-        let mut builder = lkrequest::Client::builder()
-            .fingerprint(profile)
-            .h2_profile(self.inner.h2_profile().clone());
-        if let Some(tcp) = self.inner.tcp_fingerprint() {
-            builder = builder.tcp_fingerprint(tcp.clone());
-        }
-        if let Some(quic_tls) = self.inner.quic_tls_profile() {
-            builder = builder.quic_fingerprint(quic_tls.clone());
-        }
-        PyClient {
-            inner: builder.build(),
-        }
+    fn randomize_fingerprint(&self, shuffle_extensions: bool) -> PyResult<Self> {
+        let profile = randomized_tls_profile(&self.inner, shuffle_extensions);
+        Self::from_recipe(self.recipe.with_tls_profile(profile))
+    }
+
+    /// Tunnel to `target_host:target_port` through `proxy`, resolving names as
+    /// this client does, and return the seconds the tunnel took to set up.
+    #[pyo3(signature = (proxy, target_host="www.google.com", target_port=443, timeout=5.0))]
+    fn check_proxy<'py>(
+        &self,
+        py: Python<'py>,
+        proxy: &Bound<'py, PyAny>,
+        target_host: &str,
+        target_port: u16,
+        timeout: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let check = proxy_check(&self.inner, proxy, target_host, target_port, timeout)?;
+        crate::bridge::future_into_py(py, check)
     }
 
     fn __repr__(&self) -> String {
@@ -1133,6 +1323,27 @@ pub(crate) fn blocking_runtime() -> &'static tokio::runtime::Runtime {
 #[derive(Clone)]
 pub struct PyBlockingClient {
     pub(crate) inner: lkrequest::Client,
+    /// How `inner` was built, for `randomize_fingerprint()`.
+    recipe: Arc<ClientRecipe>,
+}
+
+impl PyBlockingClient {
+    fn from_recipe(recipe: ClientRecipe) -> PyResult<Self> {
+        Ok(Self {
+            inner: recipe.build()?,
+            recipe: Arc::new(recipe),
+        })
+    }
+
+    fn from_preset(
+        preset: lkrequest::preset::ClientPreset,
+        tcp: lkrequest::TcpFingerprint,
+    ) -> Self {
+        Self {
+            inner: build_preset_client(preset.clone(), tcp.clone(), None),
+            recipe: Arc::new(ClientRecipe::preset(preset, tcp)),
+        }
+    }
 }
 
 #[pymethods]
@@ -1147,6 +1358,7 @@ impl PyBlockingClient {
         header_order=None,
         h3_header_order=None,
         cookie_order=None,
+        http1_title_case_headers=None,
         dns_timeout=None,
         tcp_connect_timeout=None,
         tls_handshake_timeout=None,
@@ -1171,6 +1383,9 @@ impl PyBlockingClient {
         ca_cert_der=None,
         verify=None,
         use_native_certs=false,
+        trust_anchor_advertisement=None,
+        trust_anchor_recovery=None,
+        trust_anchor_bindings=None,
         ech_config=None,
         dns=None,
         ip_family=None,
@@ -1195,10 +1410,11 @@ impl PyBlockingClient {
         tls_profile: Option<Bound<'py, PyAny>>,
         h2_profile: Option<Bound<'py, PyAny>>,
         tcp_fingerprint: Option<Bound<'py, PyAny>>,
-        default_headers: Option<HashMap<String, String>>,
+        default_headers: Option<StrPairs>,
         header_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
         cookie_order: Option<Vec<String>>,
+        http1_title_case_headers: Option<bool>,
         dns_timeout: Option<f64>,
         tcp_connect_timeout: Option<f64>,
         tls_handshake_timeout: Option<f64>,
@@ -1223,13 +1439,16 @@ impl PyBlockingClient {
         ca_cert_der: Option<Vec<u8>>,
         verify: Option<bool>,
         use_native_certs: bool,
+        trust_anchor_advertisement: Option<String>,
+        trust_anchor_recovery: Option<String>,
+        trust_anchor_bindings: Option<BTreeMap<String, String>>,
         ech_config: Option<Vec<u8>>,
-        dns: Option<String>,
+        dns: Option<Bound<'_, PyAny>>,
         ip_family: Option<String>,
         connect_to: Option<HashMap<String, String>>,
         system_dns_cache_ttl: Option<f64>,
         system_dns_cache_max_entries: Option<usize>,
-        keylog: Option<String>,
+        keylog: Option<Bound<'_, PyAny>>,
         protocol_policy: Option<PyProtocolPolicy>,
         session_resumption: Option<PySessionResumptionConfig>,
         disable_http3: bool,
@@ -1261,7 +1480,7 @@ impl PyBlockingClient {
             .as_ref()
             .map(resolve_quic_from_any)
             .transpose()?;
-        let client = build_client(ClientConfig {
+        let config = ClientConfig {
             tls_profile: tls,
             h2_profile: h2,
             tcp_fingerprint: tcp,
@@ -1269,6 +1488,7 @@ impl PyBlockingClient {
             header_order,
             h3_header_order,
             cookie_order,
+            http1_title_case_headers,
             dns_timeout,
             tcp_connect_timeout,
             tls_handshake_timeout,
@@ -1293,14 +1513,23 @@ impl PyBlockingClient {
             ca_cert_der,
             verify,
             use_native_certs,
+            trust_anchor_policy: crate::trust_anchor::parse_policy(
+                trust_anchor_advertisement.as_deref(),
+                trust_anchor_recovery.as_deref(),
+            )?,
+            trust_anchor_bindings: trust_anchor_bindings
+                .map(crate::trust_anchor::parse_bindings)
+                .transpose()?,
             ech_config,
-            dns,
+            dns: dns.as_ref().map(resolve_dns).transpose()?,
             ip_family,
             connect_to,
             system_dns_cache_ttl,
             system_dns_cache_max_entries,
-            keylog,
-            protocol_policy: protocol_policy.map(|p| p.inner),
+            keylog: keylog.as_ref().map(resolve_keylog).transpose()?,
+            protocol_policy: protocol_policy
+                .map(PyProtocolPolicy::validated)
+                .transpose()?,
             session_resumption: session_resumption.map(|c| c.inner),
             disable_http3,
             quic_fingerprint: quic_fp,
@@ -1311,188 +1540,168 @@ impl PyBlockingClient {
             tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
             tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
             masque,
-        })?;
-        Ok(PyBlockingClient { inner: client })
+        };
+        Self::from_recipe(ClientRecipe::Options(config))
     }
 
     #[staticmethod]
     fn chrome_131() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_131(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_131(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_144() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_144(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_144(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_145() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_145(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_145(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_146() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_146(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_146(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_147() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_147(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_147(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_148() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_148(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_148(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_149() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_149(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_149(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_150() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_150(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_150(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_151() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_151(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_151(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_152() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_152(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_152(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_153() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_153(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_153(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_154() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_154(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_154(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn chrome_155() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::chrome_155(),
-                lkrequest::TcpFingerprint::chrome(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::chrome_155(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
+    }
+
+    #[staticmethod]
+    fn chrome_156() -> Self {
+        Self::from_preset(
+            lkrequest::preset::chrome_156(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
+    }
+
+    #[staticmethod]
+    fn chrome_157() -> Self {
+        Self::from_preset(
+            lkrequest::preset::chrome_157(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
     }
 
     #[staticmethod]
     fn firefox_133() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::firefox_133(),
-                lkrequest::TcpFingerprint::firefox(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::firefox_133(),
+            lkrequest::TcpFingerprint::firefox(),
+        )
     }
 
     #[staticmethod]
     fn firefox_147() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::firefox_147(),
-                lkrequest::TcpFingerprint::firefox(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::firefox_147(),
+            lkrequest::TcpFingerprint::firefox(),
+        )
     }
 
     #[staticmethod]
     fn firefox_156() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::firefox_156(),
-                lkrequest::TcpFingerprint::firefox(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::firefox_156(),
+            lkrequest::TcpFingerprint::firefox(),
+        )
     }
 
     #[staticmethod]
     fn safari_18() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::safari_18(),
-                lkrequest::TcpFingerprint::safari(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::safari_18(),
+            lkrequest::TcpFingerprint::safari(),
+        )
     }
 
     #[staticmethod]
     fn safari_26() -> Self {
-        PyBlockingClient {
-            inner: build_preset_client(
-                lkrequest::preset::safari_26(),
-                lkrequest::TcpFingerprint::safari(),
-            ),
-        }
+        Self::from_preset(
+            lkrequest::preset::safari_26(),
+            lkrequest::TcpFingerprint::safari(),
+        )
     }
 
     #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
@@ -1516,7 +1725,7 @@ impl PyBlockingClient {
         on_response: Option<Py<PyAny>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
-        broken_quic_policy: Option<PyBrokenQuicPolicy>,
+        broken_quic_policy: Option<BrokenQuic>,
         h3_retry_mode: Option<PyH3RetryMode>,
         header_order: Option<Vec<String>>,
         h3_header_order: Option<Vec<String>>,
@@ -1570,13 +1779,13 @@ impl PyBlockingClient {
             builder = builder.idle_timeout(validated_duration(t)?);
         }
         if let Some(policy) = protocol_policy {
-            builder = builder.protocol_policy(policy.inner);
+            builder = builder.protocol_policy(policy.validated()?);
         }
         if let Some(intent) = http_intent {
             builder = builder.http_intent(intent.into());
         }
         if let Some(policy) = broken_quic_policy {
-            builder = builder.broken_quic_policy(policy.into());
+            builder = builder.broken_quic_policy(policy.0);
         }
         if let Some(mode) = h3_retry_mode {
             builder = apply_h3_retry_mode(builder, mode)?;
@@ -1644,6 +1853,16 @@ impl PyBlockingClient {
         self.inner.h2_dispatch_batch_size()
     }
 
+    /// Whether HTTP/1.1 requests send header names in Title-Case
+    /// (`Content-Type`) rather than lowercase (`content-type`). Readable because
+    /// the casing is on the wire. Host keeps its capital H in either mode.
+    /// HTTP/2 and HTTP/3 always send lowercase names.
+    /// Defaults to True.
+    #[getter]
+    fn http1_title_case_headers(&self) -> bool {
+        self.inner.http1_title_case_headers()
+    }
+
     /// The TLS session ticket resumption policy in effect for this client.
     #[getter]
     fn tls_session_resumption_policy(
@@ -1656,33 +1875,235 @@ impl PyBlockingClient {
 
     /// Return a copy of this client with TLS-extension randomization enabled.
     ///
-    /// Only the fingerprint layers are carried over (TLS profile + its QUIC
-    /// fingerprint, H2 profile, TCP fingerprint). Other client-level
-    /// configuration — timeouts, default headers, header/cookie order,
-    /// certificate/`verify` settings, protocol policy, DNS, proxy and resource
-    /// limits — is NOT preserved and reverts to builder defaults. To keep that
-    /// config, pass a randomized `TlsProfile` (with its `randomization` set)
-    /// to the `Client(...)` constructor instead of calling this afterwards.
+    /// The copy is built again from the same constructor options, or the same
+    /// preset, with only the TLS profile replaced: its `randomization` is set,
+    /// and the rest of the profile and every other option carry over. A CA file
+    /// the options name is read again, and a keylog file opened again for
+    /// appending.
     #[pyo3(signature = (*, shuffle_extensions=true))]
-    fn randomize_fingerprint(&self, shuffle_extensions: bool) -> Self {
-        let mut profile = self.inner.tls_profile().clone();
-        profile.randomization =
-            Some(lktls::profile::types::RandomizationConfig { shuffle_extensions });
-        let mut builder = lkrequest::Client::builder()
-            .fingerprint(profile)
-            .h2_profile(self.inner.h2_profile().clone());
-        if let Some(tcp) = self.inner.tcp_fingerprint() {
-            builder = builder.tcp_fingerprint(tcp.clone());
-        }
-        if let Some(quic_tls) = self.inner.quic_tls_profile() {
-            builder = builder.quic_fingerprint(quic_tls.clone());
-        }
-        PyBlockingClient {
-            inner: builder.build(),
-        }
+    fn randomize_fingerprint(&self, shuffle_extensions: bool) -> PyResult<Self> {
+        let profile = randomized_tls_profile(&self.inner, shuffle_extensions);
+        Self::from_recipe(self.recipe.with_tls_profile(profile))
+    }
+
+    /// As `Client.check_proxy()`, blocking until the check is done.
+    #[pyo3(signature = (proxy, target_host="www.google.com", target_port=443, timeout=5.0))]
+    fn check_proxy(
+        &self,
+        py: Python<'_>,
+        proxy: &Bound<'_, PyAny>,
+        target_host: &str,
+        target_port: u16,
+        timeout: f64,
+    ) -> PyResult<f64> {
+        let check = proxy_check(&self.inner, proxy, target_host, target_port, timeout)?;
+        py.detach(|| blocking_runtime().block_on(check))
     }
 
     fn __repr__(&self) -> String {
         format!("<BlockingClient tls='{}'>", self.inner.tls_profile().name)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Requests straight from a client
+// ---------------------------------------------------------------------------
+
+/// `get()` … `options()` on a client class, each sending the request from a
+/// session of its own, as upstream's `Client::get()` and the like build one
+/// per call. Forwarding to the session's method keeps the arguments, and how
+/// they are checked, the same as there.
+macro_rules! one_off_requests {
+    ($client:ty: $($method:ident),*) => {
+        #[pymethods]
+        impl $client {
+            $(
+                #[doc = concat!(
+                    "`session().", stringify!($method), "(url, **kwargs)`: the request ",
+                    "from a session of its own, so no connection or cookie is kept ",
+                    "from one call to the next."
+                )]
+                #[pyo3(signature = (url, **kwargs))]
+                fn $method<'py>(
+                    slf: &Bound<'py, Self>,
+                    url: &Bound<'py, PyAny>,
+                    kwargs: Option<&Bound<'py, PyDict>>,
+                ) -> PyResult<Bound<'py, PyAny>> {
+                    slf.call_method0("session")?
+                        .call_method(stringify!($method), (url,), kwargs)
+                }
+            )*
+        }
+    };
+}
+
+one_off_requests!(PyClient: get, post, put, delete, head, patch, options);
+one_off_requests!(PyBlockingClient: get, post, put, delete, head, patch, options);
+
+// ---------------------------------------------------------------------------
+// What a client was built with
+// ---------------------------------------------------------------------------
+
+/// `timeouts`, in seconds under the names of the arguments that set them.
+fn timeouts_dict<'py>(
+    py: Python<'py>,
+    timeouts: &lkrequest::TimeoutConfig,
+) -> PyResult<Bound<'py, PyDict>> {
+    let secs = |timeout: Option<std::time::Duration>| timeout.map(|t| t.as_secs_f64());
+    let dict = PyDict::new(py);
+    dict.set_item("dns_timeout", secs(timeouts.dns_timeout))?;
+    dict.set_item("tcp_connect_timeout", secs(timeouts.tcp_connect_timeout))?;
+    dict.set_item(
+        "tls_handshake_timeout",
+        secs(timeouts.tls_handshake_timeout),
+    )?;
+    dict.set_item("ttfb_timeout", secs(timeouts.ttfb_timeout))?;
+    dict.set_item("total_timeout", secs(timeouts.total_timeout))?;
+    dict.set_item("quic_connect_timeout", secs(timeouts.quic_connect_timeout))?;
+    Ok(dict)
+}
+
+/// `limits`, under the names of the arguments that set them; no cap on
+/// connections reads as `None`, as that argument takes it.
+fn resource_limits_dict<'py>(
+    py: Python<'py>,
+    limits: &lkrequest::ResourceLimits,
+) -> PyResult<Bound<'py, PyDict>> {
+    let connections = Some(limits.max_connections_per_session).filter(|&cap| cap != usize::MAX);
+    let dict = PyDict::new(py);
+    dict.set_item("max_response_body_size", limits.max_response_body_size)?;
+    dict.set_item("max_connections_per_session", connections)?;
+    dict.set_item("max_header_count", limits.max_header_count)?;
+    dict.set_item("max_header_size", limits.max_header_size)?;
+    dict.set_item("max_headers_total_size", limits.max_headers_total_size)?;
+    dict.set_item("min_transfer_rate", limits.min_transfer_rate)?;
+    dict.set_item(
+        "min_transfer_rate_window",
+        limits.transfer_rate_window.as_secs_f64(),
+    )?;
+    Ok(dict)
+}
+
+/// Read-only settings on a client class, as the client has them once built,
+/// a preset applied: mostly under the name of the argument that sets them.
+macro_rules! client_settings {
+    ($client:ty) => {
+        #[pymethods]
+        impl $client {
+            /// The TLS profile its ClientHello is built from.
+            #[getter]
+            fn tls_profile(&self) -> crate::fingerprint::PyTlsProfile {
+                crate::fingerprint::PyTlsProfile {
+                    inner: self.inner.tls_profile().clone(),
+                }
+            }
+
+            /// The HTTP/2 profile.
+            #[getter]
+            fn h2_profile(&self) -> crate::fingerprint::PyH2Profile {
+                crate::fingerprint::PyH2Profile {
+                    inner: self.inner.h2_profile().clone(),
+                }
+            }
+
+            /// The TCP fingerprint, or `None` to leave sockets as the OS sets
+            /// them up.
+            #[getter]
+            fn tcp_fingerprint(&self) -> Option<crate::fingerprint::PyTcpFingerprint> {
+                self.inner.tcp_fingerprint().map(|fingerprint| {
+                    crate::fingerprint::PyTcpFingerprint {
+                        inner: fingerprint.clone(),
+                    }
+                })
+            }
+
+            /// The default headers as `(name, value)` pairs, in the order they
+            /// go out wherever `header_order` does not place them.
+            #[getter]
+            fn default_headers(&self) -> Vec<(String, String)> {
+                self.inner
+                    .default_headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                        (name.as_str().to_owned(), value)
+                    })
+                    .collect()
+            }
+
+            #[getter]
+            fn header_order(&self) -> Option<Vec<String>> {
+                self.inner
+                    .header_order()
+                    .map(|names| names.iter().map(|name| name.as_str().to_owned()).collect())
+            }
+
+            #[getter]
+            fn h3_header_order(&self) -> Option<Vec<String>> {
+                self.inner
+                    .h3_header_order()
+                    .map(|names| names.iter().map(|name| name.as_str().to_owned()).collect())
+            }
+
+            #[getter]
+            fn cookie_order(&self) -> Option<Vec<String>> {
+                self.inner
+                    .cookie_order()
+                    .map(|names| names.iter().map(|name| name.to_string()).collect())
+            }
+
+            /// The timeouts in seconds, `None` where there is none.
+            #[getter]
+            fn timeouts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+                timeouts_dict(py, self.inner.timeouts())
+            }
+
+            /// The response and connection limits.
+            #[getter]
+            fn resource_limits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+                resource_limits_dict(py, self.inner.resource_limits())
+            }
+
+            /// The protocol policy its sessions start from.
+            #[getter]
+            fn protocol_policy(&self) -> PyProtocolPolicy {
+                PyProtocolPolicy {
+                    inner: self.inner.protocol_policy().clone(),
+                }
+            }
+
+            #[getter]
+            fn verify(&self) -> bool {
+                self.inner.verify()
+            }
+
+            #[getter]
+            fn ip_family(&self) -> &'static str {
+                crate::dns::family_label(self.inner.ip_family())
+            }
+
+            #[getter]
+            fn h2_fallback_h1(&self) -> bool {
+                self.inner.fallback().h2_to_h1
+            }
+
+            #[getter]
+            fn proxy_fallback_direct(&self) -> bool {
+                self.inner.fallback().proxy_to_direct
+            }
+
+            #[getter]
+            fn max_pending_h2_requests(&self) -> Option<usize> {
+                self.inner.max_pending_h2_requests()
+            }
+
+            #[getter]
+            fn ech_config(&self) -> Option<Vec<u8>> {
+                self.inner.ech_config().map(<[u8]>::to_vec)
+            }
+        }
+    };
+}
+
+client_settings!(PyClient);
+client_settings!(PyBlockingClient);

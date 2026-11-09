@@ -345,6 +345,23 @@ async def test_h2_priority_weight_is_accepted_by_the_async_session(h2_probe):
     assert h2_probe.requests[0].wire_weight == 21
 
 
+@pytest.mark.parametrize("method", ["head", "options", "send_streaming"])
+def test_every_request_method_takes_the_priority_options(h2_probe, method):
+    session = firefox_156_session()
+    url = f"{h2_probe.url}/{method}"
+    options = {
+        "priority": lkrequest.RequestPriority(6, False),
+        "h2_priority_weight": 21,
+    }
+    if method == "send_streaming":
+        session.send_streaming("GET", url, **options).bytes()
+    else:
+        getattr(session, method)(url, **options)
+    seen = h2_probe.requests[0]
+    assert seen.wire_weight == 21
+    assert seen.priority_header is not None and "u=6" in seen.priority_header
+
+
 # ---------------------------------------------------------------------------
 # Requests the caller gives up on after they are on the wire
 # ---------------------------------------------------------------------------

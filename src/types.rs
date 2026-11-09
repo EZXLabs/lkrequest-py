@@ -1,20 +1,29 @@
-//! Shared value-type pyclasses and helpers: `HttpVersion`, `TimeoutConfig`,
-//! `ResourceLimits`, `SessionResumptionConfig`, `AcceptEncoding`, pool-stats
-//! types, plus duration validation and preset/JSON conversion utilities.
+//! Shared value-type pyclasses and helpers: `HttpVersion`,
+//! `SessionResumptionConfig`, `AcceptEncoding`, pool-stats types, plus
+//! duration validation and preset/JSON conversion utilities.
 
 use pyo3::prelude::*;
 use std::time::Duration;
 
-/// Validate and convert a Python float to Duration, rejecting NaN/Infinity/negative values
-/// that would panic in `Duration::from_secs_f64`.
+/// Validate and convert a Python float to Duration, rejecting the NaN, infinite,
+/// negative and too large values that `Duration::from_secs_f64` panics on.
 pub fn validated_duration(secs: f64) -> PyResult<Duration> {
-    if !secs.is_finite() || secs < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Duration must be a finite non-negative number, got {}",
+    Duration::try_from_secs_f64(secs).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Duration must be a non-negative number of seconds below 2**64, got {}",
             secs
-        )));
-    }
-    Ok(Duration::from_secs_f64(secs))
+        ))
+    })
+}
+
+/// Whether `function` is an `async def`, whose call the Rust library, which
+/// calls back synchronously, would only get an unawaited coroutine from.
+pub(crate) fn is_async_function(function: &Bound<'_, PyAny>) -> PyResult<bool> {
+    function
+        .py()
+        .import("inspect")?
+        .call_method1("iscoroutinefunction", (function,))?
+        .is_truthy()
 }
 
 /// Accept either a Python `dict[str, str]` or a sequence of `(str, str)` pairs
@@ -24,11 +33,14 @@ pub fn validated_duration(secs: f64) -> PyResult<Duration> {
 /// (CPython dicts are insertion-ordered) and allows duplicate keys — both of
 /// which matter for header-order fingerprinting and for repeated query/form
 /// fields like `?tag=a&tag=b`.
+#[derive(Clone)]
 pub struct StrPairs(pub Vec<(String, String)>);
 
-impl<'py> FromPyObject<'py> for StrPairs {
-    fn extract_bound(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if let Ok(dict) = obj.downcast::<pyo3::types::PyDict>() {
+impl<'py> FromPyObject<'_, 'py> for StrPairs {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(dict) = obj.cast::<pyo3::types::PyDict>() {
             let mut pairs = Vec::with_capacity(dict.len());
             for (k, v) in dict.iter() {
                 pairs.push((k.extract::<String>()?, v.extract::<String>()?));
@@ -70,104 +82,11 @@ impl From<lkrequest::HttpVersion> for PyHttpVersion {
     }
 }
 
-#[pyclass(name = "TimeoutConfig")]
-#[derive(Clone)]
-pub struct PyTimeoutConfig {
-    pub(crate) inner: lkrequest::TimeoutConfig,
-}
-
-#[pymethods]
-impl PyTimeoutConfig {
-    #[new]
-    #[pyo3(signature = (*, dns=None, tcp_connect=None, tls_handshake=None, ttfb=None, total=None))]
-    fn new(
-        dns: Option<f64>,
-        tcp_connect: Option<f64>,
-        tls_handshake: Option<f64>,
-        ttfb: Option<f64>,
-        total: Option<f64>,
-    ) -> PyResult<Self> {
-        let mut config = lkrequest::TimeoutConfig::none();
-        if let Some(t) = dns {
-            config = config.with_dns_timeout(validated_duration(t)?);
-        }
-        if let Some(t) = tcp_connect {
-            config = config.with_tcp_connect_timeout(validated_duration(t)?);
-        }
-        if let Some(t) = tls_handshake {
-            config = config.with_tls_handshake_timeout(validated_duration(t)?);
-        }
-        if let Some(t) = ttfb {
-            config = config.with_ttfb_timeout(validated_duration(t)?);
-        }
-        if let Some(t) = total {
-            config = config.with_total_timeout(validated_duration(t)?);
-        }
-        Ok(PyTimeoutConfig { inner: config })
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "TimeoutConfig(dns={:?}, tcp_connect={:?}, tls_handshake={:?}, ttfb={:?}, total={:?})",
-            self.inner.dns_timeout,
-            self.inner.tcp_connect_timeout,
-            self.inner.tls_handshake_timeout,
-            self.inner.ttfb_timeout,
-            self.inner.total_timeout,
-        )
-    }
-}
-
-#[pyclass(name = "ResourceLimits")]
-#[derive(Clone)]
-pub struct PyResourceLimits {
-    pub(crate) inner: lkrequest::ResourceLimits,
-}
-
-#[pymethods]
-impl PyResourceLimits {
-    #[new]
-    #[pyo3(signature = (*, max_response_body_size=None, max_connections_per_session=None, min_transfer_rate=None, transfer_rate_window=None))]
-    fn new(
-        max_response_body_size: Option<usize>,
-        max_connections_per_session: Option<usize>,
-        min_transfer_rate: Option<usize>,
-        transfer_rate_window: Option<f64>,
-    ) -> PyResult<Self> {
-        let mut limits = lkrequest::ResourceLimits::default();
-        if let Some(s) = max_response_body_size {
-            limits = limits.with_max_response_body_size(s);
-        }
-        if let Some(n) = max_connections_per_session {
-            limits = limits.with_max_connections_per_session(n);
-        }
-        if transfer_rate_window.is_some() && min_transfer_rate.is_none() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "transfer_rate_window has no effect without min_transfer_rate; set both or neither",
-            ));
-        }
-        if let Some(rate) = min_transfer_rate {
-            let window = validated_duration(transfer_rate_window.unwrap_or(10.0))?;
-            limits = limits.with_min_transfer_rate(rate, window);
-        }
-        Ok(PyResourceLimits { inner: limits })
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "ResourceLimits(max_body={}, max_conn={}, min_rate={:?})",
-            self.inner.max_response_body_size,
-            self.inner.max_connections_per_session,
-            self.inner.min_transfer_rate,
-        )
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SessionResumptionConfig — TLS 1.3 PSK / TLS 1.2 ticket resumption control
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "SessionResumptionConfig")]
+#[pyclass(name = "SessionResumptionConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PySessionResumptionConfig {
     pub(crate) inner: lktls::profile::types::SessionResumptionConfig,
@@ -263,13 +182,15 @@ pub fn resolve_tls_profile(name: &str) -> PyResult<lktls::profile::TlsProfile> {
         "chrome_153" => Ok(lktls::profile::presets::chrome_153()),
         "chrome_154" => Ok(lktls::profile::presets::chrome_154()),
         "chrome_155" => Ok(lktls::profile::presets::chrome_155()),
+        "chrome_156" => Ok(lktls::profile::presets::chrome_156()),
+        "chrome_157" => Ok(lktls::profile::presets::chrome_157()),
         "firefox_133" => Ok(lktls::profile::presets::firefox_133()),
         "firefox_147" => Ok(lktls::profile::presets::firefox_147()),
         "firefox_156" => Ok(lktls::profile::presets::firefox_156()),
         "safari_18" => Ok(lktls::profile::presets::safari_18()),
         "safari_26" => Ok(lktls::profile::presets::safari_26()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
+            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
             name
         ))),
     }
@@ -290,13 +211,15 @@ pub fn resolve_h2_profile(name: &str) -> PyResult<lkh2::profile::H2Profile> {
         "chrome_153" => Ok(lkh2::profile::chrome_153_h2()),
         "chrome_154" => Ok(lkh2::profile::chrome_154_h2()),
         "chrome_155" => Ok(lkh2::profile::chrome_155_h2()),
+        "chrome_156" => Ok(lkh2::profile::chrome_156_h2()),
+        "chrome_157" => Ok(lkh2::profile::chrome_157_h2()),
         "firefox_133" => Ok(lkh2::profile::firefox_133_h2()),
         "firefox_147" => Ok(lkh2::profile::firefox_147_h2()),
         "firefox_156" => Ok(lkh2::profile::firefox_156_h2()),
         "safari_18" => Ok(lkh2::profile::safari_18_h2()),
         "safari_26" => Ok(lkh2::profile::safari_26_h2()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
+            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
             name
         ))),
     }
@@ -329,7 +252,7 @@ pub fn resolve_tcp_fingerprint(name: &str) -> PyResult<lkrequest::TcpFingerprint
 // AcceptEncoding — bitflag-style encoding selection
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "AcceptEncoding")]
+#[pyclass(name = "AcceptEncoding", from_py_object)]
 #[derive(Clone, Copy)]
 pub struct PyAcceptEncoding {
     pub(crate) inner: lkrequest::AcceptEncoding,
@@ -452,7 +375,7 @@ impl PySessionPoolStats {
 /// The default keeps whatever the browser preset does natively; set this
 /// explicitly only when deliberately reshaping DATA framing, since the frame
 /// sizes are themselves an observable fingerprint trait.
-#[pyclass(name = "H2DataFramePolicy", eq)]
+#[pyclass(name = "H2DataFramePolicy", eq, from_py_object)]
 #[derive(Clone, Copy, PartialEq)]
 pub struct PyH2DataFramePolicy {
     pub(crate) inner: lkrequest::H2DataFramePolicy,

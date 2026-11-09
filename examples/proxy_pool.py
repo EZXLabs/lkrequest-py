@@ -1,14 +1,16 @@
 """
 代理和代理池示例
 
-演示单代理、多跳代理链、代理池、坏代理配置和健康检查。
+演示单代理、多跳代理链、代理池、坏代理配置、健康检查，以及用函数生成代理。
 
 注意：运行此示例需要可用的代理服务器。
       示例中使用的代理地址需要替换为你自己的。
 """
 
 import asyncio
+import itertools
 import lkrequest
+import lkrequest.blocking
 from lkrequest.blocking import Client as BlockingClient
 
 
@@ -109,16 +111,43 @@ async def proxy_pool_usage():
         bad_proxy_config=lkrequest.BadProxyConfig(failure_threshold=3),
     )
 
-    # 获取一个代理
-    proxy = await pool.acquire()
-    print(f"获取代理: {proxy}")
+    # 获取一个代理：lease.proxy 是带凭据的 ProxyConfig，可直接传给 session(proxy=...)
+    lease = await pool.acquire()
+    print(f"获取代理: {lease.proxy}")
+    session = lkrequest.Client().session(proxy=lease.proxy)
+    print(f"会话: {session!r}")
 
-    # 标记代理为坏
-    # pool.mark_bad(proxy)
-    print("可用方法: acquire(), mark_bad(identity)")
+    # 标记代理为坏并换一个
+    # lease = await pool.acquire_fresh(lease)
+
+    # 用完归还（也可以用 with / async with），否则会一直占着 max_proxies 的名额
+    lease.release()
+    print(
+        "可用方法: acquire(), acquire_fresh(lease), lease.mark_bad(), lease.release()"
+    )
+
+
+def dynamic_proxies():
+    """用函数生成代理（同步代理池）"""
+    print("\n=== 用函数生成代理 ===")
+
+    # 住宅代理网关常按用户名里的 session id 选出口，每次换一个 id 就换一个出口
+    session_ids = itertools.count(1)
+    pool = lkrequest.blocking.ProxyPool(
+        lambda: f"http://user-session-{next(session_ids)}:pass@127.0.0.1:7777",
+        max_proxies=10,
+        proxy_buffer=5,  # 在单独的线程上预先生成 5 个代理
+    )
+
+    # 每次 acquire() 都会拿到一个新代理；函数抛出的异常会从 acquire() 抛出
+    with pool.acquire() as lease:
+        print(f"获取代理: {lease.proxy}")
+        session = BlockingClient().session(proxy=lease.proxy)
+        print(f"会话: {session!r}")
 
 
 if __name__ == "__main__":
     proxy_basics()
     proxy_pool_config()
     asyncio.run(proxy_pool_usage())
+    dynamic_proxies()

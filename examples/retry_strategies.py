@@ -14,10 +14,10 @@ def main():
     # === 指数退避重试 ===
     print("=== 指数退避重试 (ExponentialBackoff) ===")
     retry_exp = lkrequest.ExponentialBackoff(
-        max_retries=3,      # 最多重试 3 次
-        base_delay=0.5,     # 基础延迟 0.5 秒
-        max_delay=30.0,     # 最大延迟 30 秒
-        jitter=True,        # 添加随机抖动
+        max_retries=3,  # 最多重试 3 次
+        base_delay=0.5,  # 基础延迟 0.5 秒
+        max_delay=30.0,  # 最大延迟 30 秒
+        jitter=True,  # 添加随机抖动
     )
     print(f"  配置: {repr(retry_exp)}")
 
@@ -26,10 +26,10 @@ def main():
     print(f"  结果: {resp.status_code}")
 
     # === 固定间隔重试 ===
-    print(f"\n=== 固定间隔重试 (FixedInterval) ===")
+    print("\n=== 固定间隔重试 (FixedInterval) ===")
     retry_fixed = lkrequest.FixedInterval(
-        max_retries=5,      # 最多重试 5 次
-        interval=1.0,       # 每次间隔 1 秒
+        max_retries=5,  # 最多重试 5 次
+        interval=1.0,  # 每次间隔 1 秒
     )
     print(f"  配置: {repr(retry_fixed)}")
 
@@ -38,9 +38,11 @@ def main():
     print(f"  结果: {resp.status_code}")
 
     # === 自定义重试策略 (callable) ===
-    print(f"\n=== 自定义重试策略 (callable) ===")
+    print("\n=== 自定义重试策略 (callable) ===")
 
-    def smart_retry(attempt: int, error: str | None, status: int | None) -> float | None:
+    def smart_retry(
+        attempt: int, error: str | None, status: int | None
+    ) -> float | None:
         """
         智能重试策略：
         - attempt: 当前重试次数 (从 1 开始)
@@ -51,7 +53,7 @@ def main():
         print(f"  [smart_retry] attempt={attempt}, error={error}, status={status}")
 
         if status == 429:
-            return min(2 ** attempt, 60)
+            return min(2**attempt, 60)
 
         if status and 500 <= status < 600:
             if attempt <= 3:
@@ -67,7 +69,7 @@ def main():
     print(f"  结果: {resp.status_code}")
 
     # === Lambda 重试 ===
-    print(f"\n=== Lambda 重试 ===")
+    print("\n=== Lambda 重试 ===")
     session4 = client.session(
         retry=lambda attempt, error, status: 0.5 if attempt < 3 else None
     )
@@ -75,15 +77,17 @@ def main():
     print(f"  结果: {resp.status_code}")
 
     # === 记录重试日志的策略 ===
-    print(f"\n=== 重试日志记录 ===")
+    print("\n=== 重试日志记录 ===")
     retry_log = []
 
     def logging_retry(attempt, error, status):
-        retry_log.append({
-            "attempt": attempt,
-            "error": error,
-            "status": status,
-        })
+        retry_log.append(
+            {
+                "attempt": attempt,
+                "error": error,
+                "status": status,
+            }
+        )
         if attempt <= 3:
             return 0.1
         return None
@@ -91,7 +95,23 @@ def main():
     session5 = client.session(retry=logging_retry)
     resp = session5.get("https://httpbin.org/get")
     print(f"  重试日志: {retry_log}")
-    print(f"  (正常请求不会触发重试，日志应该为空)")
+    print("  (正常请求不会触发重试，日志应该为空)")
+
+    # === 按异常属性决定是否重试 ===
+    # 回调多接受一个 exception= 参数，就能拿到异常对象及其 retryable、phase 等属性
+    print("\n=== 按异常属性重试 ===")
+
+    def retry_when_worth_it(attempt, error, status, exception=None):
+        if exception is not None and exception.retryable and attempt <= 2:
+            print(f"  第 {attempt} 次失败于 {exception.phase}，0.1 秒后重试")
+            return 0.1
+        return None
+
+    session6 = client.session(retry=retry_when_worth_it)
+    try:
+        session6.get("http://127.0.0.1:1/")  # 没有监听的端口
+    except lkrequest.LkConnectionError as e:
+        print(f"  最终失败: {type(e).__name__}")
 
 
 if __name__ == "__main__":

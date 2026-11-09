@@ -7,10 +7,52 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::client::{blocking_runtime, PyBlockingClient, PyClient};
-use crate::proxy::resolve_proxy_list;
+use crate::proxy::{rotation_strategy, PyBadProxyConfig, PyHealthCheckConfig};
+use crate::proxy_source::{acquiring, ProxySource};
 use crate::session::{PyBlockingSession, PySession};
 use crate::session_state::SessionState;
 use crate::types::validated_duration;
+
+/// The upstream pool both `SessionPool` classes wrap.
+fn build_session_pool(
+    client: &lkrequest::Client,
+    proxies: &Bound<'_, PyAny>,
+    max_sessions: Option<usize>,
+    idle_timeout: Option<f64>,
+    rotation: Option<&str>,
+    bad_proxy_config: Option<PyBadProxyConfig>,
+    health_check: Option<PyHealthCheckConfig>,
+    proxy_buffer: Option<usize>,
+) -> PyResult<lkrequest::SessionPool> {
+    let builder = lkrequest::SessionPool::builder().client(client);
+    let mut builder = match ProxySource::resolve(proxies, proxy_buffer)? {
+        ProxySource::List(configs) => builder.proxies(configs),
+        ProxySource::Function(function, buffer) => {
+            let builder = builder.proxy_provider(function);
+            match buffer {
+                Some(capacity) => builder.proxy_buffer(capacity),
+                None => builder,
+            }
+        }
+    };
+    if let Some(n) = max_sessions {
+        builder = builder.max_sessions(n);
+    }
+    if let Some(t) = idle_timeout {
+        builder = builder.idle_timeout(validated_duration(t)?);
+    }
+    if let Some(strategy) = rotation {
+        builder = builder.rotation(rotation_strategy(strategy)?);
+    }
+    if let Some(bpc) = bad_proxy_config {
+        builder = builder.bad_proxy_config(bpc.inner);
+    }
+    if let Some(hc) = health_check {
+        builder = builder.health_check(hc.inner);
+    }
+    let _guard = blocking_runtime().enter();
+    Ok(builder.build())
+}
 
 // ---------------------------------------------------------------------------
 // Async SessionPool
@@ -25,40 +67,28 @@ pub struct PySessionPool {
 #[pymethods]
 impl PySessionPool {
     #[new]
-    #[pyo3(signature = (client, proxies, *, max_sessions=None, idle_timeout=None, rotation=None))]
+    #[pyo3(signature = (client, proxies, *, max_sessions=None, idle_timeout=None, rotation=None, bad_proxy_config=None, health_check=None, proxy_buffer=None))]
     fn new(
         client: &PyClient,
         proxies: &Bound<'_, PyAny>,
         max_sessions: Option<usize>,
         idle_timeout: Option<f64>,
         rotation: Option<&str>,
+        bad_proxy_config: Option<PyBadProxyConfig>,
+        health_check: Option<PyHealthCheckConfig>,
+        proxy_buffer: Option<usize>,
     ) -> PyResult<Self> {
-        let configs = resolve_proxy_list(proxies)?;
-        let mut builder = lkrequest::SessionPool::builder()
-            .client(&client.inner)
-            .proxies(configs);
-        if let Some(n) = max_sessions {
-            builder = builder.max_sessions(n);
-        }
-        if let Some(t) = idle_timeout {
-            builder = builder.idle_timeout(validated_duration(t)?);
-        }
-        if let Some(strategy) = rotation {
-            let rs = match strategy {
-                "round_robin" => lkrequest::proxy::RotationStrategy::RoundRobin,
-                "random" => lkrequest::proxy::RotationStrategy::Random,
-                other => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "Unknown rotation strategy: '{}'. Use 'round_robin' or 'random'",
-                        other
-                    )));
-                }
-            };
-            builder = builder.rotation(rs);
-        }
-        let _guard = blocking_runtime().enter();
         Ok(PySessionPool {
-            inner: builder.build(),
+            inner: build_session_pool(
+                &client.inner,
+                proxies,
+                max_sessions,
+                idle_timeout,
+                rotation,
+                bad_proxy_config,
+                health_check,
+                proxy_buffer,
+            )?,
         })
     }
 
@@ -66,7 +96,7 @@ impl PySessionPool {
         let pool = self.inner.clone();
         crate::bridge::future_into_py(py, async move {
             tracing::debug!("session_pool.acquire");
-            let guard = pool.acquire().await;
+            let guard = acquiring(pool.acquire()).await?;
             Ok(PySessionGuard {
                 guard: Arc::new(Mutex::new(Some(guard))),
             })
@@ -89,7 +119,7 @@ impl PySessionPool {
                 }
                 *lock = None;
             }
-            let guard = pool.acquire().await;
+            let guard = acquiring(pool.acquire()).await?;
             Ok(PySessionGuard {
                 guard: Arc::new(Mutex::new(Some(guard))),
             })
@@ -200,47 +230,35 @@ pub struct PyBlockingSessionPool {
 #[pymethods]
 impl PyBlockingSessionPool {
     #[new]
-    #[pyo3(signature = (client, proxies, *, max_sessions=None, idle_timeout=None, rotation=None))]
+    #[pyo3(signature = (client, proxies, *, max_sessions=None, idle_timeout=None, rotation=None, bad_proxy_config=None, health_check=None, proxy_buffer=None))]
     fn new(
         client: &PyBlockingClient,
         proxies: &Bound<'_, PyAny>,
         max_sessions: Option<usize>,
         idle_timeout: Option<f64>,
         rotation: Option<&str>,
+        bad_proxy_config: Option<PyBadProxyConfig>,
+        health_check: Option<PyHealthCheckConfig>,
+        proxy_buffer: Option<usize>,
     ) -> PyResult<Self> {
-        let configs = resolve_proxy_list(proxies)?;
-        let mut builder = lkrequest::SessionPool::builder()
-            .client(&client.inner)
-            .proxies(configs);
-        if let Some(n) = max_sessions {
-            builder = builder.max_sessions(n);
-        }
-        if let Some(t) = idle_timeout {
-            builder = builder.idle_timeout(validated_duration(t)?);
-        }
-        if let Some(strategy) = rotation {
-            let rs = match strategy {
-                "round_robin" => lkrequest::proxy::RotationStrategy::RoundRobin,
-                "random" => lkrequest::proxy::RotationStrategy::Random,
-                other => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "Unknown rotation strategy: '{}'. Use 'round_robin' or 'random'",
-                        other
-                    )));
-                }
-            };
-            builder = builder.rotation(rs);
-        }
-        let _guard = blocking_runtime().enter();
         Ok(PyBlockingSessionPool {
-            inner: builder.build(),
+            inner: build_session_pool(
+                &client.inner,
+                proxies,
+                max_sessions,
+                idle_timeout,
+                rotation,
+                bad_proxy_config,
+                health_check,
+                proxy_buffer,
+            )?,
         })
     }
 
     fn acquire(&self, py: Python<'_>) -> PyResult<PyBlockingSessionGuard> {
         let pool = self.inner.clone();
-        py.allow_threads(|| {
-            let guard = blocking_runtime().block_on(pool.acquire());
+        py.detach(|| {
+            let guard = blocking_runtime().block_on(acquiring(pool.acquire()))?;
             Ok(PyBlockingSessionGuard { guard: Some(guard) })
         })
     }
@@ -255,8 +273,8 @@ impl PyBlockingSessionPool {
             pool.mark_bad(g);
         }
         bad_guard.guard = None;
-        py.allow_threads(|| {
-            let guard = blocking_runtime().block_on(pool.acquire());
+        py.detach(|| {
+            let guard = blocking_runtime().block_on(acquiring(pool.acquire()))?;
             Ok(PyBlockingSessionGuard { guard: Some(guard) })
         })
     }
@@ -269,7 +287,7 @@ impl PyBlockingSessionPool {
 
     fn stats(&self, py: Python<'_>) -> PyResult<crate::types::PySessionPoolStats> {
         let pool = self.inner.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             blocking_runtime().block_on(async move {
                 let stats = pool.stats().await;
                 Ok(crate::types::PySessionPoolStats::from(stats))

@@ -32,7 +32,7 @@ def blocking_streaming():
 
 async def async_streaming():
     """异步流式响应"""
-    print(f"\n=== 异步流式响应 ===")
+    print("\n=== 异步流式响应 ===")
 
     client = lkrequest.Client.chrome_144()
     session = client.session()
@@ -49,7 +49,7 @@ async def async_streaming():
     print(f"text() 长度: {len(text)}")
 
     # --- 逐块读取 (async for) ---
-    print(f"\n--- 逐块读取 ---")
+    print("\n--- 逐块读取 ---")
     stream3 = await session.send_streaming("GET", "https://httpbin.org/get")
     total = 0
     chunk_count = 0
@@ -59,7 +59,7 @@ async def async_streaming():
     print(f"收到 {chunk_count} 个 chunk, 总计 {total} bytes")
 
     # --- 使用 chunk() 方法手动读取 ---
-    print(f"\n--- chunk() 手动读取 ---")
+    print("\n--- chunk() 手动读取 ---")
     stream4 = await session.send_streaming("GET", "https://httpbin.org/get")
     chunks = []
     while True:
@@ -70,7 +70,7 @@ async def async_streaming():
     print(f"手动读取 {len(chunks)} 个 chunk")
 
     # --- 带参数的流式请求 ---
-    print(f"\n--- 带参数的流式请求 ---")
+    print("\n--- 带参数的流式请求 ---")
     stream5 = await session.send_streaming(
         "GET",
         "https://httpbin.org/get",

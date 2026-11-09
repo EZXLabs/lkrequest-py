@@ -19,7 +19,7 @@ def main():
     print(f"  warnings: {result.get('warnings', [])}")
 
     # === 混合指纹组合 ===
-    print(f"\n=== 混合指纹组合 ===")
+    print("\n=== 混合指纹组合 ===")
     result = lkrequest.validate_fingerprint_consistency(
         tls_profile="chrome_144",
         h2_profile="firefox_147",
@@ -32,7 +32,7 @@ def main():
             print(f"  ⚠ {w}")
 
     # === 部分指纹验证 ===
-    print(f"\n=== 部分指纹验证 ===")
+    print("\n=== 部分指纹验证 ===")
     result = lkrequest.validate_fingerprint_consistency(
         tls_profile="chrome_144",
     )
@@ -45,7 +45,7 @@ def main():
     print(f"  TLS+H2 Firefox - valid: {result['valid']}")
 
     # === 所有有效组合 ===
-    print(f"\n=== 常用组合验证 ===")
+    print("\n=== 常用组合验证 ===")
     combos = [
         ("chrome_131", "chrome_131", "chrome_win"),
         ("chrome_144", "chrome_144", "chrome_win"),

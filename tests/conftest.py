@@ -278,8 +278,9 @@ def _with_websocket_echo(inner):
     The route matches on the plain ASGI `path`, so an upgrade sent in
     absolute-form fails the handshake instead of being quietly normalised.
 
-    Sending `_WS_HANDSHAKE_PROBE` gets back JSON describing the request line and
-    Host header the server saw, which is how the handshake tests observe them.
+    Sending `_WS_HANDSHAKE_PROBE` gets back JSON describing the request line,
+    Host and Sec-WebSocket-Extensions headers the server saw, which is how the
+    handshake tests observe them.
 
     Anything that is not a WebSocket scope is delegated untouched.
     """
@@ -305,9 +306,7 @@ def _with_websocket_echo(inner):
                 continue
             text = message.get("text")
             if text == _WS_HANDSHAKE_PROBE:
-                host = next(
-                    (v for k, v in scope.get("headers", []) if k == b"host"), b""
-                )
+                headers = dict(scope.get("headers", []))
                 await send(
                     {
                         "type": "websocket.send",
@@ -316,7 +315,10 @@ def _with_websocket_echo(inner):
                                 "raw_path": scope.get("raw_path", b"").decode(
                                     "latin-1"
                                 ),
-                                "host": host.decode("latin-1"),
+                                "host": headers.get(b"host", b"").decode("latin-1"),
+                                "extensions": headers.get(
+                                    b"sec-websocket-extensions", b""
+                                ).decode("latin-1"),
                             }
                         ),
                     }
@@ -488,10 +490,10 @@ def _masque_proxy_server(_certs):
 
 @pytest.fixture
 def raw_http():
-    """Start plain HTTP/1.1 servers that answer with raw bytes (see `_raw_http.py`).
+    """Start HTTP/1.1 servers that answer with raw bytes (see `_raw_http.py`).
 
-    Call it with `reply(request) -> bytes`; the servers are stopped when the
-    test ends.
+    Call it with `reply(request) -> bytes`, and `ssl=` for one that speaks TLS;
+    the servers are stopped when the test ends.
     """
     from _raw_http import RawHttpServer
 

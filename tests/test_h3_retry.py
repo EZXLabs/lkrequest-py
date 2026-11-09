@@ -165,6 +165,28 @@ def test_a_not_idempotent_request_opts_out_of_the_mode(h3_closing_server):
     assert len(h3_closing_server.accepted) == 1
 
 
+@pytest.mark.parametrize(
+    ("idempotency", "attempts"),
+    [(None, 3), (lkrequest.Idempotency.NotIdempotent, 1)],
+    ids=["default", "not-idempotent"],
+)
+@pytest.mark.parametrize("method", ["head", "options", "send_streaming"])
+def test_every_request_method_takes_idempotency(
+    h3_closing_server, method, idempotency, attempts
+):
+    mode = lkrequest.H3RetryMode.Chrome155ProtocolErrors
+    retrying = session(h3_retry_mode=mode)
+    options = {"timeout": 5}
+    if idempotency is not None:
+        options["idempotency"] = idempotency
+    with pytest.raises(lkrequest.RequestError, match="H3_INTERNAL_ERROR"):
+        if method == "send_streaming":
+            retrying.send_streaming("GET", h3_closing_server.url, **options).bytes()
+        else:
+            getattr(retrying, method)(h3_closing_server.url, **options)
+    assert len(h3_closing_server.accepted) == attempts
+
+
 async def test_the_async_session_takes_the_mode_too(h3_closing_server):
     client = lkrequest.Client(quic_profile="chrome_155", verify=False)
     mode = lkrequest.H3RetryMode.Chrome155ProtocolErrors

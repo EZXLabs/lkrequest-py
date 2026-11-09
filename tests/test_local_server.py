@@ -456,8 +456,7 @@ def test_h3_fallback_still_reuses_the_pooled_h2_connection(server_url):
     # and pooled was invisible and each request re-dialled TCP + TLS.
     #
     # `diagnostics` reports None for a phase that did not happen, so a reused
-    # connection is one with no TCP and no TLS timing. See
-    # docs/UPSTREAM-H3-FALLBACK-POOL.md for the original defect report.
+    # connection is one with no TCP and no TLS timing.
     client = BlockingClient(
         tls_profile="chrome_152",
         h2_profile="chrome_152",
@@ -500,7 +499,16 @@ def test_h3_get(h3_server_url):
     reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
 )
 @pytest.mark.parametrize(
-    "preset", ["chrome", "chrome_146", "chrome_153", "chrome_154", "chrome_155"]
+    "preset",
+    [
+        "chrome",
+        "chrome_146",
+        "chrome_153",
+        "chrome_154",
+        "chrome_155",
+        "chrome_156",
+        "chrome_157",
+    ],
 )
 def test_h3_connection_survives_the_qpack_dynamic_table(h3_server_url, preset):
     # The Chrome QUIC presets advertise a 64 KiB QPACK dynamic table, as Chrome

@@ -36,8 +36,12 @@ def sync_websocket():
     binary_echo = ws.recv()
     print(f"Binary echo: binary={binary_echo.is_binary()}")
 
+    # 心跳：服务器回的 pong 会从 recv() 返回，载荷最多 125 字节
+    ws.ping(b"heartbeat")
+    print(f"Ping 回复: {ws.recv()!r}")
+
     ws.close()
-    print("连接已关闭\n")
+    print(f"连接已关闭: {ws.url}\n")
 
 
 async def async_websocket():
@@ -71,7 +75,9 @@ def ws_message_types():
     print("=== WsMessage 类型 ===")
 
     text_msg = lkrequest.WsMessage.text("hello")
-    print(f"Text: is_text={text_msg.is_text()}, is_binary={text_msg.is_binary()}, is_close={text_msg.is_close()}")
+    print(
+        f"Text: is_text={text_msg.is_text()}, is_binary={text_msg.is_binary()}, is_close={text_msg.is_close()}"
+    )
     print(f"repr: {repr(text_msg)}")
 
     binary_msg = lkrequest.WsMessage.binary(b"\x00\x01\x02")

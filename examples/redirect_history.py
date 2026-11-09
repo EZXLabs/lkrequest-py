@@ -18,12 +18,12 @@ def blocking_redirect():
 
     # --- 无重定向 ---
     resp = session.get("https://httpbin.org/get")
-    print(f"无重定向:")
+    print("无重定向:")
     print(f"  was_redirected: {resp.was_redirected}")
     print(f"  history: {resp.history}")
 
     # --- 单次重定向 ---
-    print(f"\n单次重定向:")
+    print("\n单次重定向:")
     resp = session.get("https://httpbin.org/redirect/1")
     print(f"  was_redirected: {resp.was_redirected}")
     print(f"  最终 URL: {resp.url}")
@@ -33,7 +33,7 @@ def blocking_redirect():
         print(f"    repr: {repr(hop)}")
 
     # --- 多次重定向 ---
-    print(f"\n多次重定向:")
+    print("\n多次重定向:")
     resp = session.get("https://httpbin.org/redirect/3")
     print(f"  最终状态码: {resp.status_code}")
     print(f"  最终 URL: {resp.url}")
@@ -46,7 +46,7 @@ def blocking_redirect():
         print(f"         Location: {location}")
 
     # --- 限制重定向次数 ---
-    print(f"\n限制重定向次数:")
+    print("\n限制重定向次数:")
     limited = client.session(max_redirects=2)
     try:
         limited.get("https://httpbin.org/redirect/5")
@@ -56,7 +56,7 @@ def blocking_redirect():
 
 async def async_redirect():
     """异步重定向历史"""
-    print(f"\n=== 异步重定向历史 ===\n")
+    print("\n=== 异步重定向历史 ===\n")
 
     client = lkrequest.Client.chrome_144()
     session = client.session()

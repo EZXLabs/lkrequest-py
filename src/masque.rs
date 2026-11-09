@@ -29,7 +29,7 @@ pub(crate) type OuterConfig = std::convert::Infallible;
 /// Neither inherits from the other, so relaxing one hop for debugging never
 /// silently relaxes the other.
 #[cfg(feature = "masque")]
-#[pyclass(name = "MasqueConfig", frozen)]
+#[pyclass(name = "MasqueConfig", frozen, from_py_object)]
 #[derive(Clone)]
 pub struct PyMasqueConfig {
     pub(crate) inner: lkrequest::proxy::MasqueOuterConfig,
@@ -44,6 +44,7 @@ impl PyMasqueConfig {
         server_name=None,
         ca_cert=None,
         ca_cert_pem=None,
+        ca_cert_der=None,
         use_native_certs=true,
         verify=true,
         tunnel_idle_timeout=Some(lkrequest::proxy::masque::DEFAULT_TUNNEL_IDLE_TIMEOUT.as_secs_f64()),
@@ -54,6 +55,7 @@ impl PyMasqueConfig {
         server_name: Option<String>,
         ca_cert: Option<String>,
         ca_cert_pem: Option<Vec<u8>>,
+        ca_cert_der: Option<Vec<u8>>,
         use_native_certs: bool,
         verify: bool,
         tunnel_idle_timeout: Option<f64>,
@@ -79,6 +81,9 @@ impl PyMasqueConfig {
         if let Some(pem) = ca_cert_pem {
             add_ca_certs_pem(&mut inner, &pem)?;
         }
+        if let Some(der) = ca_cert_der {
+            add_ca_cert_der(&mut inner, der)?;
+        }
         Ok(PyMasqueConfig { inner })
     }
 
@@ -97,7 +102,8 @@ impl PyMasqueConfig {
         self.inner.verify
     }
 
-    /// Number of extra trust anchors loaded from `ca_cert` / `ca_cert_pem`.
+    /// Number of extra trust anchors loaded from `ca_cert` / `ca_cert_pem` /
+    /// `ca_cert_der`.
     #[getter]
     fn ca_cert_count(&self) -> usize {
         self.inner.extra_roots.len()
@@ -139,6 +145,19 @@ fn add_ca_certs_pem(inner: &mut OuterConfig, pem: &[u8]) -> PyResult<()> {
         .add_ca_certs_pem(pem)
         .map(|_| ())
         .map_err(crate::error::to_py_err)
+}
+
+/// Add one DER certificate. Upstream would only find out it is not one when
+/// the first tunnel is set up, if then; checked here, as a PEM bundle is.
+#[cfg(feature = "masque")]
+fn add_ca_cert_der(inner: &mut OuterConfig, der: Vec<u8>) -> PyResult<()> {
+    lktls::verify::certchain::parse_trust_anchor_from_der(&der).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "MASQUE CA certificate is not a usable DER certificate: {err}"
+        ))
+    })?;
+    inner.extra_roots.push(der.into());
+    Ok(())
 }
 
 /// Extract the `masque=` argument shared by `Client` and `HealthCheckConfig`.

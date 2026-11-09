@@ -28,7 +28,7 @@ use pyo3::prelude::*;
 /// modes the ClientHello advertises (fingerprint shape), while this one decides
 /// whether the client actually retains tickets and offers them as a PSK on
 /// later connections.
-#[pyclass(name = "TlsSessionResumptionPolicy", eq)]
+#[pyclass(name = "TlsSessionResumptionPolicy", eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyTlsSessionResumptionPolicy {
     pub(crate) inner: lkrequest::TlsSessionResumptionPolicy,
@@ -98,7 +98,7 @@ impl PyTlsSessionResumptionPolicy {
 /// The browser presets already carry the matching policy (Chrome family →
 /// `CHROMIUM`, Firefox → `FIREFOX`, Safari → `UNPARTITIONED`); setting this
 /// explicitly is only needed when building a client by hand.
-#[pyclass(name = "TlsSessionCachePartitionPolicy", eq)]
+#[pyclass(name = "TlsSessionCachePartitionPolicy", eq, from_py_object)]
 #[derive(Clone, Copy, PartialEq)]
 pub struct PyTlsSessionCachePartitionPolicy {
     pub(crate) inner: lkrequest::TlsSessionCachePartitionPolicy,
@@ -174,7 +174,7 @@ impl PyTlsSessionCachePartitionPolicy {
 ///
 /// Both site arguments must be canonical schemeful sites (e.g.
 /// `https://example.com`), not arbitrary document URLs.
-#[pyclass(name = "NetworkPartitionContext", eq)]
+#[pyclass(name = "NetworkPartitionContext", eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyNetworkPartitionContext {
     pub(crate) inner: lkrequest::NetworkPartitionContext,

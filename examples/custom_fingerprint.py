@@ -22,8 +22,10 @@ def tls_profile_examples():
         "Safari 26": lkrequest.TlsProfile.safari_26(),
     }
     for name, p in profiles.items():
-        print(f"  {name}: cipher_suites={len(p.cipher_suites)}, "
-              f"groups={len(p.supported_groups)}, alpn={p.alpn_protocols}")
+        print(
+            f"  {name}: cipher_suites={len(p.cipher_suites)}, "
+            f"groups={len(p.supported_groups)}, alpn={p.alpn_protocols}"
+        )
 
     # --- 查看 profile 属性 ---
     print("\n--- Profile 属性 ---")
@@ -70,18 +72,25 @@ def tls_profile_examples():
             0x1301,  # TLS_AES_128_GCM_SHA256
             0x1302,  # TLS_AES_256_GCM_SHA384
             0x1303,  # TLS_CHACHA20_POLY1305_SHA256
-            0xc02b,  # TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-            0xc02f,  # TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            0xC02B,  # TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            0xC02F,  # TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
         ],
         extensions=extensions,
-        supported_groups=[0x001d, 0x0017, 0x0018],  # x25519, secp256r1, secp384r1
+        supported_groups=[0x001D, 0x0017, 0x0018],  # x25519, secp256r1, secp384r1
         signature_algorithms=[
-            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            0x0403,
+            0x0804,
+            0x0401,
+            0x0503,
+            0x0805,
+            0x0501,
+            0x0806,
+            0x0601,
         ],
-        key_share_curves=[0x001d, 0x0017],
+        key_share_curves=[0x001D, 0x0017],
         alpn_protocols=["h2", "http/1.1"],
-        tls_min_version="1.2",
-        tls_max_version="1.3",
+        tls_min_version="tls12",
+        tls_max_version="tls13",
         ec_point_formats=[0],
         compression_methods=[0],
         grease=lkrequest.GreaseConfig(
@@ -141,11 +150,12 @@ def h2_profile_examples():
 
     # 也可以用整数 ID
     settings_by_id = [
-        lkrequest.H2Setting(1, 65536),   # header_table_size
-        lkrequest.H2Setting(2, 0),       # enable_push
-        lkrequest.H2Setting(3, 1000),    # max_concurrent_streams
-        lkrequest.H2Setting(4, 6291456), # initial_window_size
+        lkrequest.H2Setting(1, 65536),  # header_table_size
+        lkrequest.H2Setting(2, 0),  # enable_push
+        lkrequest.H2Setting(3, 1000),  # max_concurrent_streams
+        lkrequest.H2Setting(4, 6291456),  # initial_window_size
     ]
+    print(f"  整数 ID: {settings_by_id[0]!r}")
 
     # Headers Priority (weight 最大 255)
     headers_priority = lkrequest.HeadersPriority(
@@ -189,6 +199,7 @@ def tcp_fingerprint_examples():
         ("Firefox Linux", lkrequest.TcpFingerprint.firefox_linux),
         ("Firefox macOS", lkrequest.TcpFingerprint.firefox_macos),
         ("Safari", lkrequest.TcpFingerprint.safari),
+        ("Safari iOS", lkrequest.TcpFingerprint.safari_ios),
     ]
     for name, factory in presets:
         tcp = factory()
@@ -206,6 +217,19 @@ def tcp_fingerprint_examples():
         send_buf_size=65536,
     )
     print(f"  自定义 TCP: {repr(custom_tcp)}")
+
+    # SYN 选项顺序（kind 数字，即 JA4T 第二段）只用于描述，体现在 to_ja4t() 里；
+    # keep-alive 会真正设到 socket 上
+    described = lkrequest.TcpFingerprint(
+        window_size=64240,
+        tcp_options=[2, 1, 3, 1, 1, 4],
+        mss=1460,
+        window_scale=8,
+        keepalive_idle=30.0,
+        keepalive_interval=5.0,
+    )
+    print(f"  JA4T: {described.to_ja4t()}")
+    print(f"  to_dict(): {described.to_dict()}")
 
     # --- JA4T ---
     print("\n--- JA4T 格式 ---")

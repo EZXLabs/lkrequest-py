@@ -35,7 +35,7 @@ def main():
     print(f"文件: {list(data.get('files', {}).keys())}")
 
     # === 多文件上传 ===
-    print(f"\n=== 多文件上传 ===")
+    print("\n=== 多文件上传 ===")
     mp2 = lkrequest.Multipart()
     mp2.text("batch_id", "batch-001")
     mp2.file("file1", "data.csv", "text/csv", b"name,age\nAlice,30\nBob,25")
@@ -48,11 +48,19 @@ def main():
         print(f"  {name}: {content[:50]}...")
 
     # === 使用 Part 精细控制 ===
-    print(f"\n=== Part 精细控制 ===")
+    print("\n=== Part 精细控制 ===")
     part = lkrequest.Part("attachment", b"\x89PNG\r\n\x1a\n...")
     part.filename("image.png")
     part.content_type("image/png")
-    print(f"Part 已创建: name=attachment, filename=image.png")
+    mp3 = lkrequest.Multipart()
+    mp3.part(part)
+    # 不带文件名的二进制字段，text() / file() 表达不了
+    mp3.part(lkrequest.Part("checksum", b"\x00\x01\x02\x03"))
+
+    resp = session.post("https://httpbin.org/post", multipart=mp3)
+    data = resp.json()
+    print(f"文件: {list(data.get('files', {}).keys())}")
+    print(f"表单字段: {list(data.get('form', {}).keys())}")
 
 
 if __name__ == "__main__":

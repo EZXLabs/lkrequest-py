@@ -1,14 +1,13 @@
 //! What a `Session` handle owns besides the Rust session itself: its event
 //! hooks, the middleware callbacks registered on it, and whether it was closed.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 use pyo3::PyTraverseError;
 use tokio::sync::watch;
 
@@ -35,7 +34,7 @@ pub(crate) struct EventHooks {
 
 impl Default for EventHooks {
     fn default() -> Self {
-        Python::with_gil(|py| EventHooks {
+        Python::attach(|py| EventHooks {
             request_hooks: PyList::empty(py).unbind(),
             response_hooks: PyList::empty(py).unbind(),
         })
@@ -46,7 +45,7 @@ impl Clone for EventHooks {
     /// The clone shares the same lists, so a hook registered on one handle is
     /// seen by the request futures that hold the other.
     fn clone(&self) -> Self {
-        Python::with_gil(|py| EventHooks {
+        Python::attach(|py| EventHooks {
             request_hooks: self.request_hooks.clone_ref(py),
             response_hooks: self.response_hooks.clone_ref(py),
         })
@@ -83,13 +82,19 @@ impl EventHooks {
         url: &str,
         headers: &Option<Vec<(String, String)>>,
     ) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let hooks = snapshot(&self.request_hooks, py);
             if hooks.is_empty() {
                 return;
             }
-            let headers_val: HashMap<String, String> =
-                headers.clone().unwrap_or_default().into_iter().collect();
+            // In the order the headers were given. A name given twice keeps
+            // its first position and its last value.
+            let headers_val = PyDict::new(py);
+            for (name, value) in headers.iter().flatten() {
+                if let Err(e) = headers_val.set_item(name, value) {
+                    tracing::warn!(error = %e, "event_hook.on_request: header not passed to the hook");
+                }
+            }
             for hook in hooks {
                 if let Err(e) = hook.call1((method, url, &headers_val)) {
                     tracing::warn!(error = %e, "event_hook.on_request failed");
@@ -99,7 +104,7 @@ impl EventHooks {
     }
 
     pub(crate) fn fire_response(&self, status_code: u16, url: &str, elapsed: f64) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for hook in snapshot(&self.response_hooks, py) {
                 if let Err(e) = hook.call1((status_code, url, elapsed)) {
                     tracing::warn!(error = %e, "event_hook.on_response failed");
@@ -192,7 +197,7 @@ impl SessionState {
     /// For `__clear__`: called by the collector on a handle it found to be
     /// garbage, to break the cycle it sits in.
     pub(crate) fn clear_for_gc(&self) {
-        Python::with_gil(|py| self.hooks.clear(py));
+        Python::attach(|py| self.hooks.clear(py));
     }
 }
 

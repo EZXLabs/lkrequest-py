@@ -41,7 +41,7 @@ def blocking_session_pool():
 
 async def async_session_pool():
     """异步会话池示例"""
-    print(f"\n=== 异步会话池 (SessionPool) ===")
+    print("\n=== 异步会话池 (SessionPool) ===")
 
     client = lkrequest.Client.chrome_144()
 
@@ -82,10 +82,11 @@ async def async_session_pool():
 
 def session_pool_stats():
     """SessionPoolStats 示例"""
-    print(f"\n=== SessionPoolStats ===")
+    print("\n=== SessionPoolStats ===")
 
-    stats = lkrequest.SessionPoolStats
-    print(f"  属性: idle_sessions, max_sessions")
+    print(
+        f"  {lkrequest.SessionPoolStats.__name__} 的属性: idle_sessions, max_sessions"
+    )
 
 
 if __name__ == "__main__":

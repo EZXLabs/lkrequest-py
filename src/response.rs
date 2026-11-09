@@ -234,7 +234,7 @@ fn decode_with_codec<'py>(
 ) -> PyResult<Bound<'py, PyString>> {
     PyBytes::new(py, body)
         .call_method1("decode", (codec, "replace"))?
-        .downcast_into()
+        .cast_into()
         .map_err(Into::into)
 }
 
@@ -340,6 +340,29 @@ impl PyResponse {
     }
 }
 
+/// `Response.diagnostics`, and the `diagnostics` of a request that failed.
+pub(crate) fn diagnostics_dict<'py>(
+    py: Python<'py>,
+    diag: &lkrequest::diagnostics::RequestDiagnostics,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("dns_ms", diag.dns_ms)?;
+    d.set_item("tcp_ms", diag.tcp_ms)?;
+    d.set_item("tls_ms", diag.tls_ms)?;
+    d.set_item("ttfb_ms", diag.ttfb_ms)?;
+    d.set_item("total_ms", diag.total_ms)?;
+    d.set_item("remote_addr", diag.remote_addr.clone())?;
+    d.set_item("protocol", diag.protocol.clone())?;
+    d.set_item("cipher_suite", diag.cipher_suite.clone())?;
+    let trust_anchor = diag
+        .trust_anchor
+        .as_deref()
+        .map(|info| crate::trust_anchor::info_dict(py, info))
+        .transpose()?;
+    d.set_item("trust_anchor", trust_anchor)?;
+    Ok(d)
+}
+
 #[pymethods]
 impl PyResponse {
     #[getter]
@@ -409,17 +432,7 @@ impl PyResponse {
     /// measured (e.g. a reused connection skips DNS/TCP/TLS).
     #[getter]
     fn diagnostics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let diag = &self.diagnostics;
-        d.set_item("dns_ms", diag.dns_ms)?;
-        d.set_item("tcp_ms", diag.tcp_ms)?;
-        d.set_item("tls_ms", diag.tls_ms)?;
-        d.set_item("ttfb_ms", diag.ttfb_ms)?;
-        d.set_item("total_ms", diag.total_ms)?;
-        d.set_item("remote_addr", diag.remote_addr.clone())?;
-        d.set_item("protocol", diag.protocol.clone())?;
-        d.set_item("cipher_suite", diag.cipher_suite.clone())?;
-        Ok(d)
+        diagnostics_dict(py, &self.diagnostics)
     }
 
     /// Decode the body as text.
@@ -480,10 +493,11 @@ impl PyResponse {
 
     fn error_for_status(&self) -> PyResult<()> {
         if self.status_code >= 400 {
-            Err(crate::error::HttpStatusError::new_err(format!(
-                "{} for url: {}",
-                self.status_code, self.url
-            )))
+            Err(crate::error::status_error(
+                format!("{} for url: {}", self.status_code, self.url),
+                self.status_code,
+                &self.diagnostics,
+            ))
         } else {
             Ok(())
         }
@@ -646,7 +660,7 @@ impl PyStreamingResponse {
                 pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
             })?;
             match stream.bytes().await {
-                Ok(data) => Python::with_gil(|py| Ok(PyBytes::new(py, &data).unbind())),
+                Ok(data) => Python::attach(|py| Ok(PyBytes::new(py, &data).unbind())),
                 Err(e) => Err(crate::error::to_py_err(e)),
             }
         })
@@ -665,7 +679,7 @@ impl PyStreamingResponse {
                 pyo3::exceptions::PyRuntimeError::new_err("Stream already consumed")
             })?;
             let body = stream.bytes().await.map_err(crate::error::to_py_err)?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 decode_text(py, &body, declared.as_deref(), encoding.as_deref()).map(Bound::unbind)
             })
         })
@@ -747,7 +761,7 @@ impl PyBlockingStreamingResponse {
 
     fn chunk<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let inner = self.inner.clone();
-        let chunk = py.allow_threads(|| {
+        let chunk = py.detach(|| {
             crate::client::blocking_runtime().block_on(async move {
                 let mut guard = inner.lock().await;
                 let stream = guard.as_mut().ok_or_else(|| {
@@ -768,7 +782,7 @@ impl PyBlockingStreamingResponse {
 
     fn chunk_decoded<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let inner = self.inner.clone();
-        let chunk = py.allow_threads(|| {
+        let chunk = py.detach(|| {
             crate::client::blocking_runtime().block_on(async move {
                 let mut guard = inner.lock().await;
                 let stream = guard.as_mut().ok_or_else(|| {
@@ -789,7 +803,7 @@ impl PyBlockingStreamingResponse {
 
     fn bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let inner = self.inner.clone();
-        let data = py.allow_threads(|| {
+        let data = py.detach(|| {
             crate::client::blocking_runtime().block_on(async move {
                 let mut guard = inner.lock().await;
                 let stream = guard.take().ok_or_else(|| {
@@ -807,7 +821,7 @@ impl PyBlockingStreamingResponse {
     #[pyo3(signature = (encoding=None))]
     fn text<'py>(&self, py: Python<'py>, encoding: Option<&str>) -> PyResult<Bound<'py, PyString>> {
         let inner = self.inner.clone();
-        let body = py.allow_threads(|| {
+        let body = py.detach(|| {
             crate::client::blocking_runtime().block_on(async move {
                 let mut guard = inner.lock().await;
                 let stream = guard.take().ok_or_else(|| {
@@ -830,7 +844,7 @@ impl PyBlockingStreamingResponse {
 
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let inner = self.inner.clone();
-        let chunk = py.allow_threads(|| {
+        let chunk = py.detach(|| {
             crate::client::blocking_runtime().block_on(async move {
                 let mut guard = inner.lock().await;
                 let stream = match guard.as_mut() {

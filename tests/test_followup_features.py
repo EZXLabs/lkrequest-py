@@ -1,6 +1,6 @@
 """Tests for features added while tracking the lkrequest core update:
 
-new browser presets (chrome_145 through chrome_155, firefox_156), request
+new browser presets (chrome_145 through chrome_157, firefox_156), request
 priority, protocol
 policy / HTTP intent, session resumption, per-request preferred HTTP version /
 idempotency, and the QUIC/H3 surface.
@@ -28,6 +28,8 @@ NEW_CHROME_PRESETS = [
     "chrome_153",
     "chrome_154",
     "chrome_155",
+    "chrome_156",
+    "chrome_157",
 ]
 
 
@@ -87,7 +89,7 @@ class TestNewPresets:
         # Python mirror of upstream's `chrome_152_is_first_chromium_profile_with_
         # signature_algorithm_grease`. GREASE placement is a fingerprint-visible
         # difference, so a preset silently gaining/losing it must fail here.
-        # Chrome 152 introduced it and Chrome 153 through 155 keep it.
+        # Chrome 152 introduced it and Chrome 153 through 156 keep it.
         greased = {
             name
             for name in NEW_CHROME_PRESETS + ["chrome_131", "chrome_144"]
@@ -95,7 +97,14 @@ class TestNewPresets:
                 "signature_algorithms"
             ]
         }
-        assert greased == {"chrome_152", "chrome_153", "chrome_154", "chrome_155"}
+        assert greased == {
+            "chrome_152",
+            "chrome_153",
+            "chrome_154",
+            "chrome_155",
+            "chrome_156",
+            "chrome_157",
+        }
 
     def test_chrome_152_carries_trust_anchor_ids(self):
         # Python mirror of upstream's `chrome_152_adds_capture_verified_trust_
@@ -207,21 +216,69 @@ class TestNewPresets:
             == lkrequest.H2Profile.chrome_153().to_json()
         )
 
-    def test_chrome_155_is_chrome_154_under_a_new_name(self):
+    def test_chrome_155_is_chrome_154_with_its_trust_anchor_ids_sorted(self):
         # The Chrome 155.0.8059.40 capture matched Chrome 154 field for field
-        # over TCP TLS, QUIC TLS and H2, so upstream builds 155 from 154 and only
-        # the profile name may differ.
+        # over TCP TLS, QUIC TLS and H2, the 28 trust-anchor IDs included. What
+        # differs is how they go out: 155 sends them in one fixed, sorted order,
+        # the order Chromium encodes them in, where 154 is modelled as
+        # shuffling them on every handshake.
+        def split(name: str) -> tuple[str, bool, list[str], dict]:
+            profile = json.loads(getattr(lkrequest.TlsProfile, name)().to_json())
+            [source] = [
+                extension["source"]
+                for extension in profile["extensions"]
+                if (extension.get("source") or {}).get("type") == "trust_anchor_ids"
+            ]
+            ids = source["ids"]
+            source["ids"] = sorted(ids)
+            return profile.pop("name"), source.pop("shuffle"), ids, profile
+
         for prev, cur in (
             ("chrome_154", "chrome_155"),
             ("chrome_154_quic", "chrome_155_quic"),
         ):
-            old = json.loads(getattr(lkrequest.TlsProfile, prev)().to_json())
-            new = json.loads(getattr(lkrequest.TlsProfile, cur)().to_json())
-            assert new.pop("name") == old.pop("name").replace("154", "155")
+            old_name, old_shuffle, _, old = split(prev)
+            new_name, new_shuffle, new_ids, new = split(cur)
+            assert new_name == old_name.replace("154", "155")
+            assert (old_shuffle, new_shuffle) == (True, False)
+            assert new_ids == sorted(new_ids)
             assert new == old
         assert (
             lkrequest.H2Profile.chrome_155().to_json()
             == lkrequest.H2Profile.chrome_154().to_json()
+        )
+
+    def test_chrome_156_is_chrome_155_under_a_new_name(self):
+        # The Chrome 156.0.8078.48 capture matched Chrome 155 over TCP TLS, QUIC
+        # TLS and H2, the sorted trust-anchor IDs included, so only the profile
+        # name may differ.
+        for prev, cur in (
+            ("chrome_155", "chrome_156"),
+            ("chrome_155_quic", "chrome_156_quic"),
+        ):
+            old = json.loads(getattr(lkrequest.TlsProfile, prev)().to_json())
+            new = json.loads(getattr(lkrequest.TlsProfile, cur)().to_json())
+            assert new.pop("name") == old.pop("name").replace("155", "156")
+            assert new == old
+        assert (
+            lkrequest.H2Profile.chrome_156().to_json()
+            == lkrequest.H2Profile.chrome_155().to_json()
+        )
+
+    def test_chrome_157_is_chrome_156_under_a_new_name(self):
+        # The Chrome 157.0.8103.39 capture matched Chrome 156 over TCP TLS, QUIC
+        # TLS and H2, the sorted trust-anchor IDs included.
+        for prev, cur in (
+            ("chrome_156", "chrome_157"),
+            ("chrome_156_quic", "chrome_157_quic"),
+        ):
+            old = json.loads(getattr(lkrequest.TlsProfile, prev)().to_json())
+            new = json.loads(getattr(lkrequest.TlsProfile, cur)().to_json())
+            assert new.pop("name") == old.pop("name").replace("156", "157")
+            assert new == old
+        assert (
+            lkrequest.H2Profile.chrome_157().to_json()
+            == lkrequest.H2Profile.chrome_156().to_json()
         )
 
     @pytest.mark.parametrize(
@@ -344,6 +401,8 @@ class TestNewPresets:
             "chrome_153",
             "chrome_154",
             "chrome_155",
+            "chrome_156",
+            "chrome_157",
         ):
             tcp = json.loads(getattr(lkrequest.TlsProfile, name)().to_json())
             quic = json.loads(getattr(lkrequest.TlsProfile, f"{name}_quic")().to_json())
@@ -402,6 +461,8 @@ class TestNewPresets:
             "chrome_153",
             "chrome_154",
             "chrome_155",
+            "chrome_156",
+            "chrome_157",
             "firefox_133",
             "firefox_147",
             "firefox_156",
@@ -590,6 +651,8 @@ class TestQuicSurface:
             "chrome_153",
             "chrome_154",
             "chrome_155",
+            "chrome_156",
+            "chrome_157",
         ):
             qp = getattr(lkrequest.QuicProfile, name)()
             assert qp.connection_id_length >= 0
@@ -649,6 +712,11 @@ class TestQuicSurface:
                 "stop_before_matching_reset",
             )
         }
+        # Chrome 156 is Chrome 155's QUIC and H3 verbatim: upstream builds it from
+        # 155's and swaps in an H3 profile that is 155's as well.
+        assert profiles["chrome_156"] == profiles["chrome_155"]
+        # So is Chrome 157 Chrome 156's.
+        assert profiles["chrome_157"] == profiles["chrome_156"]
 
     def test_chrome_152_quic_drops_google_initial_rtt(self):
         # Unlike Chrome 151 (identical to 150), Chrome 152 is the first preset
@@ -689,6 +757,8 @@ class TestQuicSurface:
             "chrome_153",
             "chrome_154",
             "chrome_155",
+            "chrome_156",
+            "chrome_157",
         )
         for name in captured + ("chrome",):
             p = json.loads(getattr(lkrequest.QuicProfile, name)().to_json())

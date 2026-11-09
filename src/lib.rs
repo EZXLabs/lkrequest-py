@@ -13,12 +13,14 @@
 #![allow(clippy::too_many_arguments)]
 
 mod bridge;
+mod build_info;
 mod client;
 mod client_pool;
 mod dns;
 mod error;
 mod fingerprint;
 mod hsts;
+mod logging;
 mod masque;
 mod metrics;
 mod middleware;
@@ -27,20 +29,26 @@ mod network_partition;
 mod priority;
 mod protocol;
 mod proxy;
+mod proxy_source;
 mod quic;
 mod randomize;
+mod resolver;
 mod response;
 mod retry;
 mod session;
 mod session_pool;
 mod session_state;
+mod trust_anchor;
 mod types;
 mod upload;
 mod websocket;
 
 use pyo3::prelude::*;
 
-#[pymodule]
+// PyO3 0.28+ declares modules free-threading safe by default. This one has not
+// been audited for that, so a version-specific build on a free-threaded Python
+// keeps the GIL on, as it did before.
+#[pymodule(gil_used = true)]
 fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Async API
     m.add_class::<client::PyClient>()?;
@@ -57,8 +65,6 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<response::PyBlockingStreamingResponse>()?;
 
     // Configuration
-    m.add_class::<types::PyTimeoutConfig>()?;
-    m.add_class::<types::PyResourceLimits>()?;
     m.add_class::<types::PyHttpVersion>()?;
     m.add_class::<types::PyAcceptEncoding>()?;
     m.add_class::<types::PyPoolStats>()?;
@@ -79,6 +85,8 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Proxy
     m.add_class::<proxy::PyProxyConfig>()?;
     m.add_class::<proxy::PyProxyPool>()?;
+    m.add_class::<proxy::PyBlockingProxyPool>()?;
+    m.add_class::<proxy::PyProxyLease>()?;
     m.add_class::<proxy::PyBadProxyConfig>()?;
     m.add_class::<proxy::PyHealthCheckConfig>()?;
 
@@ -97,10 +105,15 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Protocol policy
     m.add_class::<protocol::PyProtocolPolicy>()?;
+    m.add_class::<protocol::PyAcquisitionPolicy>()?;
+    m.add_class::<protocol::PyRacePolicy>()?;
+    m.add_class::<protocol::PyUpgradePolicy>()?;
+    m.add_class::<protocol::PyFallbackPolicy>()?;
     m.add_class::<protocol::PyHttpIntent>()?;
     m.add_class::<protocol::PyPreferredHttpVersion>()?;
     m.add_class::<protocol::PyIdempotency>()?;
     m.add_class::<protocol::PyBrokenQuicPolicy>()?;
+    m.add_class::<protocol::PyBrokenQuicConfig>()?;
     m.add_class::<protocol::PyH3RetryMode>()?;
 
     // HSTS / scheme-upgrade policy
@@ -139,6 +152,7 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<fingerprint::PyExtensionSpec>()?;
     m.add_class::<fingerprint::PyGreaseConfig>()?;
     m.add_class::<fingerprint::PyPaddingStrategy>()?;
+    m.add_class::<fingerprint::PyEchMode>()?;
     m.add_class::<fingerprint::PyRandomizationConfig>()?;
     m.add_class::<fingerprint::PyTlsProfile>()?;
     m.add_class::<fingerprint::PyH2Setting>()?;
@@ -162,6 +176,12 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(pending_requests, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(drain_pending, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(blocking_drain_pending, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(build_info::features, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(build_info::list_presets, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        trust_anchor::trust_anchor_identity,
+        m
+    )?)?;
 
     Ok(())
 }
@@ -193,9 +213,7 @@ fn drain_pending(py: Python<'_>, timeout: Option<f64>) -> PyResult<Bound<'_, PyA
 #[pyo3(signature = (timeout=None))]
 fn blocking_drain_pending(py: Python<'_>, timeout: Option<f64>) -> PyResult<bool> {
     let timeout = timeout.map(types::validated_duration).transpose()?;
-    Ok(py.allow_threads(|| {
-        pyo3_async_runtimes::tokio::get_runtime().block_on(bridge::drain(timeout))
-    }))
+    Ok(py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(bridge::drain(timeout))))
 }
 
 /// Validate that TLS, H2, and TCP fingerprint configurations are consistent.
@@ -209,7 +227,7 @@ fn validate_fingerprint_consistency(
     tls_profile: Option<&str>,
     h2_profile: Option<&str>,
     tcp_fingerprint: Option<&str>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     use pyo3::types::{PyDict, PyList};
 
     let mut warnings: Vec<String> = Vec::new();
@@ -273,12 +291,15 @@ fn validate_fingerprint_consistency(
 ///   - "compact" (default): single-line, human-readable
 ///   - "full": multi-line with all metadata
 ///   - "json": structured JSON, one object per line (machine-parseable)
+///   - "logging": handed to Python's `logging`, on `lkrequest.<target>`
 ///
 /// Returns True if the log level was set, False if a subscriber was already initialized.
 /// The log level can only be set once per process — subsequent calls return False.
 #[pyfunction]
 #[pyo3(signature = (level, *, format="compact"))]
-fn set_log_level(level: &str, format: &str) -> PyResult<bool> {
+fn set_log_level(py: Python<'_>, level: &str, format: &str) -> PyResult<bool> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_new(level).map_err(|e| {
@@ -300,9 +321,20 @@ fn set_log_level(level: &str, format: &str) -> PyResult<bool> {
             .with_env_filter(filter)
             .with_target(true)
             .try_init(),
+        "logging" => {
+            // Checked first so that a refused call starts no thread.
+            if tracing::dispatcher::has_been_set() {
+                return Ok(false);
+            }
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(logging::PythonLogging::start(py)?)
+                .try_init()
+                .map_err(Into::into)
+        }
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown log format '{}'. Use: compact, full, json",
+                "Unknown log format '{}'. Use: compact, full, json, logging",
                 other
             )));
         }

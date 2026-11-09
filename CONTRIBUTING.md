@@ -7,7 +7,7 @@ binding over the `lkrequest` Rust workspace, built with
 ## Development setup
 
 ```bash
-git clone https://github.com/EZ-XLabs/lkrequest-py
+git clone https://github.com/EZXLabs/lkrequest-py
 cd lkrequest-py
 python3 -m venv .venv                 # Linux/macOS
 # py -m venv .venv                    # Windows

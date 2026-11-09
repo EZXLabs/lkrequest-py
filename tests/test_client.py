@@ -2,6 +2,7 @@
 
 import os
 import asyncio
+import base64
 import json
 import pytest
 import lkrequest
@@ -19,6 +20,13 @@ requires_live_ws = pytest.mark.skipif(
 # Redirected to the local hypercorn httpbin server by the autouse fixture below,
 # so requests in this module never depend on the public httpbin.org.
 BASE = "https://httpbin.org"
+
+# How a `raw_http` server playing an HTTP proxy turns down every CONNECT, after
+# recording it.
+REFUSED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+# Spliced into proxy URLs rather than written in them: the public mirror's
+# cleaner rewrites any `scheme://user:pass@host` it finds.
+USERINFO = "alice:secret@"
 
 
 @pytest.fixture(autouse=True)
@@ -358,15 +366,6 @@ class TestWebSocketMessage:
 
 
 class TestTypes:
-    def test_timeout_config(self):
-        tc = lkrequest.TimeoutConfig(total=30.0, tcp_connect=10.0)
-        assert "total=Some(30s)" in repr(tc)
-        assert "tcp_connect=Some(10s)" in repr(tc)
-
-    def test_resource_limits(self):
-        rl = lkrequest.ResourceLimits(max_response_body_size=1024)
-        assert rl is not None
-
     def test_http_version(self):
         assert lkrequest.HttpVersion.H2 == 2
         assert lkrequest.HttpVersion.HTTP11 == 1
@@ -490,6 +489,38 @@ class TestProxyConfig:
             ["socks5h", "hop2.example", 1081, None],
             ["http", "final.example", 8080, None],
         ]
+
+    @pytest.mark.parametrize(
+        ("url", "host", "port"),
+        [
+            ("http://user:pw@proxy.example:8080", "proxy.example", 8080),
+            ("socks5h://127.0.0.1:1081", "127.0.0.1", 1081),
+            # Bracketed, as in the URL.
+            ("http://[::1]:3128", "[::1]", 3128),
+            # The scheme's port when the URL gives none.
+            ("http://proxy.example", "proxy.example", 80),
+            ("socks5://proxy.example", "proxy.example", 1080),
+        ],
+    )
+    def test_host_and_port(self, url, host, port):
+        proxy = lkrequest.ProxyConfig(url)
+        assert (proxy.host, proxy.port) == (host, port)
+        assert proxy.forbids_direct_fallback is False
+
+    def test_a_chains_host_and_port_are_its_final_hops(self):
+        chain = lkrequest.ProxyConfig.parse_chain(
+            ["socks5://hop1.example:1080", "http://final.example:8080"]
+        )
+        assert (chain.host, chain.port) == ("final.example", 8080)
+        assert chain.forbids_direct_fallback is False
+
+    @pytest.mark.skipif(
+        not hasattr(lkrequest, "MasqueConfig"), reason="built without masque"
+    )
+    def test_a_masque_proxy_forbids_falling_back_to_direct(self):
+        proxy = lkrequest.ProxyConfig("masque://relay.example")
+        assert (proxy.host, proxy.port) == ("relay.example", 443)
+        assert proxy.forbids_direct_fallback is True
 
     def test_identity_distinguishes_dns_mode(self):
         # socks5 and socks5h differ only in who resolves the hostname, which the
@@ -617,9 +648,45 @@ class TestProxyConfig:
         with pytest.raises(TypeError, match="str or ProxyConfig"):
             client.session(proxy=object())
 
-    def test_invalid_proxy_string_preserves_existing_session_behavior(self):
-        client = lkrequest.Client.chrome_131()
-        assert repr(client.session(proxy="not a proxy URL")) == "<Session>"
+    @pytest.mark.parametrize("client_cls", [lkrequest.Client, BlockingClient])
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "not a proxy URL",
+            "htp://127.0.0.1:9",
+            # What `ProxyConfig.identity()` returns: a pool key, not a URL.
+            '[["http","127.0.0.1",9,null]]',
+        ],
+    )
+    def test_an_invalid_session_proxy_url_raises(self, client_cls, url):
+        # Upstream builds the session without a proxy when the URL does not
+        # parse, so every request would go out direct from this machine.
+        with pytest.raises(ValueError, match="proxy"):
+            client_cls.chrome_131().session(proxy=url)
+
+    def test_a_session_proxy_url_carries_the_request_and_its_credentials(
+        self, raw_http
+    ):
+        proxy = raw_http(lambda request: REFUSED)
+        session = BlockingClient.chrome_131().session(
+            proxy=f"http://{USERINFO}127.0.0.1:{proxy.port}"
+        )
+        with pytest.raises(lkrequest.ProxyError):
+            session.get("https://target.example/", timeout=5.0)
+        [connect] = proxy.requests
+        assert (connect.method, connect.target) == ("CONNECT", "target.example:443")
+        assert connect.values("proxy-authorization") == [
+            "Basic " + base64.b64encode(b"alice:secret").decode()
+        ]
+
+    async def test_an_async_session_proxy_url_carries_the_request(self, raw_http):
+        proxy = raw_http(lambda request: REFUSED)
+        session = lkrequest.Client.chrome_131().session(
+            proxy=f"http://127.0.0.1:{proxy.port}"
+        )
+        with pytest.raises(lkrequest.ProxyError):
+            await session.get("https://target.example/", timeout=5.0)
+        assert [r.method for r in proxy.requests] == ["CONNECT"]
 
     def test_async_and_blocking_sessions_accept_proxy_config(self):
         chain = lkrequest.ProxyConfig.parse_chain(
@@ -703,19 +770,95 @@ class TestProxyPoolConfig:
                 failure_threshold=1, window=60.0, cooldown_duration=1.0
             ),
         )
-        proxy = await pool.acquire()
-        assert proxy != ""
-        pool.mark_bad(proxy)
+        lease = await pool.acquire()
+        assert lease.proxy is not None
+        pool.mark_bad(lease.proxy.identity())
         await asyncio.sleep(0.1)  # the failure is recorded on a task of its own
 
         acquiring = asyncio.ensure_future(pool.acquire())
         await asyncio.sleep(0.4)
         assert not acquiring.done(), "acquire() answered while the proxy cooled down"
         # ... and it does answer once the cooldown is over.
-        assert await asyncio.wait_for(acquiring, 5) == proxy
+        again = await asyncio.wait_for(acquiring, 5)
+        assert again.proxy.identity() == lease.proxy.identity()
 
     async def test_acquire_on_an_empty_pool_means_a_direct_connection(self):
-        assert await asyncio.wait_for(lkrequest.ProxyPool([]).acquire(), 5) == ""
+        lease = await asyncio.wait_for(lkrequest.ProxyPool([]).acquire(), 5)
+        assert lease.proxy is None
+
+    async def test_a_lease_carries_the_proxy_with_its_credentials(self, raw_http):
+        proxy = raw_http(lambda request: REFUSED)
+        pool = lkrequest.ProxyPool([f"http://{USERINFO}127.0.0.1:{proxy.port}"])
+        async with await pool.acquire() as lease:
+            assert isinstance(lease.proxy, lkrequest.ProxyConfig)
+            session = lkrequest.Client.chrome_131().session(proxy=lease.proxy)
+            with pytest.raises(lkrequest.ProxyError):
+                await session.get("https://target.example/", timeout=5.0)
+        [connect] = proxy.requests
+        assert (connect.method, connect.target) == ("CONNECT", "target.example:443")
+        # The password made it through: a pool key leaves it out.
+        assert connect.values("proxy-authorization") == [
+            "Basic " + base64.b64encode(b"alice:secret").decode()
+        ]
+
+    async def test_max_proxies_caps_the_leases_out_at_once(self):
+        pool = lkrequest.ProxyPool(["http://127.0.0.1:8080"], max_proxies=1)
+        assert pool.max_concurrent == 1
+        first = await pool.acquire()
+        second = asyncio.ensure_future(pool.acquire())
+        await asyncio.sleep(0.2)
+        assert not second.done(), "a second lease was handed out past max_proxies"
+        first.release()
+        assert first.released
+        lease = await asyncio.wait_for(second, 5)
+        assert not lease.released
+        first.release()  # releasing twice is harmless
+
+    async def test_with_and_async_with_release_the_lease(self):
+        pool = lkrequest.ProxyPool(["http://127.0.0.1:8080"], max_proxies=1)
+        with await pool.acquire() as lease:
+            assert not lease.released
+        assert lease.released
+        # The share came back, or this would wait for good.
+        async with await asyncio.wait_for(pool.acquire(), 5) as lease:
+            assert "ProxyLease" in repr(lease)
+        assert lease.released
+        assert not (await asyncio.wait_for(pool.acquire(), 5)).released
+
+    async def test_acquire_fresh_cools_the_proxy_down_and_releases_it(self):
+        pool = lkrequest.ProxyPool(
+            ["http://127.0.0.1:8080", "http://127.0.0.1:8081"],
+            max_proxies=1,
+            rotation="round_robin",
+            bad_proxy_config=lkrequest.BadProxyConfig(
+                failure_threshold=1, cooldown_duration=60.0
+            ),
+        )
+        first = await pool.acquire()
+        # With max_proxies=1 this only returns because the old lease is
+        # released before the new one is taken.
+        fresh = await asyncio.wait_for(pool.acquire_fresh(first), 5)
+        assert first.released
+        assert fresh.proxy.identity() != first.proxy.identity()
+        fresh.release()
+        # The first proxy is cooling down, so the rotation skips it.
+        after = await asyncio.wait_for(pool.acquire(), 5)
+        assert after.proxy.identity() == fresh.proxy.identity()
+
+    async def test_lease_mark_bad_feeds_the_pool_after_release(self):
+        pool = lkrequest.ProxyPool(
+            ["socks5://127.0.0.1:1"],
+            bad_proxy_config=lkrequest.BadProxyConfig(
+                failure_threshold=1, cooldown_duration=60.0
+            ),
+        )
+        lease = await pool.acquire()
+        lease.release()
+        lease.mark_bad()
+        acquiring = asyncio.ensure_future(pool.acquire())
+        await asyncio.sleep(0.3)
+        assert not acquiring.done(), "the only proxy should be cooling down"
+        acquiring.cancel()
 
 
 class TestCallableRetry:

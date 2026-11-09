@@ -11,6 +11,24 @@ use crate::error::to_py_err;
 type WsStream = hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>;
 type Connection = lkrequest::ws::WsConnection<WsStream>;
 
+/// RFC 6455 §5.5: the payload of a control frame is at most 125 bytes.
+const MAX_CONTROL_PAYLOAD: usize = 125;
+
+/// A ping or pong, refused before it reaches the wire if it is too long: a
+/// peer would fail the connection for it.
+fn control_frame(
+    data: Vec<u8>,
+    frame: fn(Vec<u8>) -> lkrequest::ws::WsMessage,
+) -> PyResult<lkrequest::ws::WsMessage> {
+    if data.len() > MAX_CONTROL_PAYLOAD {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "a ping or pong carries at most {MAX_CONTROL_PAYLOAD} bytes, not {}",
+            data.len()
+        )));
+    }
+    Ok(frame(data))
+}
+
 // ---------------------------------------------------------------------------
 // WsMessage
 // ---------------------------------------------------------------------------
@@ -141,18 +159,51 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[pyclass(name = "WsConnection")]
 pub struct PyWsConnection {
     shared: Arc<SharedConnection>,
+    url: String,
 }
 
 impl PyWsConnection {
     pub fn new(conn: Connection) -> Self {
         Self {
+            url: conn.url().to_owned(),
             shared: SharedConnection::new(conn),
         }
+    }
+
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        message: lkrequest::ws::WsMessage,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let shared = self.shared.clone();
+        crate::bridge::future_into_py(py, async move {
+            let conn = shared.open()?;
+            conn.send(message).await.map_err(to_py_err)
+        })
     }
 }
 
 #[pymethods]
 impl PyWsConnection {
+    /// The URL the connection was opened to; still there once it is closed.
+    #[getter]
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Send a ping; the peer answers with a pong carrying the same `data`,
+    /// which `recv()` returns.
+    #[pyo3(signature = (data=Vec::new()))]
+    fn ping<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        self.send(py, control_frame(data, lkrequest::ws::WsMessage::Ping)?)
+    }
+
+    /// Send a pong the peer did not ask for, as a heartbeat it need not answer.
+    #[pyo3(signature = (data=Vec::new()))]
+    fn pong<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        self.send(py, control_frame(data, lkrequest::ws::WsMessage::Pong)?)
+    }
+
     fn send_text<'py>(&self, py: Python<'py>, text: String) -> PyResult<Bound<'py, PyAny>> {
         let shared = self.shared.clone();
         crate::bridge::future_into_py(py, async move {
@@ -234,21 +285,51 @@ impl PyWsConnection {
 #[pyclass(name = "BlockingWsConnection")]
 pub struct PyBlockingWsConnection {
     shared: Arc<SharedConnection>,
+    url: String,
 }
 
 impl PyBlockingWsConnection {
     pub fn new(conn: Connection) -> Self {
         Self {
+            url: conn.url().to_owned(),
             shared: SharedConnection::new(conn),
         }
+    }
+
+    fn send(&self, py: Python<'_>, message: lkrequest::ws::WsMessage) -> PyResult<()> {
+        let shared = self.shared.clone();
+        py.detach(|| {
+            let conn = shared.open()?;
+            blocking_runtime()
+                .block_on(conn.send(message))
+                .map_err(to_py_err)
+        })
     }
 }
 
 #[pymethods]
 impl PyBlockingWsConnection {
+    /// As `WsConnection.url`.
+    #[getter]
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// As `WsConnection.ping()`.
+    #[pyo3(signature = (data=Vec::new()))]
+    fn ping(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
+        self.send(py, control_frame(data, lkrequest::ws::WsMessage::Ping)?)
+    }
+
+    /// As `WsConnection.pong()`.
+    #[pyo3(signature = (data=Vec::new()))]
+    fn pong(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
+        self.send(py, control_frame(data, lkrequest::ws::WsMessage::Pong)?)
+    }
+
     fn send_text(&self, py: Python<'_>, text: String) -> PyResult<()> {
         let shared = self.shared.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             let conn = shared.open()?;
             blocking_runtime()
                 .block_on(conn.send_text(&text))
@@ -258,7 +339,7 @@ impl PyBlockingWsConnection {
 
     fn send_binary(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
         let shared = self.shared.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             let conn = shared.open()?;
             blocking_runtime()
                 .block_on(conn.send_binary(&data))
@@ -268,7 +349,7 @@ impl PyBlockingWsConnection {
 
     fn recv(&self, py: Python<'_>) -> PyResult<PyWsMessage> {
         let shared = self.shared.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             let conn = shared.open()?;
             let msg = blocking_runtime()
                 .block_on(conn.recv())
@@ -281,7 +362,7 @@ impl PyBlockingWsConnection {
     fn close(&self, py: Python<'_>, code: Option<u16>, reason: &str) -> PyResult<()> {
         let shared = self.shared.clone();
         let reason = reason.to_string();
-        py.allow_threads(|| {
+        py.detach(|| {
             let conn = shared.open()?;
             let close_info = code.map(|c| (c, reason.as_str()));
             blocking_runtime()
@@ -298,7 +379,7 @@ impl PyBlockingWsConnection {
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyWsMessage>> {
         let shared = self.shared.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             let Some(conn) = shared.get() else {
                 return Ok(None);
             };
