@@ -113,7 +113,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned: actions/python-versions has no Python 3.9 build for
+          # Ubuntu 26.04, which ubuntu-latest now is.
+          - os: ubuntu-24.04
             wheel: wheel-x86_64-unknown-linux-gnu
             python: "3.9"
           - os: ubuntu-latest
