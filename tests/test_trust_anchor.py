@@ -118,8 +118,10 @@ def der_of(pem: bytes) -> bytes:
     return ssl.PEM_cert_to_DER_cert(pem.decode())
 
 
-@pytest.mark.parametrize("preset", ["chrome_155", "chrome_156", "chrome_157"])
-def test_chrome_155_to_157_send_their_ids_in_one_fixed_sorted_order(catcher, preset):
+@pytest.mark.parametrize(
+    "preset", ["chrome_155", "chrome_156", "chrome_157", "chrome_158"]
+)
+def test_chrome_155_to_158_send_their_ids_in_one_fixed_sorted_order(catcher, preset):
     # Chromium sorts them before encoding them. The extensions around them are
     # still permuted on every handshake, independently of the IDs.
     listed = profile_ids(preset)

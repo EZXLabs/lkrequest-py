@@ -50,6 +50,9 @@ class RawHttpServer:
         self.requests: list[Received] = []
         # Connections accepted, whether or not a request arrived on them.
         self.connections = 0
+        # Over TLS, whether each connection resumed a session, in the order
+        # they were accepted.
+        self.resumed: list[bool] = []
         self.port = 0
         self._reply = reply
         self._chunk_size = chunk_size
@@ -103,6 +106,9 @@ class RawHttpServer:
     async def _handle(self, reader, writer) -> None:
         self.connections += 1
         self._writers.add(writer)
+        tls = writer.get_extra_info("ssl_object")
+        if tls is not None:
+            self.resumed.append(tls.session_reused)
         try:
             request = await self._read_request(reader)
             if request is None:

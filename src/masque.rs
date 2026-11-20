@@ -179,21 +179,30 @@ pub(crate) fn resolve(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<OuterCo
     }
 }
 
-/// Install the outer-hop configuration on a client builder.
+/// Install the outer-hop configuration, if one was given, on a client builder.
+///
+/// It takes the `Option` itself: without the feature `OuterConfig` is
+/// uninhabited, and rustc 1.100 flags a call handed one as unreachable code.
 #[cfg(feature = "masque")]
 pub(crate) fn apply_to_client(
     builder: lkrequest::client::ClientBuilder,
-    config: OuterConfig,
+    config: Option<OuterConfig>,
 ) -> lkrequest::client::ClientBuilder {
-    builder.masque(config)
+    match config {
+        Some(config) => builder.masque(config),
+        None => builder,
+    }
 }
 
 #[cfg(not(feature = "masque"))]
 pub(crate) fn apply_to_client(
-    _builder: lkrequest::client::ClientBuilder,
-    config: OuterConfig,
+    builder: lkrequest::client::ClientBuilder,
+    config: Option<OuterConfig>,
 ) -> lkrequest::client::ClientBuilder {
-    match config {}
+    if let Some(config) = config {
+        match config {}
+    }
+    builder
 }
 
 /// Configure the CONNECT-UDP health-check probe.

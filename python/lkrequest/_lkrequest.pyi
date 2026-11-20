@@ -51,11 +51,18 @@ class RequestError(Exception):
       ``"io_error"``.
     - ``tls_alert``: for a ``TlsError`` that ended in a TLS alert, its name,
       such as ``"handshake_failure"``; the message says whether the server
-      sent it or the client did.
+      sent it or the client did. An alert after the handshake, such as
+      ``"certificate_required"`` from a server that wants a client
+      certificate, comes with ``phase`` ``"http_request"``.
     - ``diagnostics``: for a request that failed, its timings and transport so
       far, in the form of ``Response.diagnostics``; for ``error_for_status()``,
       the response's own. ``None`` for a streamed request, a WebSocket and
       ``preconnect()``.
+    - ``attempt_summary``: what a request that failed did, in the form of
+      ``Response.attempt_summary``, a streamed one's up to the moment its
+      response would have been handed over; for ``error_for_status()``, the
+      response's own. ``None`` for an error reading a streamed body, a
+      WebSocket and ``preconnect()``.
     """
 
     phase: Optional[str]
@@ -65,9 +72,11 @@ class RequestError(Exception):
     proxy_error_kind: Optional[str]
     tls_alert: Optional[str]
     diagnostics: Optional[dict[str, Any]]
+    attempt_summary: Optional[dict[str, Any]]
 
 class TlsError(RequestError):
-    """Raised when the TLS handshake fails."""
+    """Raised when the TLS handshake fails, or a server ends the connection
+    with a TLS alert after it."""
 
 class ProxyError(RequestError):
     """Raised when connecting through a proxy fails."""
@@ -150,8 +159,48 @@ class H2DataFramePolicy:
     def socket_write_aligned(max_write_size: int) -> H2DataFramePolicy:
         """Reserve the 9-byte frame header inside ``max_write_size``; raises ValueError if <= 9."""
 
+class AttemptLimits:
+    """Caps on what one request may do, for ``Client(attempt_limits=...)``,
+    ``Client.session(attempt_limits=...)`` and each request's
+    ``attempt_limits=``.
+
+    ``extra_http_attempts`` caps the HTTP submissions a request makes beyond
+    its first and its redirects: retries and recoveries. ``connect_attempts``
+    caps the TCP and QUIC connections it starts; reusing a pooled connection,
+    or waiting for one being set up, starts none. ``None`` sets no cap at that
+    scope. A session or request inherits the cap above it and may only lower
+    it: one above raises ``ValueError``, from ``session()`` for a session and
+    before anything is sent for a request. Caps do not turn retries on, and
+    do not replace a timeout. Concurrent requests count separately.
+
+    What a request did is in ``Response.attempt_summary``,
+    ``StreamingResponse.attempt_summary`` and the ``attempt_summary`` of the
+    exception it failed with, a dict of ``started``, ``http_submissions``
+    (every submission, redirects included), ``extra_http_submissions``,
+    ``redirects``, ``recoveries``, ``connect_initiations`` (failed ones and
+    race losers included), ``probe_suppressed_by_connect_limit``,
+    ``outcome`` (``"pending"``, ``"active"``, ``"succeeded"``, ``"failed"``
+    or ``"cancelled"``; a response of any status succeeded), ``final``,
+    ``denial_reason`` (``None``, or why a recovery the request could have
+    made was refused, such as ``"extra_http_limit"`` or ``"connect_limit"``)
+    and ``effective_limits``, the limits in effect in the form of
+    ``Client.effective_attempt_limits``.
+    """
+
+    def __init__(
+        self,
+        *,
+        extra_http_attempts: Optional[int] = None,
+        connect_attempts: Optional[int] = None,
+    ) -> None: ...
+    @property
+    def extra_http_attempts(self) -> Optional[int]: ...
+    @property
+    def connect_attempts(self) -> Optional[int]: ...
+
 class TlsSessionResumptionPolicy:
-    """Whether TLS 1.3 session tickets are cached and offered as PSKs.
+    """Whether TLS sessions are cached and resumed: TLS 1.2 sessions by ticket
+    or session ID, TLS 1.3 and QUIC ones by ticket (offered as a PSK).
 
     Distinct from ``SessionResumptionConfig``, which is a TLS-profile setting that
     decides which resumption modes the ClientHello *advertises* (fingerprint shape).
@@ -522,7 +571,9 @@ class Hsts:
     A fresh session is a stateless first visit, so omitting ``hsts`` performs no
     upgrades (equivalent to :meth:`none`). Plug a policy in to mirror Chrome's
     preloaded gTLDs, replay a session that already learned HSTS, or enforce your
-    own rules. Host matching is suffix-aware (HSTS ``includeSubDomains``).
+    own rules. A host listed in a static policy or seeded into a dynamic one
+    covers its subdomains too; a host a dynamic policy learns covers them only
+    when its header carried ``includeSubDomains``.
 
     An ``Hsts`` object holds one policy, shared by every session it is given
     to: what a dynamic one learns in one session applies in all of them, as in
@@ -542,7 +593,13 @@ class Hsts:
     def dynamic(seed: list[str] | None = None) -> Hsts:
         """Learn HSTS hosts from ``Strict-Transport-Security`` response headers,
         for every session given this object, optionally pre-seeded with known
-        HSTS hosts."""
+        HSTS hosts.
+
+        A learned host is upgraded until its ``max-age`` runs out, and its
+        subdomains only if the header carried ``includeSubDomains``;
+        ``max-age=0`` forgets it. A header with a malformed or repeated
+        directive is ignored. Seeded hosts cover their subdomains and do not
+        expire until a valid header replaces or removes them."""
     @staticmethod
     def custom(
         should_upgrade: Callable[[str], bool],
@@ -681,6 +738,14 @@ class QuicProfile:
         over from Chrome 156 without being observed again.
         """
     @staticmethod
+    def chrome_158() -> QuicProfile:
+        """Chrome 158 QUIC fingerprint preset, identical to Chrome 157.
+
+        The capture confirmed its transport values, H3 SETTINGS and
+        navigation/favicon priority; timing, loss and resumption behaviour carry
+        over from Chrome 157 without being observed again.
+        """
+    @staticmethod
     def from_json(json_str: str) -> QuicProfile:
         """Build a QuicProfile from a JSON string."""
     def to_json(self) -> str:
@@ -803,19 +868,33 @@ class ProxyConfig:
         has no header to carry it in.
         """
     def with_custom_auth(
-        self, identity: str, authorize: Callable[[], Optional[str]]
+        self,
+        identity: str,
+        authorize: Callable[[], Optional[str]],
+        on_challenge: Optional[Callable[[list[str]], Optional[str]]] = None,
     ) -> ProxyConfig:
         """Return a new config whose credential ``authorize()`` works out for each
         connection through this hop, such as a short-lived token.
 
         ``authorize`` takes no arguments and returns the header's value, such
         as ``"Bearer <token>"``, or ``None`` to send no credential. It is called
-        on the thread setting the connection up, which waits for it, and more
-        than once for a connection the proxy challenges with a 407, not every
-        answer being sent. It must be a plain function; an ``async def`` raises
-        ``TypeError``. If it raises or returns something other than a string,
-        the connection goes without a credential and a warning is logged, so
-        the request fails with what the proxy answers.
+        on the thread setting the connection up, which waits for it, once for
+        each CONNECT sent: for a connection's first, and again for the one more
+        a proxy that answers 407 with a ``Proxy-Authenticate`` challenge is
+        sent, where ``None`` gives up with ``ProxyError``. If it raises or
+        returns something other than a string, the connection goes without a
+        credential and a warning is logged, so the request fails with what the
+        proxy answers.
+
+        ``on_challenge``, if given, answers that 407 in place of ``authorize``:
+        it is called with the proxy's ``Proxy-Authenticate`` values, each whole
+        and in the order sent, realm and nonce included, and returns the header
+        value for the CONNECT sent again, which is how a challenge-based scheme
+        such as Digest works. ``None``, an exception or anything but a string
+        declines the challenge, and the request fails with a ``ProxyError``
+        whose ``proxy_error_kind`` is ``"authentication_required"``.
+
+        Both must be plain functions; an ``async def`` raises ``TypeError``.
 
         ``identity`` is a stable string, not a secret, that tells this
         credential apart from others on the same proxy address. It becomes
@@ -1113,8 +1192,19 @@ class Response:
     def history(self) -> list[RedirectRecord]:
         """The chain of redirects that led to this response."""
     @property
+    def attempt_summary(self) -> dict[str, Any]:
+        """What the request did to get this response; see ``AttemptLimits``
+        for the keys."""
+    @property
     def diagnostics(self) -> dict[str, Any]:
-        """Per-phase timings (dns/tcp/tls/ttfb/total ms) plus remote_addr/protocol/cipher_suite.
+        """Per-phase timings (dns/tcp/tls/quic/ttfb/total ms) plus remote_addr/protocol/cipher_suite.
+
+        ``quic_ms`` times the QUIC handshake of a connection an HTTP/3 request
+        opened, as ``tls_ms`` does a TLS one. A phase the request did not go
+        through is ``None``, such as every connection phase on a pooled
+        connection. ``protocol`` is always given; ``remote_addr`` and
+        ``cipher_suite`` come with a connection the request opened and, over
+        HTTP/3, with a pooled one too.
 
         ``trust_anchor`` is the Trust Anchor Identifiers negotiation of the TLS
         connection the request opened, ``None`` if it opened none, as on a
@@ -1170,6 +1260,10 @@ class StreamingResponse:
     def status_code(self) -> int:
         """The HTTP status code."""
     @property
+    def attempt_summary(self) -> dict[str, Any]:
+        """What the request did before this response was handed over; see
+        ``AttemptLimits`` for the keys. Reading the body sends no more HTTP."""
+    @property
     def headers(self) -> HeaderMap:
         """The response headers."""
     async def chunk(self) -> Optional[bytes]:
@@ -1196,6 +1290,10 @@ class BlockingStreamingResponse:
     @property
     def status_code(self) -> int:
         """The HTTP status code."""
+    @property
+    def attempt_summary(self) -> dict[str, Any]:
+        """What the request did before this response was handed over; see
+        ``AttemptLimits`` for the keys. Reading the body sends no more HTTP."""
     @property
     def headers(self) -> HeaderMap:
         """The response headers."""
@@ -1341,6 +1439,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a GET request."""
     async def post(
@@ -1374,6 +1473,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a POST request with optional json/data/body/multipart payload."""
     async def request(
@@ -1408,6 +1508,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a request with an explicit HTTP method (e.g. ``"GET"``, ``"POST"``)."""
     async def put(
@@ -1441,6 +1542,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a PUT request with optional json/data/body/multipart payload."""
     async def delete(
@@ -1473,6 +1575,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a DELETE request."""
     async def head(
@@ -1498,6 +1601,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a HEAD request."""
     async def patch(
@@ -1531,6 +1635,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a PATCH request with optional json/data/body/multipart payload."""
     async def options(
@@ -1556,8 +1661,18 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send an OPTIONS request."""
+    @property
+    def attempt_limits(self) -> AttemptLimits:
+        """The ``attempt_limits`` this session was given; what it leaves out
+        comes from the client."""
+    @property
+    def effective_attempt_limits(self) -> dict[str, Any]:
+        """The limits its requests start from, in the form of
+        ``Client.effective_attempt_limits``, the scope ``"session"`` where this
+        session set the cap."""
     def pool_stats(self) -> PoolStats:
         """Return current connection pool statistics."""
     def pool_clear(self) -> None:
@@ -1574,10 +1689,15 @@ class Session:
 
         ``extensions`` are offered, in the order given, in the upgrade's
         ``Sec-WebSocket-Extensions`` header, which is part of what a browser's
-        handshake looks like. The frames themselves are always read and written
-        plain, so only an extension that leaves them alone can be used: once a
-        server accepts ``permessage-deflate``, the compression Chrome offers,
-        every compressed message it sends fails to be received.
+        handshake looks like. ``permessage-deflate`` is the one extension the
+        connection speaks: offer it, as Chrome does with
+        ``"permessage-deflate; client_max_window_bits"``, and once the server
+        accepts it messages are compressed and decompressed for you, with
+        context takeover, fragmented messages and client windows of 9 to 15
+        bits; a message that decompresses to more than 64 MiB fails the
+        connection. Compression is used only when offered. A server that
+        accepts any other extension, more than one, or deflate parameters that
+        match no offer fails the handshake with ``RequestError``.
         """
     def set_cookie(self, url: str, name: str, value: str) -> None:
         """Set a cookie for the given URL in the session's cookie jar."""
@@ -1675,6 +1795,7 @@ class Session:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> StreamingResponse:
         """Send a request and return a streaming response read chunk by chunk."""
     def on_request(self, callback: Callable[..., Any]) -> None:
@@ -1724,6 +1845,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a GET request."""
     def post(
@@ -1755,6 +1877,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a POST request with optional json/data/body/multipart payload."""
     def request(
@@ -1787,6 +1910,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a request with an explicit HTTP method (e.g. ``"GET"``, ``"POST"``)."""
     def put(
@@ -1818,6 +1942,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a PUT request with optional json/data/body/multipart payload."""
     def delete(
@@ -1848,6 +1973,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a DELETE request."""
     def head(
@@ -1873,6 +1999,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a HEAD request."""
     def patch(
@@ -1904,6 +2031,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send a PATCH request with optional json/data/body/multipart payload."""
     def options(
@@ -1929,8 +2057,18 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Response:
         """Send an OPTIONS request."""
+    @property
+    def attempt_limits(self) -> AttemptLimits:
+        """The ``attempt_limits`` this session was given; what it leaves out
+        comes from the client."""
+    @property
+    def effective_attempt_limits(self) -> dict[str, Any]:
+        """The limits its requests start from, in the form of
+        ``Client.effective_attempt_limits``, the scope ``"session"`` where this
+        session set the cap."""
     def pool_stats(self) -> PoolStats:
         """Return current connection pool statistics."""
     def pool_clear(self) -> None:
@@ -2038,6 +2176,7 @@ class BlockingSession:
         h3_header_order: Optional[list[str]] = None,
         protocol_policy: Optional[ProtocolPolicy] = None,
         http_intent: Optional[HttpIntent] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> BlockingStreamingResponse:
         """Send a request and return a streaming response read chunk by chunk."""
     def on_request(self, callback: Callable[..., Any]) -> None:
@@ -2089,6 +2228,7 @@ class Client:
         max_pending_h2_requests: Optional[int] = None,
         h2_dispatch_batch_size: Optional[int] = None,
         quic_connect_timeout: Optional[float] = None,
+        read_idle_timeout: Optional[float] = None,
         max_header_count: Optional[int] = None,
         max_header_size: Optional[int] = None,
         max_headers_total_size: Optional[int] = None,
@@ -2125,6 +2265,8 @@ class Client:
         tls_session_cache_partition_policy: Optional[
             TlsSessionCachePartitionPolicy
         ] = None,
+        tls_session_cache_ttl: Optional[float] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
         masque: Optional[MasqueConfig] = None,
     ) -> None:
         """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options.
@@ -2187,6 +2329,51 @@ class Client:
         was given in is not kept, and HTTP/2 and HTTP/3 always send lowercase
         names.
 
+        The timeouts are in seconds. Left out, ``dns_timeout`` is 5,
+        ``tcp_connect_timeout``, ``tls_handshake_timeout`` and
+        ``quic_connect_timeout`` are 10, ``ttfb_timeout`` (until the response
+        headers) is 30 and ``total_timeout`` is 120, while
+        ``read_idle_timeout``, how long a response body may go without
+        anything arriving, is off. ``total_timeout``, or a request's
+        ``timeout=``, bounds the whole request: connecting, redirects, retries
+        and their backoff, and reading the body, a streamed one included, so a
+        download that may take longer needs a deadline that fits it.
+        ``math.inf`` turns any of these deadlines off.
+
+        A client caches the TLS sessions of its connections and resumes them
+        on later ones, as a browser does, over TLS 1.2 (by ticket or session
+        ID) and TLS 1.3 and QUIC (by ticket); a fatal TLS error drops a
+        session. ``tls_session_cache_ttl`` sets how many seconds a cached
+        session lives, for all three: by default an hour for TLS 1.2, counted
+        from its first full handshake, and seven days for TLS 1.3, which is
+        also the most it can be. A shorter lifetime from the server still
+        wins, and ``0`` caches nothing. To turn the cache off, pass
+        ``tls_session_resumption_policy=TlsSessionResumptionPolicy.DISABLED``.
+
+        ``attempt_limits`` caps, for each request of this client, the HTTP
+        submissions beyond the first and its redirects, and the connections it
+        starts; see ``AttemptLimits``. A session or request can only lower it.
+
+        ``h2_fallback_h1`` and ``retry_on_connection_close`` are off unless
+        set to ``True``: an HTTP/2 connection that fails is not retried over
+        HTTP/1.1, whose fingerprint differs from the browser's, and a request
+        whose pooled connection the server has closed fails instead of going
+        out again on a new one. Neither overrides the method's idempotency or a
+        body that cannot be sent twice. HTTP/2 forbids the connection-specific
+        headers ``Connection``, ``Keep-Alive``, ``Proxy-Connection``,
+        ``Transfer-Encoding``, ``Upgrade`` and a ``TE`` other than
+        ``trailers``: given one, a request over HTTP/2 still sends it and logs
+        a warning, and a strict server fails the request.
+
+        ``quic_fingerprint`` is the ClientHello sent inside QUIC, which for
+        Chrome differs from the one it sends over TCP: a ``TlsProfile``, or a
+        name. A preset's name stands for the one that preset sends over QUIC,
+        so ``"chrome_158"`` is ``TlsProfile.chrome_158_quic()``, as
+        ``Client.chrome_158()`` sends it, and a preset without a QUIC
+        ClientHello of its own (Chrome 131, Firefox, Safari) gives its TLS
+        profile. The QUIC-TLS presets can be named too, as
+        ``"chrome_158_quic"``. Left out, HTTP/3 reuses the TLS profile.
+
         ``masque`` configures the hop to a ``masque://`` proxy (requires the
         ``masque`` feature). It is independent of ``verify`` and ``ca_cert*``,
         which only govern the tunneled connection to the origin.
@@ -2203,7 +2390,7 @@ class Client:
         ``trust_anchor_bindings`` negotiate Trust Anchor Identifiers
         (draft-ietf-tls-trust-anchor-ids): IDs of the roots a client accepts,
         which a ClientHello carries in extension ``0xca34``. Only the Chrome 152
-        to 157 profiles have that extension; a profile without it refuses
+        to 158 profiles have that extension; a profile without it refuses
         ``"trusted"`` and ``"once"``. ``"profile"``, the default, sends the IDs
         the TLS profile lists, in its order; ``"trusted"`` sends the sorted IDs
         of the roots this client trusts instead. ``trust_anchor_recovery="once"``
@@ -2265,6 +2452,9 @@ class Client:
     def chrome_157() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
+    def chrome_158() -> Client:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
     def firefox_133() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
@@ -2283,6 +2473,34 @@ class Client:
     @staticmethod
     def safari_26() -> Client:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def from_preset_json(
+        json: str | bytes,
+        *,
+        tcp_fingerprint: Optional[str | TcpFingerprint] = None,
+    ) -> Client:
+        """A client built from a complete profile bundle, lkrequest's v2 preset
+        JSON as :func:`export_preset_json` writes it: the TLS, QUIC TLS, HTTP/2
+        and QUIC profiles, the header and cookie order, the protocol policy and
+        the TLS session-cache partitioning, as a ``Client.<name>()`` preset
+        has them. A bundle has no TCP fingerprint; give one as
+        ``tcp_fingerprint``, or the client has none, as ``Client()``.
+
+        Upstream validates the bundle as it reads it, within limits of its own
+        (1 MiB, nesting depth and the like). A bundle it refuses raises
+        ``ValueError`` naming the reason (``InvalidJson``, ``UnknownField``,
+        ``InvalidProfile``, …) and the JSON pointer of the value at fault,
+        such as ``UnknownField at /runtime/surprise``.
+        """
+    @staticmethod
+    def from_preset_file(
+        path: str | os.PathLike[str],
+        *,
+        tcp_fingerprint: Optional[str | TcpFingerprint] = None,
+    ) -> Client:
+        """``from_preset_json()`` for the bundle in the file at ``path``, a
+        regular file of at most 1 MiB. A file that cannot be read raises
+        ``ValueError`` too."""
     def session(
         self,
         *,
@@ -2314,6 +2532,7 @@ class Client:
         hsts: Optional[Hsts] = None,
         base_url: Optional[str] = None,
         network_partition_context: Optional[NetworkPartitionContext] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> Session:
         """Create a new session, optionally overriding proxy, retry, protocol, and hook settings.
 
@@ -2350,6 +2569,23 @@ class Client:
     @property
     def tls_session_resumption_policy(self) -> TlsSessionResumptionPolicy:
         """The TLS session-ticket resumption policy in effect for this client."""
+    @property
+    def tls_session_cache_ttl(self) -> Optional[float]:
+        """The lifetime ``tls_session_cache_ttl`` gives cached sessions, in
+        seconds, or ``None`` for the defaults: an hour for TLS 1.2, seven days
+        for TLS 1.3 and QUIC."""
+    @property
+    def tls_session_cache_enabled(self) -> bool:
+        """Whether sessions are cached for resumption: ``False`` under
+        ``TlsSessionResumptionPolicy.DISABLED`` or a lifetime of zero."""
+    @property
+    def attempt_limits(self) -> AttemptLimits:
+        """The ``attempt_limits`` this client was given."""
+    @property
+    def effective_attempt_limits(self) -> dict[str, Any]:
+        """The limits its sessions start from: ``extra_http_attempts`` and
+        ``connect_attempts``, ``None`` for no cap, each with the scope that set
+        it (``extra_http_scope``, ``connect_scope``: ``"client"`` or ``None``)."""
     # What the client was built with, a preset applied: mostly under the name
     # of the constructor argument that sets each.
     @property
@@ -2373,8 +2609,9 @@ class Client:
     @property
     def timeouts(self) -> dict[str, Optional[float]]:
         """``dns_timeout``, ``tcp_connect_timeout``, ``tls_handshake_timeout``,
-        ``ttfb_timeout``, ``total_timeout`` and ``quic_connect_timeout``, in
-        seconds, the defaults included; ``None`` where there is none."""
+        ``ttfb_timeout``, ``total_timeout``, ``quic_connect_timeout`` and
+        ``read_idle_timeout``, in seconds, the defaults included; ``None``
+        where that deadline is off."""
     @property
     def resource_limits(self) -> dict[str, Any]:
         """``max_response_body_size``, ``max_connections_per_session`` (``None``
@@ -2393,6 +2630,8 @@ class Client:
     def h2_fallback_h1(self) -> bool: ...
     @property
     def proxy_fallback_direct(self) -> bool: ...
+    @property
+    def retry_on_connection_close(self) -> bool: ...
     @property
     def max_pending_h2_requests(self) -> Optional[int]: ...
     @property
@@ -2476,6 +2715,7 @@ class BlockingClient:
         max_pending_h2_requests: Optional[int] = None,
         h2_dispatch_batch_size: Optional[int] = None,
         quic_connect_timeout: Optional[float] = None,
+        read_idle_timeout: Optional[float] = None,
         max_header_count: Optional[int] = None,
         max_header_size: Optional[int] = None,
         max_headers_total_size: Optional[int] = None,
@@ -2512,6 +2752,8 @@ class BlockingClient:
         tls_session_cache_partition_policy: Optional[
             TlsSessionCachePartitionPolicy
         ] = None,
+        tls_session_cache_ttl: Optional[float] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
         masque: Optional[MasqueConfig] = None,
     ) -> None:
         """Build a client with explicit fingerprints, headers, timeouts, certificates, and protocol options.
@@ -2574,6 +2816,51 @@ class BlockingClient:
         was given in is not kept, and HTTP/2 and HTTP/3 always send lowercase
         names.
 
+        The timeouts are in seconds. Left out, ``dns_timeout`` is 5,
+        ``tcp_connect_timeout``, ``tls_handshake_timeout`` and
+        ``quic_connect_timeout`` are 10, ``ttfb_timeout`` (until the response
+        headers) is 30 and ``total_timeout`` is 120, while
+        ``read_idle_timeout``, how long a response body may go without
+        anything arriving, is off. ``total_timeout``, or a request's
+        ``timeout=``, bounds the whole request: connecting, redirects, retries
+        and their backoff, and reading the body, a streamed one included, so a
+        download that may take longer needs a deadline that fits it.
+        ``math.inf`` turns any of these deadlines off.
+
+        A client caches the TLS sessions of its connections and resumes them
+        on later ones, as a browser does, over TLS 1.2 (by ticket or session
+        ID) and TLS 1.3 and QUIC (by ticket); a fatal TLS error drops a
+        session. ``tls_session_cache_ttl`` sets how many seconds a cached
+        session lives, for all three: by default an hour for TLS 1.2, counted
+        from its first full handshake, and seven days for TLS 1.3, which is
+        also the most it can be. A shorter lifetime from the server still
+        wins, and ``0`` caches nothing. To turn the cache off, pass
+        ``tls_session_resumption_policy=TlsSessionResumptionPolicy.DISABLED``.
+
+        ``attempt_limits`` caps, for each request of this client, the HTTP
+        submissions beyond the first and its redirects, and the connections it
+        starts; see ``AttemptLimits``. A session or request can only lower it.
+
+        ``h2_fallback_h1`` and ``retry_on_connection_close`` are off unless
+        set to ``True``: an HTTP/2 connection that fails is not retried over
+        HTTP/1.1, whose fingerprint differs from the browser's, and a request
+        whose pooled connection the server has closed fails instead of going
+        out again on a new one. Neither overrides the method's idempotency or a
+        body that cannot be sent twice. HTTP/2 forbids the connection-specific
+        headers ``Connection``, ``Keep-Alive``, ``Proxy-Connection``,
+        ``Transfer-Encoding``, ``Upgrade`` and a ``TE`` other than
+        ``trailers``: given one, a request over HTTP/2 still sends it and logs
+        a warning, and a strict server fails the request.
+
+        ``quic_fingerprint`` is the ClientHello sent inside QUIC, which for
+        Chrome differs from the one it sends over TCP: a ``TlsProfile``, or a
+        name. A preset's name stands for the one that preset sends over QUIC,
+        so ``"chrome_158"`` is ``TlsProfile.chrome_158_quic()``, as
+        ``Client.chrome_158()`` sends it, and a preset without a QUIC
+        ClientHello of its own (Chrome 131, Firefox, Safari) gives its TLS
+        profile. The QUIC-TLS presets can be named too, as
+        ``"chrome_158_quic"``. Left out, HTTP/3 reuses the TLS profile.
+
         ``masque`` configures the hop to a ``masque://`` proxy (requires the
         ``masque`` feature). It is independent of ``verify`` and ``ca_cert*``,
         which only govern the tunneled connection to the origin.
@@ -2582,7 +2869,7 @@ class BlockingClient:
         ``trust_anchor_bindings`` negotiate Trust Anchor Identifiers
         (draft-ietf-tls-trust-anchor-ids): IDs of the roots a client accepts,
         which a ClientHello carries in extension ``0xca34``. Only the Chrome 152
-        to 157 profiles have that extension; a profile without it refuses
+        to 158 profiles have that extension; a profile without it refuses
         ``"trusted"`` and ``"once"``. ``"profile"``, the default, sends the IDs
         the TLS profile lists, in its order; ``"trusted"`` sends the sorted IDs
         of the roots this client trusts instead. ``trust_anchor_recovery="once"``
@@ -2644,6 +2931,9 @@ class BlockingClient:
     def chrome_157() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
+    def chrome_158() -> BlockingClient:
+        """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
     def firefox_133() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
     @staticmethod
@@ -2662,6 +2952,34 @@ class BlockingClient:
     @staticmethod
     def safari_26() -> BlockingClient:
         """Create a client preconfigured with this browser's TLS/HTTP2/TCP fingerprint."""
+    @staticmethod
+    def from_preset_json(
+        json: str | bytes,
+        *,
+        tcp_fingerprint: Optional[str | TcpFingerprint] = None,
+    ) -> BlockingClient:
+        """A client built from a complete profile bundle, lkrequest's v2 preset
+        JSON as :func:`export_preset_json` writes it: the TLS, QUIC TLS, HTTP/2
+        and QUIC profiles, the header and cookie order, the protocol policy and
+        the TLS session-cache partitioning, as a ``BlockingClient.<name>()`` preset
+        has them. A bundle has no TCP fingerprint; give one as
+        ``tcp_fingerprint``, or the client has none, as ``BlockingClient()``.
+
+        Upstream validates the bundle as it reads it, within limits of its own
+        (1 MiB, nesting depth and the like). A bundle it refuses raises
+        ``ValueError`` naming the reason (``InvalidJson``, ``UnknownField``,
+        ``InvalidProfile``, …) and the JSON pointer of the value at fault,
+        such as ``UnknownField at /runtime/surprise``.
+        """
+    @staticmethod
+    def from_preset_file(
+        path: str | os.PathLike[str],
+        *,
+        tcp_fingerprint: Optional[str | TcpFingerprint] = None,
+    ) -> BlockingClient:
+        """``from_preset_json()`` for the bundle in the file at ``path``, a
+        regular file of at most 1 MiB. A file that cannot be read raises
+        ``ValueError`` too."""
     def session(
         self,
         *,
@@ -2693,6 +3011,7 @@ class BlockingClient:
         hsts: Optional[Hsts] = None,
         base_url: Optional[str] = None,
         network_partition_context: Optional[NetworkPartitionContext] = None,
+        attempt_limits: Optional[AttemptLimits] = None,
     ) -> BlockingSession:
         """Create a new session, optionally overriding proxy, retry, protocol, and hook settings.
 
@@ -2729,6 +3048,23 @@ class BlockingClient:
     @property
     def tls_session_resumption_policy(self) -> TlsSessionResumptionPolicy:
         """The TLS session-ticket resumption policy in effect for this client."""
+    @property
+    def tls_session_cache_ttl(self) -> Optional[float]:
+        """The lifetime ``tls_session_cache_ttl`` gives cached sessions, in
+        seconds, or ``None`` for the defaults: an hour for TLS 1.2, seven days
+        for TLS 1.3 and QUIC."""
+    @property
+    def tls_session_cache_enabled(self) -> bool:
+        """Whether sessions are cached for resumption: ``False`` under
+        ``TlsSessionResumptionPolicy.DISABLED`` or a lifetime of zero."""
+    @property
+    def attempt_limits(self) -> AttemptLimits:
+        """The ``attempt_limits`` this client was given."""
+    @property
+    def effective_attempt_limits(self) -> dict[str, Any]:
+        """The limits its sessions start from: ``extra_http_attempts`` and
+        ``connect_attempts``, ``None`` for no cap, each with the scope that set
+        it (``extra_http_scope``, ``connect_scope``: ``"client"`` or ``None``)."""
     # What the client was built with, a preset applied: mostly under the name
     # of the constructor argument that sets each.
     @property
@@ -2752,8 +3088,9 @@ class BlockingClient:
     @property
     def timeouts(self) -> dict[str, Optional[float]]:
         """``dns_timeout``, ``tcp_connect_timeout``, ``tls_handshake_timeout``,
-        ``ttfb_timeout``, ``total_timeout`` and ``quic_connect_timeout``, in
-        seconds, the defaults included; ``None`` where there is none."""
+        ``ttfb_timeout``, ``total_timeout``, ``quic_connect_timeout`` and
+        ``read_idle_timeout``, in seconds, the defaults included; ``None``
+        where that deadline is off."""
     @property
     def resource_limits(self) -> dict[str, Any]:
         """``max_response_body_size``, ``max_connections_per_session`` (``None``
@@ -2772,6 +3109,8 @@ class BlockingClient:
     def h2_fallback_h1(self) -> bool: ...
     @property
     def proxy_fallback_direct(self) -> bool: ...
+    @property
+    def retry_on_connection_close(self) -> bool: ...
     @property
     def max_pending_h2_requests(self) -> Optional[int]: ...
     @property
@@ -3127,6 +3466,9 @@ class TlsProfile:
     def chrome_157() -> TlsProfile:
         """Chrome 157: the capture kept Chrome 156's TLS shape, sorted trust-anchor IDs included; only the profile name differs."""
     @staticmethod
+    def chrome_158() -> TlsProfile:
+        """Chrome 158: the capture kept Chrome 157's TLS shape, sorted trust-anchor IDs included; only the profile name differs."""
+    @staticmethod
     def chrome_146_quic() -> TlsProfile:
         """Chrome 146 QUIC-TLS preset (the ClientHello sent inside QUIC), for ``Client(quic_fingerprint=...)``."""
     @staticmethod
@@ -3153,6 +3495,9 @@ class TlsProfile:
     @staticmethod
     def chrome_157_quic() -> TlsProfile:
         """Chrome 157 QUIC-TLS preset: Chrome 156's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
+    @staticmethod
+    def chrome_158_quic() -> TlsProfile:
+        """Chrome 158 QUIC-TLS preset: Chrome 157's QUIC ClientHello, for ``Client(quic_fingerprint=...)``."""
     @staticmethod
     def firefox_133() -> TlsProfile:
         """TLS fingerprint preset for this browser version."""
@@ -3327,6 +3672,9 @@ class H2Profile:
     @staticmethod
     def chrome_157() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 156)."""
+    @staticmethod
+    def chrome_158() -> H2Profile:
+        """HTTP/2 fingerprint preset for this browser version (unchanged from Chrome 157)."""
     @staticmethod
     def firefox_133() -> H2Profile:
         """HTTP/2 fingerprint preset for this browser version."""
@@ -3521,6 +3869,12 @@ def list_presets() -> list[dict[str, Any]]:
     speaks HTTP/3 in this build. A name is what ``Client.<name>()``,
     ``tls_profile=`` and ``h2_profile=`` take.
     """
+
+def export_preset_json(name: str) -> str:
+    """The browser preset ``name`` (one :func:`list_presets` gives) as a
+    complete profile bundle, lkrequest's v2 preset JSON, which
+    ``Client.from_preset_json()`` reads back. Edit it to make a preset of your
+    own. An unknown name raises ``ValueError``."""
 
 def trust_anchor_identity(der: bytes) -> str:
     """The identity of a DER root certificate, for ``Client(trust_anchor_bindings=...)``.

@@ -30,7 +30,8 @@ def handshake(ws, probe) -> dict:
 
 def test_extensions_are_offered_in_the_upgrade(ws_server_url, ws_handshake_probe):
     # Names the server does not know, so it accepts none and the frames stay
-    # plain; see the stub on why permessage-deflate cannot be offered.
+    # plain: the client fails a handshake that accepts any extension other than
+    # permessage-deflate.
     ws = connect(ws_server_url, extensions=["x-first", "x-second; level=1"])
     try:
         seen = handshake(ws, ws_handshake_probe)
@@ -109,14 +110,36 @@ def test_the_url_is_there_before_and_after_closing(ws_server_url):
         ws.ping()
 
 
-def test_permessage_deflate_is_offered_but_cannot_be_received(ws_server_url):
-    # The frame layer (fastwebsockets) does not decompress, so a server that
-    # accepts the offer sends what cannot be read. When this starts to pass the
-    # message through, the limitation in the stub and the README is gone.
-    ws = connect(ws_server_url, extensions=["permessage-deflate"])
+#: The offer Chrome makes. The local server accepts it and compresses what it
+#: sends back: builds that offered it without speaking it failed every receive
+#: with "Reserved bits".
+CHROME_DEFLATE_OFFER = "permessage-deflate; client_max_window_bits"
+
+
+@pytest.mark.parametrize(
+    "offer", ["permessage-deflate", CHROME_DEFLATE_OFFER], ids=["bare", "chrome"]
+)
+def test_permessage_deflate_messages_are_compressed_and_received(ws_server_url, offer):
+    ws = connect(ws_server_url, extensions=[offer])
     try:
-        ws.send_text("hello " * 50)
-        with pytest.raises(lkrequest.RequestError, match="Reserved bits"):
-            ws.recv()
+        text = "hello " * 50
+        ws.send_text(text)
+        assert ws.recv().data == text
+        data = bytes(range(256)) * 64
+        ws.send_binary(data)
+        assert ws.recv().data == data
+    finally:
+        ws.close()
+
+
+def test_permessage_deflate_keeps_its_context_across_large_messages(ws_server_url):
+    # Context takeover: each message is compressed against the ones before it,
+    # so a mistake in the shared window shows up on the second and third.
+    ws = connect(ws_server_url, extensions=[CHROME_DEFLATE_OFFER])
+    try:
+        for size in (300_000, 1_000_000, 64):
+            text = ("abcdefghij" * (size // 10 + 1))[:size]
+            ws.send_text(text)
+            assert ws.recv().data == text
     finally:
         ws.close()

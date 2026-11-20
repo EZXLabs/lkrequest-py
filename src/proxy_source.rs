@@ -16,7 +16,8 @@ use crate::proxy::{resolve_proxy, resolve_proxy_list};
 use crate::types::is_async_function;
 
 /// How long upstream's `proxy_buffer` thread is held back after the function
-/// failed. Left alone, it calls again at once, over and over.
+/// failed. Left alone, it calls again 50 ms later, which is too soon for a
+/// function that is usually a network call to a proxy provider.
 const BUFFER_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 tokio::task_local! {

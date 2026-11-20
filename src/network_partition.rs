@@ -21,13 +21,14 @@ use pyo3::prelude::*;
 // TlsSessionResumptionPolicy
 // ---------------------------------------------------------------------------
 
-/// Caching and reuse policy for TLS 1.3 session tickets. Pass to
+/// Caching and reuse policy for TLS sessions: TLS 1.2 ones by ticket or
+/// session ID, TLS 1.3 and QUIC ones by ticket. Pass to
 /// `Client(tls_session_resumption_policy=...)`.
 ///
 /// Distinct from `SessionResumptionConfig`: that one decides which resumption
 /// modes the ClientHello advertises (fingerprint shape), while this one decides
-/// whether the client actually retains tickets and offers them as a PSK on
-/// later connections.
+/// whether the client actually retains sessions and offers them on later
+/// connections.
 #[pyclass(name = "TlsSessionResumptionPolicy", eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyTlsSessionResumptionPolicy {

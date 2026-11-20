@@ -12,6 +12,7 @@
 // timeout, proxy, encoding, …). Collapsing them to <=7 would hurt the binding.
 #![allow(clippy::too_many_arguments)]
 
+mod attempts;
 mod bridge;
 mod build_info;
 mod client;
@@ -71,6 +72,7 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PySessionPoolStats>()?;
     m.add_class::<types::PySessionResumptionConfig>()?;
     m.add_class::<types::PyH2DataFramePolicy>()?;
+    m.add_class::<attempts::PyAttemptLimits>()?;
 
     // Browser-style network session policies (ticket resumption / cache
     // partitioning / browsing context)
@@ -178,6 +180,7 @@ fn _lkrequest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(blocking_drain_pending, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(build_info::features, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(build_info::list_presets, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(build_info::export_preset_json, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         trust_anchor::trust_anchor_identity,
         m

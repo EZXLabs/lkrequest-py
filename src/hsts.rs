@@ -68,8 +68,10 @@ impl PyHsts {
 
     /// Learn HSTS hosts from `Strict-Transport-Security` response headers,
     /// mirroring a browser's dynamic HSTS store, for every session given this
-    /// object. Optionally pre-seed with known HSTS hosts (e.g. replaying a
-    /// prior session's state).
+    /// object. A learned host expires with its `max-age` and covers its
+    /// subdomains only with `includeSubDomains`. Optionally pre-seed with
+    /// known HSTS hosts (e.g. replaying a prior session's state); seeds cover
+    /// subdomains and do not expire.
     #[staticmethod]
     #[pyo3(signature = (seed=None))]
     fn dynamic(seed: Option<Vec<String>>) -> Self {

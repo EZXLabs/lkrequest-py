@@ -22,7 +22,7 @@ Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性�
 - **Event Hook** — 轻量级请求/响应回调
 - **连接预热** — `preconnect()` / `prefetch()` 批量预建连接
 - **Prometheus 指标** — 内置请求计数、延迟直方图、exposition format 导出
-- **请求诊断** — `response.diagnostics` 暴露单请求分阶段计时（DNS/TCP/TLS/TTFB/total）+ remote_addr/protocol/cipher_suite，以及信任锚协商情况
+- **请求诊断** — `response.diagnostics` 暴露单请求分阶段计时（DNS/TCP/TLS/QUIC/TTFB/total）+ remote_addr/protocol/cipher_suite，以及信任锚协商情况
 - **运行指标快照** — `metrics_snapshot()` 拉取进程级 wire 字节 / 连接 / 请求计数（供宿主自采，需 `telemetry` feature 才有真实数值）
 - **零拷贝 Response** — `bytes::Bytes` + PyBuffer 协议 + text/json 缓存
 - **自动解压** — Brotli / gzip / deflate / zstd，可控 `AcceptEncoding`
@@ -37,8 +37,9 @@ Python HTTP 客户端，支持 TLS/HTTP2/TCP 指纹控制。基于 Rust 高性�
 - **TLS close_notify** — `Client(require_close_notify=True)` 拒绝未收到 TLS close_notify 警报就被截断的响应体
 - **HTTP/1.1 头名大小写** — `Client(http1_title_case_headers=False)` 让 HTTP/1.1 头名使用小写（`content-type`），但保留大写首字母的 `Host`；默认仍为 Title-Case（`Content-Type`）。自动生成的头、普通请求、流式请求、预连接和 WebSocket 握手都适用。HTTP/2 与 HTTP/3 的头名始终是小写
 - **请求级协议覆盖** — `preferred_http_version` / `idempotency`（0-RTT 重放安全声明）
-- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`，QUIC 连接失败后源站留在 TCP 上多久也可以自己定：`broken_quic_policy=BrokenQuicConfig(initial_cooldown=2.0, max_cooldown=30.0)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151/152/153/154/155/156/157 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint=TlsProfile.chrome_151_quic()`，否则 HTTP/3 会沿用主 TLS profile
+- **QUIC / HTTP3** — 可选 feature（`maturin develop --features quic-h3`）：`session(http3_only=True / http3_with_fallback=True / broken_quic_policy=BrokenQuicPolicy.Resilient)`，QUIC 连接失败后源站留在 TCP 上多久也可以自己定：`broken_quic_policy=BrokenQuicConfig(initial_cooldown=2.0, max_cooldown=30.0)`；`Client(quic_fingerprint=..., quic_profile="chrome_150", disable_http3=True)`；独立的 Chrome 146/150/151/152/153/154/155/156/157/158 `QuicProfile` 预设（仅 feature 开启时可用）。QUIC 专用的 ClientHello 是另一份 TLS profile——手工构造客户端时请传 `quic_fingerprint="chrome_158"`（即 `Client.chrome_158()` 在 QUIC 里发的 `TlsProfile.chrome_158_quic()`）或一个 `TlsProfile`，否则 HTTP/3 会沿用主 TLS profile
 - **HTTP/3 重试** — `session(h3_retry_mode=H3RetryMode.Chrome155ProtocolErrors)` 会像 Chrome 155 那样，在响应头到达之前对特定的 HTTP/3 协议错误最多重试两次。它会重放已缓冲的请求，**包括 POST**，也就是说服务器已经处理过的请求可能被再处理一次；用 `idempotency=Idempotency.NotIdempotent` 可以让单个请求退出。默认关闭（`H3RetryMode.Safe`）；非 `Safe` 的取值需要 `quic-h3` feature
+- **尝试上限** — `AttemptLimits(extra_http_attempts=..., connect_attempts=...)` 在客户端、会话或单个请求上限制一次请求的重试与恢复次数和新建连接数；`Response.attempt_summary` 说明每个请求做了什么
 - **MASQUE 代理（实验性）** — 可选 feature（`maturin develop --features masque`，隐含 `quic-h3`）：`session(proxy="masque://proxy:443", http3_only=True)` 把到目标的 QUIC 连接放进 RFC 9298 CONNECT-UDP 隧道；`Client(masque=MasqueConfig(...))` 配置到代理这一跳的信任，与 `verify` 相互独立；`HealthCheckConfig(tunnel_probe=True, masque=...)` 用真实隧道探测代理池中的 MASQUE 代理
 - **合成指纹（高级）** — 可选 feature（`maturin develop --features synthetic-fp`）：`Client(randomize=Randomize.recombine())` 为每个 session 合成一个跨层（TLS+H2+H3）唯一身份；`Randomize.full()` 进一步对 H2/QUIC 取语料外数值；`Layers` 掩码（如 `Randomize.recombine_layers(Layers.TLS | Layers.H2)`）限定合成层。合成指纹不匹配任何真实浏览器，仅用于黑名单（negative-model）目标，对白名单会立即失败
 
@@ -195,6 +196,20 @@ def retry_when_worth_it(attempt, error, status, exception=None):
     if exception is not None and exception.retryable and attempt < 3:
         return 1.0
     return None
+```
+
+### 尝试上限
+
+`AttemptLimits` 限制一次请求能做的事：`extra_http_attempts` 限制首次提交和重定向之外的 HTTP 提交（重试与恢复），`connect_attempts` 限制它新建的 TCP 和 QUIC 连接。可以给客户端、会话或单个请求；会话和请求继承上一级的上限，只能收紧，放宽会抛 `ValueError`。上限不会开启重试，也不能代替超时。每个响应以及失败请求的异常都会说明这次请求做了什么：
+
+```python
+client = lkrequest.Client(attempt_limits=lkrequest.AttemptLimits(extra_http_attempts=2))
+session = client.session(retry=lkrequest.FixedInterval(max_retries=5, interval=1.0))
+resp = await session.get(url, attempt_limits=lkrequest.AttemptLimits(connect_attempts=1))
+resp.attempt_summary  # 服务器每次都返回 503 时
+# {'http_submissions': 3, 'extra_http_submissions': 2, 'redirects': 0, 'recoveries': 2,
+#  'connect_initiations': 1, 'outcome': 'succeeded', 'denial_reason': 'extra_http_limit',
+#  'effective_limits': {'extra_http_attempts': 2, 'extra_http_scope': 'client', ...}, ...}
 ```
 
 ### 中间件
@@ -361,6 +376,12 @@ body = await stream.bytes()
 text = await stream.text()
 ```
 
+读取响应体也算在请求的期限内：`total_timeout`（默认 120 秒）或请求自己的 `timeout=` 限制的是整个请求，包括流式读取响应体，所以可能下载更久的请求要给一个够用的期限，或者用 `total_timeout=math.inf` 不设总期限，改用 `read_idle_timeout=` 在响应体停止到达时结束请求：
+
+```python
+client = lkrequest.Client(total_timeout=math.inf, read_idle_timeout=30.0)
+```
+
 ### 连接预热
 
 提前建立 TLS 连接，减少首次请求延迟。
@@ -410,7 +431,7 @@ await ws.pong()                # 主动发送的 pong
 ws.url                         # close() 之后仍可读取
 ```
 
-`extensions` 会写进升级请求的 `Sec-WebSocket-Extensions` 头，这个头本身就是浏览器握手特征的一部分。但帧始终按未压缩的格式读写，所以只能使用不改变帧格式的扩展：服务器一旦接受 `permessage-deflate`（Chrome 会提供的压缩扩展），它发来的每条压缩消息都会接收失败。
+`extensions` 会写进升级请求的 `Sec-WebSocket-Extensions` 头，这个头本身就是浏览器握手特征的一部分。连接能处理的扩展只有 `permessage-deflate`：像 Chrome 那样提供 `"permessage-deflate; client_max_window_bits"`，服务器接受后消息会自动压缩和解压（支持上下文接管、分片消息、9 到 15 位的客户端窗口）；解压后超过 64 MiB 的消息会使连接失败。只有提供了才会压缩。服务器若接受了其他扩展、接受了多个扩展，或返回的 deflate 参数与所提供的都不匹配，握手会以 `RequestError` 失败。
 
 ### 代理
 
@@ -495,7 +516,16 @@ proxy = lkrequest.ProxyConfig("http://gateway:8080").with_custom_auth(
 )
 ```
 
-凭据需要每次建连时现算的，用 `with_custom_auth()`。函数返回认证头的值或 `None`，在建连的线程上运行，该线程会等它返回；函数抛异常时这次连接不带凭据，并记一条 warning 日志。
+凭据需要每次建连时现算的，用 `with_custom_auth()`。函数返回认证头的值或 `None`，在建连的线程上运行，该线程会等它返回，每发一次 CONNECT 调用一次；函数抛异常时这次连接不带凭据，并记一条 warning 日志。代理回 407 并带 `Proxy-Authenticate` 质询时会再发一次 CONNECT；若传了 `on_challenge=`，这次的凭据由它根据质询算出，Digest 这类方案就需要这样：
+
+```python
+def answer(challenges: list[str]) -> str | None:   # 每个 Proxy-Authenticate 的完整值
+    return digest_header(challenges[0])              # 返回 None 表示放弃
+
+proxy = lkrequest.ProxyConfig("http://gateway:8080").with_custom_auth(
+    "account-1", lambda: None, on_challenge=answer
+)
+```
 
 ### MASQUE 代理（实验性）
 
@@ -736,8 +766,9 @@ session.pool_clear()
 ### HSTS / http→https 升级策略
 
 浏览器会把已知 HSTS（或预加载）主机的 `http://` 请求在连接前升级为 `https://`。
-默认（不传 `hsts`）为无状态“首次访问”，不做任何升级。主机匹配为后缀匹配
-（等价于 HSTS 的 `includeSubDomains`）。
+默认（不传 `hsts`）为无状态“首次访问”，不做任何升级。静态列表里的主机、以及动态策略的种子主机，
+连同其子域一起升级。动态策略学到的主机在 `max-age` 到期前升级，只有响应头带了 `includeSubDomains`
+才覆盖子域；收到 `max-age=0` 则忘掉该主机。
 
 ```python
 # 从响应的 Strict-Transport-Security 头动态学习 HSTS 主机（像长时间运行的浏览器）
@@ -804,9 +835,10 @@ collector.reset()
 ```python
 resp = await session.get("https://example.com")
 print(resp.diagnostics)
-# {'dns_ms': 3, 'tcp_ms': 0, 'tls_ms': 423, 'ttfb_ms': 193, 'total_ms': 621,
+# {'dns_ms': 3, 'tcp_ms': 0, 'tls_ms': 423, 'quic_ms': None, 'ttfb_ms': 193, 'total_ms': 621,
 #  'remote_addr': '93.184.216.34:443', 'protocol': 'h2', 'cipher_suite': '0x1301'}
-# 复用连接时 dns_ms/tcp_ms/tls_ms 为 None（未经历该阶段）
+# 复用连接时 dns_ms/tcp_ms/tls_ms 为 None（未经历该阶段）；
+# 走 HTTP/3 时由 quic_ms 记录 QUIC 握手耗时，tcp_ms/tls_ms 为 None
 ```
 
 `diagnostics["trust_anchor"]` 记录请求新建的 TLS 连接上的[信任锚标识](#信任锚标识)协商，复用连接时为 `None`。
@@ -847,7 +879,7 @@ client = lkrequest.Client(ech_config=ech_bytes)              # ECH 支持
 
 ### 信任锚标识
 
-Chrome 152 及以后的版本会告诉服务端自己接受哪些根证书：把它们的 ID 放进 ClientHello 的 `trust_anchors` 扩展（`0xca34`，draft-ietf-tls-trust-anchor-ids），服务端据此挑一条终止于其中某个根证书的证书链。`Client.chrome_155()` 到 `Client.chrome_157()`（默认指纹也在其中）和对应版本的 Chrome 一样，按固定的排序顺序发出 28 个 ID；Chrome 152 到 154 的预设每次握手都会打乱顺序。三个客户端选项可以改变发什么、以及之后怎么做：
+Chrome 152 及以后的版本会告诉服务端自己接受哪些根证书：把它们的 ID 放进 ClientHello 的 `trust_anchors` 扩展（`0xca34`，draft-ietf-tls-trust-anchor-ids），服务端据此挑一条终止于其中某个根证书的证书链。`Client.chrome_155()` 到 `Client.chrome_158()`（默认指纹也在其中）和对应版本的 Chrome 一样，按固定的排序顺序发出 28 个 ID；Chrome 152 到 154 的预设每次握手都会打乱顺序。三个客户端选项可以改变发什么、以及之后怎么做：
 
 ```python
 root = open("private-root.der", "rb").read()
@@ -865,7 +897,7 @@ client = lkrequest.Client(
 - `trust_anchor_recovery`：设为 `"once"` 后，如果服务端列出了它能提供的 ID，随后证书链校验失败或服务端中止握手，客户端会再建一条连接，请求这些 ID 中第一个本客户端信任的。每个请求最多发生一次，被拒的那条连接上不发任何 HTTP 字节，并会关闭 0-RTT；需要开启 `verify`，不能与 `proxy_fallback_direct=True` 同用。默认是 `"disabled"`。
 - `trust_anchor_bindings`：为你自己的根证书提供 `{id: anchor_identity}`，ID 是你的 CA 分配的十六进制值，绑定到 `lkrequest.trust_anchor_identity(root_der)` 的结果。根证书本身仍需通过 `ca_cert*` 加载。
 
-这些 ID 不会改变信任哪些证书。只有带这个扩展的 profile（Chrome 152–157）接受 `"trusted"` 或 `"once"`，TLS 合成（`Randomize.recombine()` / `Randomize.full()`）也不能与它们同用；上游拒绝的设置会抛 `ValueError`。`diagnostics["trust_anchor"]` 记录新建连接请求了哪些 ID、服务端提供了哪些、由哪个根证书校验通过，以及恢复之后的首次尝试。
+这些 ID 不会改变信任哪些证书。只有带这个扩展的 profile（Chrome 152–158）接受 `"trusted"` 或 `"once"`，TLS 合成（`Randomize.recombine()` / `Randomize.full()`）也不能与它们同用；上游拒绝的设置会抛 `ValueError`。`diagnostics["trust_anchor"]` 记录新建连接请求了哪些 ID、服务端提供了哪些、由哪个根证书校验通过，以及恢复之后的首次尝试。
 
 ### DNS
 
@@ -1015,9 +1047,10 @@ except lkrequest.RequestError as e:
     e.proxy_error_kind  # ProxyError："authentication_required"、"tunnel_refused" 等
     e.tls_alert         # TlsError：握手因哪个告警结束，如 "handshake_failure"
     e.diagnostics       # 到失败为止的耗时与传输信息，格式同 Response.diagnostics
+    e.attempt_summary   # 这次请求做了什么，格式同 Response.attempt_summary
 ```
 
-不适用的属性为 `None`（两个布尔值为 `False`），手动构造的异常也是如此。HTTP 方法和 `request()` 失败时、以及 `error_for_status()` 抛出的异常带有 `diagnostics`；流式请求、WebSocket 和 `preconnect()` 的异常不带。
+不适用的属性为 `None`（两个布尔值为 `False`），手动构造的异常也是如此。HTTP 方法和 `request()` 失败时、以及 `error_for_status()` 抛出的异常带有 `diagnostics`；流式请求、WebSocket 和 `preconnect()` 的异常不带。`attempt_summary` 除了上述情况，流式请求在交出响应之前失败时也有，读取流式响应体出错时没有。
 
 ## 可用浏览器指纹
 
@@ -1038,6 +1071,7 @@ except lkrequest.RequestError as e:
 | `Client.chrome_155()` | Chrome 155 | Chrome 155 | Chrome |
 | `Client.chrome_156()` | Chrome 156 | Chrome 156 | Chrome |
 | `Client.chrome_157()` | Chrome 157 | Chrome 157 | Chrome |
+| `Client.chrome_158()` | Chrome 158 | Chrome 158 | Chrome |
 | `Client.firefox_133()` | Firefox 133 | Firefox 133 | Firefox |
 | `Client.firefox_147()` | Firefox 147 | Firefox 147 | Firefox |
 | `Client.firefox_156()` | Firefox 156 | Firefox 156 | Firefox |
@@ -1054,6 +1088,18 @@ Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权�
 
 预设只设置请求头的**顺序**，不设置请求头的值：`Client.chrome_155()` 发出的请求不会自带 `User-Agent`、`Accept` 等浏览器请求头，需要自己通过 `default_headers=` 或逐个请求设置。
 
+### Profile bundle
+
+预设可以导出成完整的 profile bundle（lkrequest 的 v2 预设 JSON），包含 TLS、QUIC TLS、HTTP/2、QUIC 各个 profile，请求头和 cookie 顺序，协议策略，以及会话缓存分区。可以修改导出的 bundle，或者维护自己的 bundle，再用它构建客户端；bundle 里没有 TCP 指纹，需要另外指定：
+
+```python
+bundle = lkrequest.export_preset_json("chrome_158")
+client = lkrequest.Client.from_preset_json(bundle, tcp_fingerprint="chrome")
+client = lkrequest.Client.from_preset_file("my_preset.json", tcp_fingerprint="chrome")
+```
+
+库拒绝的 bundle 会抛 `ValueError`，消息里写明原因和出错值的 JSON 指针，例如 `UnknownField at /runtime/surprise`。
+
 ## API 参考
 
 ### Client
@@ -1067,13 +1113,15 @@ Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权�
 | `header_order` | Header 发送顺序 |
 | `cookie_order` | Cookie 发送顺序 |
 | `http1_title_case_headers` | HTTP/1.1 头名的大小写：`True`（默认）发 `Content-Type`，`False` 发 `content-type`，但保留大写首字母的 `Host`，自动生成的头也一样。不保留调用时传入的原始拼写；HTTP/2 与 HTTP/3 的头名始终是小写 |
-| `dns_timeout` / `tcp_connect_timeout` / `tls_handshake_timeout` / `ttfb_timeout` / `total_timeout` / `quic_connect_timeout` | 超时控制 |
+| `dns_timeout` / `tcp_connect_timeout` / `tls_handshake_timeout` / `ttfb_timeout` / `total_timeout` / `quic_connect_timeout` / `read_idle_timeout` | 超时（秒）；不传时依次为 5 / 10 / 10 / 30 / 120 / 10 和关闭。`total_timeout` 限制整个请求，包括流式读取响应体；`read_idle_timeout` 限制响应体多久收不到任何数据。传 `math.inf` 关闭该项 |
 | `max_response_body_size` / `max_connections_per_session` / `max_header_count` / `max_header_size` / `max_headers_total_size` / `min_transfer_rate`(+ `min_transfer_rate_window`) | 资源限制 / 抗 DoS |
 | `max_pending_h2_requests` | 限制等待 HTTP/2 流槽位的排队请求数（默认不限）|
-| `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | 容错选项 |
+| `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` | 容错选项，默认全部关闭。`h2_fallback_h1=True` 在 HTTP/2 连接失败时改用 HTTP/1.1 重试，指纹会随之变化；`retry_on_connection_close=True` 在池中连接已被服务器关闭时换一条新连接重发请求。两者都不会绕过方法的幂等性检查，也不会重发无法再次发送的请求体 |
 | `h2_dispatch_batch_size` | 合并进同一次 driver 写轮次的就绪 HTTP/2 请求数（默认 1）|
 | `h2_data_frame_policy` | 请求体如何切分为 HTTP/2 DATA 帧（`H2DataFramePolicy`） |
 | `require_close_notify` | 拒绝未收到 TLS close_notify 就被截断的响应体（默认 `False`） |
+| `tls_session_cache_ttl` | 缓存的 TLS 会话多少秒后不再用于恢复：默认 TLS 1.2 为一小时，TLS 1.3 和 QUIC 为七天（也是上限）；服务端给的期限更短时以服务端为准，`0` 表示不缓存。关闭缓存用 `tls_session_resumption_policy=TlsSessionResumptionPolicy.DISABLED` |
+| `attempt_limits` | 本客户端每个请求的 `AttemptLimits`：额外 HTTP 提交次数和新建连接次数的上限，见[尝试上限](#尝试上限) |
 | `tls_session_resumption_policy` / `tls_session_cache_partition_policy` | TLS ticket 是否存储，以及 ticket 缓存如何分键 |
 | `middleware` | 中间件列表 |
 | `ca_cert` / `ca_cert_pem` / `ca_cert_der` / `verify` / `use_native_certs` | 证书配置 |
@@ -1088,12 +1136,13 @@ Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权�
 
 | 方法 | 说明 |
 |------|------|
-| `session(...)` | 创建会话（`network_partition_context=...` 按站点分区 TLS ticket 缓存；`h3_retry_mode=...` 选择 HTTP/3 重试，见“特性”） |
+| `session(...)` | 创建会话（`network_partition_context=...` 按站点分区 TLS ticket 缓存；`h3_retry_mode=...` 选择 HTTP/3 重试，见“特性”；`attempt_limits=...` 收紧客户端的尝试上限，只读的 `attempt_limits`、`effective_attempt_limits` 可读回） |
+| `Client.from_preset_json(json, *, tcp_fingerprint=None)` / `Client.from_preset_file(path, *, tcp_fingerprint=None)` | 用完整的 profile bundle 构建客户端，见 [Profile bundle](#profile-bundle) |
 | `fingerprint_info()` | 返回指纹信息 dict |
 | `randomize_fingerprint(shuffle_extensions=True)` | 返回 Client 的副本，其 TLS profile 按连接打乱扩展顺序，其他配置全部保留 |
 | `get(url, **kwargs)` / `post` / `put` / `delete` / `head` / `patch` / `options` | 等同 `session().get(url, **kwargs)` 等：每次调用临时建一个会话，用完即弃，调用之间不复用连接、不保留 Cookie。要发多个请求请先建会话 |
 | `check_proxy(proxy, target_host="www.google.com", target_port=443, timeout=5.0)` | 经代理建一条隧道，返回所用秒数；见 [代理](#代理) |
-| `tls_profile` / `h2_profile` / `tcp_fingerprint` / `default_headers` / `header_order` / `h3_header_order` / `cookie_order` / `timeouts` / `resource_limits` / `protocol_policy` / `verify` / `ip_family` / `h2_fallback_h1` / `proxy_fallback_direct` / `max_pending_h2_requests` / `ech_config` | 只读：客户端最终生效的配置（含预设与默认值），大多与设置它的构造参数同名。`timeouts`、`resource_limits` 是以这些参数名为键的 dict |
+| `tls_profile` / `h2_profile` / `tcp_fingerprint` / `default_headers` / `header_order` / `h3_header_order` / `cookie_order` / `timeouts` / `resource_limits` / `protocol_policy` / `verify` / `ip_family` / `h2_fallback_h1` / `proxy_fallback_direct` / `retry_on_connection_close` / `max_pending_h2_requests` / `ech_config` / `tls_session_cache_ttl` / `tls_session_cache_enabled` / `attempt_limits` / `effective_attempt_limits` | 只读：客户端最终生效的配置（含预设与默认值），大多与设置它的构造参数同名。`timeouts`、`resource_limits` 是以这些参数名为键的 dict |
 
 ### Session
 
@@ -1110,6 +1159,7 @@ Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权�
 | `proxy` | 请求级代理覆盖 |
 | `no_decompress` / `accept_encoding` | 编码控制 |
 | `priority` / `h2_priority_weight` | RFC 9218 请求优先级 / HTTP/2 HEADERS 帧旧式优先级字段的权重（0–255） |
+| `attempt_limits` | 本次请求的 `AttemptLimits`，只能收紧会话的上限 |
 
 | 方法 | 说明 |
 |------|------|
@@ -1141,7 +1191,8 @@ Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权�
 | `cookies` | 响应 Cookie |
 | `encoding` | `Content-Type` 中声明的 charset |
 | `elapsed` | 请求耗时 (秒) |
-| `diagnostics` | 分阶段计时 dict：`dns_ms`/`tcp_ms`/`tls_ms`/`ttfb_ms`/`total_ms` + `remote_addr`/`protocol`/`cipher_suite`（未测阶段为 None）+ `trust_anchor`，即请求新建连接上的信任锚协商 |
+| `diagnostics` | 分阶段计时 dict：`dns_ms`/`tcp_ms`/`tls_ms`/`quic_ms`/`ttfb_ms`/`total_ms` + `remote_addr`/`protocol`/`cipher_suite`（未测阶段为 None）+ `trust_anchor`，即请求新建连接上的信任锚协商 |
+| `attempt_summary` | 请求做了什么：HTTP 提交、重定向、恢复和新建连接的次数，结果，以及生效的上限（见[尝试上限](#尝试上限)）；`StreamingResponse` 和失败请求的异常上也有 |
 | `was_redirected` | 是否经过重定向 |
 | `history` | 重定向链 (`list[RedirectRecord]`) |
 | `error_for_status()` | 4xx/5xx 抛出 `HttpStatusError` |
@@ -1187,6 +1238,7 @@ Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权�
 | `validate_fingerprint_consistency(...)` | 校验指纹组合一致性 |
 | `features()` | 本构建启用了哪些可选 feature，按 Cargo 名返回 `{"quic-h3": True, ...}`；PyPI 上的 wheel 全部启用 |
 | `list_presets()` | 浏览器预设列表，每项形如 `{"name": "chrome_155", "browser": "chrome", "http3": True}`；`name` 即 `Client.<name>()`、`tls_profile=`、`h2_profile=` 接受的名字 |
+| `export_preset_json(name)` | 把 `list_presets()` 里的预设导出为完整的 profile bundle（v2 预设 JSON），`Client.from_preset_json()` / `Client.from_preset_file()` 可据此构建客户端，见 [Profile bundle](#profile-bundle) |
 | `trust_anchor_identity(der)` | DER 根证书的标识，用于在 `Client(trust_anchor_bindings=...)` 里绑定信任锚 ID |
 
 ### 异常
@@ -1203,7 +1255,7 @@ Firefox 156 的第一个 HTTP/2 请求使用流 3，导航请求的 HEADERS 权�
 | `ResourceLimitError` | 资源限制超出 |
 | `JsonDecodeError` | `json()` 遇到非 JSON body（同时也是 `json.JSONDecodeError`） |
 
-它们都带有 `phase`、`retryable`、`safe_to_replay`、`status_code`、`proxy_error_kind`、`tls_alert`、`diagnostics` 属性，见[错误处理](#错误处理)。
+它们都带有 `phase`、`retryable`、`safe_to_replay`、`status_code`、`proxy_error_kind`、`tls_alert`、`diagnostics`、`attempt_summary` 属性，见[错误处理](#错误处理)。
 
 ## 示例
 

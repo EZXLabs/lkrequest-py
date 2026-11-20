@@ -17,8 +17,8 @@ use crate::retry::{PyCallableRetryPolicy, PyExponentialBackoff, PyFixedInterval}
 use crate::session::{PyBlockingSession, PySession};
 use crate::session_state::SessionState;
 use crate::types::{
-    resolve_h2_profile, resolve_tcp_fingerprint, resolve_tls_profile, validated_duration,
-    PyAcceptEncoding, PySessionResumptionConfig, StrPairs,
+    deadline, resolve_h2_profile, resolve_quic_tls_profile, resolve_tcp_fingerprint,
+    resolve_tls_profile, validated_duration, PyAcceptEncoding, PySessionResumptionConfig, StrPairs,
 };
 
 fn resolve_tls_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lktls::profile::TlsProfile> {
@@ -29,6 +29,20 @@ fn resolve_tls_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lktls::profile::TlsP
     } else {
         Err(pyo3::exceptions::PyTypeError::new_err(
             "tls_profile must be str (preset name) or TlsProfile object",
+        ))
+    }
+}
+
+/// `quic_fingerprint` is resolved apart from `tls_profile`: as a name,
+/// `"chrome_158"` is the ClientHello Chrome sends inside QUIC, not over TCP.
+fn resolve_quic_tls_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lktls::profile::TlsProfile> {
+    if let Ok(s) = obj.extract::<String>() {
+        resolve_quic_tls_profile(&s)
+    } else if let Ok(p) = obj.extract::<PyTlsProfile>() {
+        Ok(p.inner)
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "quic_fingerprint must be str (preset name) or TlsProfile object",
         ))
     }
 }
@@ -47,7 +61,8 @@ fn resolve_h2_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkh2::profile::H2Prof
 
 /// Resolve a QUIC profile from a preset name (`"chrome"` / `"chrome_146"` /
 /// `"chrome_150"` / `"chrome_151"` / `"chrome_152"` / `"chrome_153"` /
-/// `"chrome_154"` / `"chrome_155"` / `"chrome_156"` / `"chrome_157"`) or a
+/// `"chrome_154"` / `"chrome_155"` / `"chrome_156"` / `"chrome_157"` /
+/// `"chrome_158"`) or a
 /// `QuicProfile` object. Requires the `quic-h3` feature; without it any value is
 /// rejected with a clear error.
 #[cfg(feature = "quic-h3")]
@@ -64,8 +79,9 @@ fn resolve_quic_from_any(obj: &Bound<'_, PyAny>) -> PyResult<lkrequest::QuicProf
             "chrome_155" => Ok(lkrequest::lkh3::chrome_155_quic()),
             "chrome_156" => Ok(lkrequest::lkh3::chrome_156_quic()),
             "chrome_157" => Ok(lkrequest::lkh3::chrome_157_quic()),
+            "chrome_158" => Ok(lkrequest::lkh3::chrome_158_quic()),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157",
+                "Unknown QUIC profile: '{}'. Available: chrome, chrome_146, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157, chrome_158",
                 s
             ))),
         }
@@ -267,6 +283,7 @@ struct ClientConfig {
     max_pending_h2_requests: Option<usize>,
     h2_dispatch_batch_size: Option<usize>,
     quic_connect_timeout: Option<f64>,
+    read_idle_timeout: Option<f64>,
     max_header_count: Option<usize>,
     max_header_size: Option<usize>,
     max_headers_total_size: Option<usize>,
@@ -300,6 +317,8 @@ struct ClientConfig {
     require_close_notify: Option<bool>,
     tls_session_resumption_policy: Option<lkrequest::TlsSessionResumptionPolicy>,
     tls_session_cache_partition_policy: Option<lkrequest::TlsSessionCachePartitionPolicy>,
+    tls_session_cache_ttl: Option<f64>,
+    attempt_limits: Option<lkrequest::AttemptLimits>,
     masque: Option<crate::masque::OuterConfig>,
 }
 
@@ -323,6 +342,7 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         max_pending_h2_requests,
         h2_dispatch_batch_size,
         quic_connect_timeout,
+        read_idle_timeout,
         max_header_count,
         max_header_size,
         max_headers_total_size,
@@ -356,6 +376,8 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         require_close_notify,
         tls_session_resumption_policy,
         tls_session_cache_partition_policy,
+        tls_session_cache_ttl,
+        attempt_limits,
         masque,
     } = cfg;
 
@@ -403,25 +425,30 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
         || ttfb_timeout.is_some()
         || total_timeout.is_some()
         || quic_connect_timeout.is_some()
+        || read_idle_timeout.is_some()
     {
+        // `None` leaves a deadline at its default; `math.inf` turns it off.
         let mut tc = lkrequest::TimeoutConfig::default();
         if let Some(t) = dns_timeout {
-            tc.dns_timeout = Some(validated_duration(t)?);
+            tc.dns_timeout = deadline(t)?;
         }
         if let Some(t) = tcp_connect_timeout {
-            tc.tcp_connect_timeout = Some(validated_duration(t)?);
+            tc.tcp_connect_timeout = deadline(t)?;
         }
         if let Some(t) = tls_handshake_timeout {
-            tc.tls_handshake_timeout = Some(validated_duration(t)?);
+            tc.tls_handshake_timeout = deadline(t)?;
         }
         if let Some(t) = ttfb_timeout {
-            tc.ttfb_timeout = Some(validated_duration(t)?);
+            tc.ttfb_timeout = deadline(t)?;
         }
         if let Some(t) = total_timeout {
-            tc.total_timeout = Some(validated_duration(t)?);
+            tc.total_timeout = deadline(t)?;
         }
         if let Some(t) = quic_connect_timeout {
-            tc.quic_connect_timeout = Some(validated_duration(t)?);
+            tc.quic_connect_timeout = deadline(t)?;
+        }
+        if let Some(t) = read_idle_timeout {
+            tc.read_idle_timeout = deadline(t)?;
         }
         builder = builder.timeout_config(tc);
     }
@@ -603,9 +630,13 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
     if let Some(policy) = tls_session_cache_partition_policy {
         builder = builder.tls_session_cache_partition_policy(policy);
     }
-    if let Some(config) = masque {
-        builder = crate::masque::apply_to_client(builder, config);
+    if let Some(ttl) = tls_session_cache_ttl {
+        builder = builder.tls_session_cache_ttl(validated_duration(ttl)?);
     }
+    if let Some(limits) = attempt_limits {
+        builder = builder.attempt_limits(limits);
+    }
+    builder = crate::masque::apply_to_client(builder, masque);
 
     // `build()` panics on settings upstream rejects, such as trust-anchor
     // recovery without verification; `try_build()` reports them instead.
@@ -613,7 +644,7 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
 }
 
 /// Build a `Client` from a high-level upstream preset bundle plus a TCP
-/// fingerprint.
+/// fingerprint, if any.
 ///
 /// Delegating to `lkrequest::preset::*` keeps the Python presets in lock-step
 /// with the Rust core: TLS/H2 profiles, header order, protocol policy, and
@@ -622,18 +653,46 @@ fn build_client(cfg: ClientConfig) -> PyResult<lkrequest::Client> {
 /// fingerprint is layered on top because `ClientPreset` does not cover it.
 fn build_preset_client(
     preset: lkrequest::preset::ClientPreset,
-    tcp: lkrequest::TcpFingerprint,
+    tcp: Option<lkrequest::TcpFingerprint>,
     tls_profile: Option<lktls::profile::TlsProfile>,
 ) -> lkrequest::Client {
-    let mut builder = lkrequest::Client::builder()
-        .preset(preset)
-        .tcp_fingerprint(tcp);
+    let mut builder = lkrequest::Client::builder().preset(preset);
+    if let Some(tcp) = tcp {
+        builder = builder.tcp_fingerprint(tcp);
+    }
     // A later `fingerprint()` replaces the preset's TLS profile and leaves the
     // rest of the preset alone; `randomize_fingerprint()` relies on that.
     if let Some(profile) = tls_profile {
         builder = builder.fingerprint(profile);
     }
     builder.build()
+}
+
+/// A complete profile bundle (lkrequest's v2 preset JSON), given as text or
+/// as bytes.
+#[derive(FromPyObject)]
+enum PresetJson {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl PresetJson {
+    /// The preset the bundle describes, validated by upstream.
+    fn load(&self) -> PyResult<lkrequest::preset::ClientPreset> {
+        match self {
+            Self::Text(text) => lkrequest::preset::ClientPreset::from_json_str(text),
+            Self::Bytes(bytes) => lkrequest::preset::ClientPreset::from_json_slice(bytes),
+        }
+        .map_err(|e| crate::build_info::preset_error("Invalid preset bundle", &e))
+    }
+}
+
+/// The preset in the bundle file at `path`, read with upstream's size limit.
+fn load_preset_file(path: &std::path::Path) -> PyResult<lkrequest::preset::ClientPreset> {
+    lkrequest::preset::ClientPreset::from_json_file(path).map_err(|e| {
+        let context = format!("Failed to load preset bundle from '{}'", path.display());
+        crate::build_info::preset_error(&context, &e)
+    })
 }
 
 /// How a client was built, kept so `randomize_fingerprint()` can build the
@@ -648,7 +707,7 @@ enum ClientRecipe {
     /// From a browser preset method.
     Preset {
         preset: lkrequest::preset::ClientPreset,
-        tcp: lkrequest::TcpFingerprint,
+        tcp: Option<lkrequest::TcpFingerprint>,
         /// The preset's own TLS profile until `randomize_fingerprint()`
         /// replaces it.
         tls_profile: Option<lktls::profile::TlsProfile>,
@@ -656,7 +715,10 @@ enum ClientRecipe {
 }
 
 impl ClientRecipe {
-    fn preset(preset: lkrequest::preset::ClientPreset, tcp: lkrequest::TcpFingerprint) -> Self {
+    fn preset(
+        preset: lkrequest::preset::ClientPreset,
+        tcp: Option<lkrequest::TcpFingerprint>,
+    ) -> Self {
         Self::Preset {
             preset,
             tcp,
@@ -729,8 +791,9 @@ impl PyClient {
 
     fn from_preset(
         preset: lkrequest::preset::ClientPreset,
-        tcp: lkrequest::TcpFingerprint,
+        tcp: impl Into<Option<lkrequest::TcpFingerprint>>,
     ) -> Self {
+        let tcp = tcp.into();
         Self {
             inner: build_preset_client(preset.clone(), tcp.clone(), None),
             recipe: Arc::new(ClientRecipe::preset(preset, tcp)),
@@ -761,6 +824,7 @@ impl PyClient {
         max_pending_h2_requests=None,
         h2_dispatch_batch_size=None,
         quic_connect_timeout=None,
+        read_idle_timeout=None,
         max_header_count=None,
         max_header_size=None,
         max_headers_total_size=None,
@@ -795,6 +859,8 @@ impl PyClient {
         require_close_notify=None,
         tls_session_resumption_policy=None,
         tls_session_cache_partition_policy=None,
+        tls_session_cache_ttl=None,
+        attempt_limits=None,
         masque=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -817,6 +883,7 @@ impl PyClient {
         max_pending_h2_requests: Option<usize>,
         h2_dispatch_batch_size: Option<usize>,
         quic_connect_timeout: Option<f64>,
+        read_idle_timeout: Option<f64>,
         max_header_count: Option<usize>,
         max_header_size: Option<usize>,
         max_headers_total_size: Option<usize>,
@@ -855,6 +922,8 @@ impl PyClient {
         tls_session_cache_partition_policy: Option<
             crate::network_partition::PyTlsSessionCachePartitionPolicy,
         >,
+        tls_session_cache_ttl: Option<f64>,
+        attempt_limits: Option<crate::attempts::PyAttemptLimits>,
         masque: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
         let masque = crate::masque::resolve(masque.as_ref())?;
@@ -866,7 +935,7 @@ impl PyClient {
             .transpose()?;
         let quic_fp = quic_fingerprint
             .as_ref()
-            .map(resolve_tls_from_any)
+            .map(resolve_quic_tls_from_any)
             .transpose()?;
         let quic = quic_profile
             .as_ref()
@@ -891,6 +960,7 @@ impl PyClient {
             max_pending_h2_requests,
             h2_dispatch_batch_size,
             quic_connect_timeout,
+            read_idle_timeout,
             max_header_count,
             max_header_size,
             max_headers_total_size,
@@ -931,6 +1001,8 @@ impl PyClient {
             require_close_notify,
             tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
             tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
+            tls_session_cache_ttl,
+            attempt_limits: attempt_limits.map(|limits| limits.inner),
             masque,
         };
         let client = Self::from_recipe(ClientRecipe::Options(config))?;
@@ -1059,6 +1131,14 @@ impl PyClient {
     }
 
     #[staticmethod]
+    fn chrome_158() -> Self {
+        Self::from_preset(
+            lkrequest::preset::chrome_158(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         Self::from_preset(
             lkrequest::preset::firefox_133(),
@@ -1098,7 +1178,37 @@ impl PyClient {
         )
     }
 
-    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
+    /// A client from a complete profile bundle, the JSON `export_preset_json()`
+    /// writes: TLS, HTTP/2 and QUIC profiles, header order and protocol
+    /// policy. A bundle has no TCP fingerprint; give one as `tcp_fingerprint`.
+    #[staticmethod]
+    #[pyo3(signature = (json, *, tcp_fingerprint=None))]
+    fn from_preset_json<'py>(
+        json: PresetJson,
+        tcp_fingerprint: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Self> {
+        let tcp = tcp_fingerprint
+            .as_ref()
+            .map(resolve_tcp_from_any)
+            .transpose()?;
+        Ok(Self::from_preset(json.load()?, tcp))
+    }
+
+    /// `from_preset_json()` for the bundle in the file at `path`.
+    #[staticmethod]
+    #[pyo3(signature = (path, *, tcp_fingerprint=None))]
+    fn from_preset_file<'py>(
+        path: std::path::PathBuf,
+        tcp_fingerprint: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Self> {
+        let tcp = tcp_fingerprint
+            .as_ref()
+            .map(resolve_tcp_from_any)
+            .transpose()?;
+        Ok(Self::from_preset(load_preset_file(&path)?, tcp))
+    }
+
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None, attempt_limits=None))]
     fn session<'py>(
         &self,
         py: Python<'py>,
@@ -1128,6 +1238,7 @@ impl PyClient {
         hsts: Option<PyHsts>,
         base_url: Option<String>,
         network_partition_context: Option<crate::network_partition::PyNetworkPartitionContext>,
+        attempt_limits: Option<crate::attempts::PyAttemptLimits>,
     ) -> PyResult<PySession> {
         let mut builder = self.inner.session();
         if let Some(p) = proxy {
@@ -1205,6 +1316,9 @@ impl PyClient {
         if let Some(ctx) = network_partition_context {
             builder = builder.network_partition_context(ctx.inner);
         }
+        if let Some(limits) = attempt_limits {
+            builder = builder.attempt_limits(limits.inner);
+        }
         let state = SessionState::default().with_middleware(middleware_slots);
         if let Some(cb) = on_request {
             state.hooks.push_request(py, cb)?;
@@ -1212,8 +1326,14 @@ impl PyClient {
         if let Some(cb) = on_response {
             state.hooks.push_response(py, cb)?;
         }
+        let inner = builder.build();
+        // Upstream refuses a session cap above the client's only once a
+        // request is sent; refuse it here, where it was given.
+        inner
+            .effective_attempt_limits()
+            .map_err(crate::error::to_py_err)?;
         Ok(PySession {
-            inner: builder.build(),
+            inner,
             state,
             base_url,
         })
@@ -1337,8 +1457,9 @@ impl PyBlockingClient {
 
     fn from_preset(
         preset: lkrequest::preset::ClientPreset,
-        tcp: lkrequest::TcpFingerprint,
+        tcp: impl Into<Option<lkrequest::TcpFingerprint>>,
     ) -> Self {
+        let tcp = tcp.into();
         Self {
             inner: build_preset_client(preset.clone(), tcp.clone(), None),
             recipe: Arc::new(ClientRecipe::preset(preset, tcp)),
@@ -1369,6 +1490,7 @@ impl PyBlockingClient {
         max_pending_h2_requests=None,
         h2_dispatch_batch_size=None,
         quic_connect_timeout=None,
+        read_idle_timeout=None,
         max_header_count=None,
         max_header_size=None,
         max_headers_total_size=None,
@@ -1403,6 +1525,8 @@ impl PyBlockingClient {
         require_close_notify=None,
         tls_session_resumption_policy=None,
         tls_session_cache_partition_policy=None,
+        tls_session_cache_ttl=None,
+        attempt_limits=None,
         masque=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1425,6 +1549,7 @@ impl PyBlockingClient {
         max_pending_h2_requests: Option<usize>,
         h2_dispatch_batch_size: Option<usize>,
         quic_connect_timeout: Option<f64>,
+        read_idle_timeout: Option<f64>,
         max_header_count: Option<usize>,
         max_header_size: Option<usize>,
         max_headers_total_size: Option<usize>,
@@ -1463,6 +1588,8 @@ impl PyBlockingClient {
         tls_session_cache_partition_policy: Option<
             crate::network_partition::PyTlsSessionCachePartitionPolicy,
         >,
+        tls_session_cache_ttl: Option<f64>,
+        attempt_limits: Option<crate::attempts::PyAttemptLimits>,
         masque: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
         let masque = crate::masque::resolve(masque.as_ref())?;
@@ -1474,7 +1601,7 @@ impl PyBlockingClient {
             .transpose()?;
         let quic_fp = quic_fingerprint
             .as_ref()
-            .map(resolve_tls_from_any)
+            .map(resolve_quic_tls_from_any)
             .transpose()?;
         let quic = quic_profile
             .as_ref()
@@ -1499,6 +1626,7 @@ impl PyBlockingClient {
             max_pending_h2_requests,
             h2_dispatch_batch_size,
             quic_connect_timeout,
+            read_idle_timeout,
             max_header_count,
             max_header_size,
             max_headers_total_size,
@@ -1539,6 +1667,8 @@ impl PyBlockingClient {
             require_close_notify,
             tls_session_resumption_policy: tls_session_resumption_policy.map(|p| p.inner),
             tls_session_cache_partition_policy: tls_session_cache_partition_policy.map(|p| p.inner),
+            tls_session_cache_ttl,
+            attempt_limits: attempt_limits.map(|limits| limits.inner),
             masque,
         };
         Self::from_recipe(ClientRecipe::Options(config))
@@ -1665,6 +1795,14 @@ impl PyBlockingClient {
     }
 
     #[staticmethod]
+    fn chrome_158() -> Self {
+        Self::from_preset(
+            lkrequest::preset::chrome_158(),
+            lkrequest::TcpFingerprint::chrome(),
+        )
+    }
+
+    #[staticmethod]
     fn firefox_133() -> Self {
         Self::from_preset(
             lkrequest::preset::firefox_133(),
@@ -1704,7 +1842,37 @@ impl PyBlockingClient {
         )
     }
 
-    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None))]
+    /// A client from a complete profile bundle, the JSON `export_preset_json()`
+    /// writes: TLS, HTTP/2 and QUIC profiles, header order and protocol
+    /// policy. A bundle has no TCP fingerprint; give one as `tcp_fingerprint`.
+    #[staticmethod]
+    #[pyo3(signature = (json, *, tcp_fingerprint=None))]
+    fn from_preset_json<'py>(
+        json: PresetJson,
+        tcp_fingerprint: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Self> {
+        let tcp = tcp_fingerprint
+            .as_ref()
+            .map(resolve_tcp_from_any)
+            .transpose()?;
+        Ok(Self::from_preset(json.load()?, tcp))
+    }
+
+    /// `from_preset_json()` for the bundle in the file at `path`.
+    #[staticmethod]
+    #[pyo3(signature = (path, *, tcp_fingerprint=None))]
+    fn from_preset_file<'py>(
+        path: std::path::PathBuf,
+        tcp_fingerprint: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Self> {
+        let tcp = tcp_fingerprint
+            .as_ref()
+            .map(resolve_tcp_from_any)
+            .transpose()?;
+        Ok(Self::from_preset(load_preset_file(&path)?, tcp))
+    }
+
+    #[pyo3(signature = (*, proxy=None, max_redirects=None, allow_redirects=true, http1_only=false, http2_only=false, http3_only=false, http3_with_fallback=false, retry=None, middleware=None, accept_encoding=None, ech_config=None, max_connections=None, idle_timeout=None, on_request=None, on_response=None, protocol_policy=None, http_intent=None, broken_quic_policy=None, h3_retry_mode=None, header_order=None, h3_header_order=None, cookie_order=None, https_only=false, hsts=None, base_url=None, network_partition_context=None, attempt_limits=None))]
     fn session<'py>(
         &self,
         py: Python<'py>,
@@ -1734,6 +1902,7 @@ impl PyBlockingClient {
         hsts: Option<PyHsts>,
         base_url: Option<String>,
         network_partition_context: Option<crate::network_partition::PyNetworkPartitionContext>,
+        attempt_limits: Option<crate::attempts::PyAttemptLimits>,
     ) -> PyResult<PyBlockingSession> {
         let mut builder = self.inner.session();
         if let Some(p) = proxy {
@@ -1811,6 +1980,9 @@ impl PyBlockingClient {
         if let Some(ctx) = network_partition_context {
             builder = builder.network_partition_context(ctx.inner);
         }
+        if let Some(limits) = attempt_limits {
+            builder = builder.attempt_limits(limits.inner);
+        }
         let state = SessionState::default().with_middleware(middleware_slots);
         if let Some(cb) = on_request {
             state.hooks.push_request(py, cb)?;
@@ -1818,8 +1990,14 @@ impl PyBlockingClient {
         if let Some(cb) = on_response {
             state.hooks.push_response(py, cb)?;
         }
+        let inner = builder.build();
+        // Upstream refuses a session cap above the client's only once a
+        // request is sent; refuse it here, where it was given.
+        inner
+            .effective_attempt_limits()
+            .map_err(crate::error::to_py_err)?;
         Ok(PyBlockingSession {
-            inner: builder.build(),
+            inner,
             state,
             base_url,
         })
@@ -1944,7 +2122,8 @@ one_off_requests!(PyBlockingClient: get, post, put, delete, head, patch, options
 // What a client was built with
 // ---------------------------------------------------------------------------
 
-/// `timeouts`, in seconds under the names of the arguments that set them.
+/// `timeouts`, in seconds under the names of the arguments that set them;
+/// `None` for a deadline that is off.
 fn timeouts_dict<'py>(
     py: Python<'py>,
     timeouts: &lkrequest::TimeoutConfig,
@@ -1960,6 +2139,7 @@ fn timeouts_dict<'py>(
     dict.set_item("ttfb_timeout", secs(timeouts.ttfb_timeout))?;
     dict.set_item("total_timeout", secs(timeouts.total_timeout))?;
     dict.set_item("quic_connect_timeout", secs(timeouts.quic_connect_timeout))?;
+    dict.set_item("read_idle_timeout", secs(timeouts.read_idle_timeout))?;
     Ok(dict)
 }
 
@@ -2090,6 +2270,49 @@ macro_rules! client_settings {
             #[getter]
             fn proxy_fallback_direct(&self) -> bool {
                 self.inner.fallback().proxy_to_direct
+            }
+
+            #[getter]
+            fn retry_on_connection_close(&self) -> bool {
+                self.inner.fallback().retry_on_connection_close
+            }
+
+            /// The local lifetime of cached TLS/QUIC sessions, in seconds, or
+            /// `None` for the per-version defaults.
+            #[getter]
+            fn tls_session_cache_ttl(&self) -> Option<f64> {
+                self.inner
+                    .tls_session_cache_ttl()
+                    .map(|ttl| ttl.as_secs_f64())
+            }
+
+            /// Whether sessions are cached for resumption: false when the
+            /// resumption policy is disabled or the lifetime is zero.
+            #[getter]
+            fn tls_session_cache_enabled(&self) -> bool {
+                self.inner.tls_session_cache_enabled()
+            }
+
+            /// The attempt limits this client was given.
+            #[getter]
+            fn attempt_limits(&self) -> crate::attempts::PyAttemptLimits {
+                crate::attempts::PyAttemptLimits {
+                    inner: self.inner.configured_attempt_limits(),
+                }
+            }
+
+            /// The attempt limits its sessions start from, each with the
+            /// scope that set it.
+            #[getter]
+            fn effective_attempt_limits<'py>(
+                &self,
+                py: Python<'py>,
+            ) -> PyResult<Bound<'py, PyDict>> {
+                let limits = self
+                    .inner
+                    .effective_attempt_limits()
+                    .map_err(crate::error::to_py_err)?;
+                crate::attempts::effective_limits_dict(py, &limits)
             }
 
             #[getter]

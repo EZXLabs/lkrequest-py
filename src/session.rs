@@ -6,8 +6,9 @@ use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::PyTraverseError;
 
+use crate::attempts::PyAttemptLimits;
 use crate::client::blocking_runtime;
-use crate::error::{to_py_err, to_py_err_with_diagnostics};
+use crate::error::{request_error, to_py_err};
 use crate::multipart::PyMultipart;
 use crate::priority::PyRequestPriority;
 use crate::protocol::{PyHttpIntent, PyIdempotency, PyPreferredHttpVersion, PyProtocolPolicy};
@@ -150,6 +151,8 @@ struct RequestOpts {
     h3_header_order: Option<Vec<String>>,
     protocol_policy: Option<lkrequest::ProtocolPolicy>,
     http_intent: Option<lkrequest::HttpIntent>,
+    /// Caps on this request's extra HTTP submissions and connection starts.
+    attempt_limits: Option<lkrequest::AttemptLimits>,
     /// A streaming upload source. Rides in this bundle rather than alongside
     /// `raw_body` because, unlike the buffered bodies, it is only accepted on
     /// the methods that already take one — and it is classified before the
@@ -253,6 +256,9 @@ fn apply_request_options(
     if let Some(intent) = req.opts.http_intent {
         rb = rb.http_intent(intent);
     }
+    if let Some(limits) = req.opts.attempt_limits {
+        rb = rb.attempt_limits(limits);
+    }
 
     if let Some(json_str) = req.json_body {
         rb = rb.header("content-type", "application/json");
@@ -310,7 +316,8 @@ async fn execute_request(
 
     let method_for_log = req.method.clone();
     let url_for_log = req.url.clone();
-    let rb = apply_request_options(&session, req)?;
+    // Watched for the response, or for the exception when it fails.
+    let (rb, attempts) = apply_request_options(&session, req)?.observe_attempts();
 
     let start = tokio::time::Instant::now();
     // Boxed for the same reason as in `bridge::future_into_py`: upstream's
@@ -318,6 +325,7 @@ async fn execute_request(
     // tokio worker in unoptimized builds.
     let (send_result, diagnostics) =
         lkrequest::diagnostics::capture_request_diagnostics(Box::pin(rb.send())).await;
+    let attempt_summary = attempts.snapshot();
     let resp = match send_result {
         Ok(r) => r,
         Err(e) => {
@@ -329,7 +337,7 @@ async fn execute_request(
                 error = %e,
                 "request failed"
             );
-            return Err(to_py_err_with_diagnostics(e, diagnostics));
+            return Err(request_error(e, Some(diagnostics), attempt_summary));
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
@@ -347,7 +355,7 @@ async fn execute_request(
         "response received"
     );
 
-    let py_resp = PyResponse::from_response(resp, elapsed, diagnostics)?;
+    let py_resp = PyResponse::from_response(resp, elapsed, diagnostics, attempt_summary)?;
 
     crate::metrics::record_global_metrics(&url, elapsed, body_size, is_error);
     hooks.fire_response(status_code, &url, elapsed);
@@ -500,7 +508,7 @@ impl PySession {
 impl PySession {
     // --- HTTP Methods -------------------------------------------------------
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn get<'py>(
         &self,
         py: Python<'py>,
@@ -524,6 +532,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.make_request(
             py,
@@ -553,13 +562,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: None,
                 content_length: None,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn post<'py>(
         &self,
         py: Python<'py>,
@@ -589,6 +599,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -623,13 +634,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn request<'py>(
         &self,
         py: Python<'py>,
@@ -660,6 +672,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -694,13 +707,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn put<'py>(
         &self,
         py: Python<'py>,
@@ -730,6 +744,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -764,13 +779,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn delete<'py>(
         &self,
         py: Python<'py>,
@@ -799,6 +815,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -832,13 +849,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn head<'py>(
         &self,
         py: Python<'py>,
@@ -862,6 +880,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.make_request(
             py,
@@ -891,13 +910,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: None,
                 content_length: None,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn patch<'py>(
         &self,
         py: Python<'py>,
@@ -927,6 +947,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -961,13 +982,14 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn options<'py>(
         &self,
         py: Python<'py>,
@@ -991,6 +1013,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.make_request(
             py,
@@ -1020,10 +1043,33 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: None,
                 content_length: None,
             },
         )
+    }
+
+    // --- Attempt limits ------------------------------------------------------
+
+    /// The attempt limits this session was given; what it leaves out comes
+    /// from the client.
+    #[getter]
+    fn attempt_limits(&self) -> PyAttemptLimits {
+        PyAttemptLimits {
+            inner: self.inner.configured_attempt_limits(),
+        }
+    }
+
+    /// The attempt limits its requests start from, each with the scope that
+    /// set it.
+    #[getter]
+    fn effective_attempt_limits<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let limits = self.inner.effective_attempt_limits().map_err(to_py_err)?;
+        crate::attempts::effective_limits_dict(py, &limits)
     }
 
     // --- Pool Stats ----------------------------------------------------------
@@ -1201,7 +1247,7 @@ impl PySession {
 
     // --- Streaming -----------------------------------------------------------
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     #[allow(clippy::too_many_arguments)]
     fn send_streaming<'py>(
         &self,
@@ -1233,6 +1279,7 @@ impl PySession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.state.ensure_open()?;
         let closing = self.state.closing();
@@ -1276,6 +1323,7 @@ impl PySession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
@@ -1283,9 +1331,14 @@ impl PySession {
         crate::bridge::future_into_py(
             py,
             closing.guard(async move {
-                let rb = apply_request_options(&session, prepared)?;
-                let resp = Box::pin(rb.send_streaming()).await.map_err(to_py_err)?;
-                Ok(crate::response::PyStreamingResponse::new(resp))
+                let (rb, attempts) = apply_request_options(&session, prepared)?.observe_attempts();
+                let resp = Box::pin(rb.send_streaming())
+                    .await
+                    .map_err(|e| request_error(e, None, attempts.snapshot()))?;
+                Ok(crate::response::PyStreamingResponse::new(
+                    resp,
+                    attempts.snapshot(),
+                ))
             }),
         )
     }
@@ -1433,7 +1486,7 @@ impl PyBlockingSession {
 
 #[pymethods]
 impl PyBlockingSession {
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn get(
         &self,
         py: Python<'_>,
@@ -1457,6 +1510,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         self.make_blocking_request(
             py,
@@ -1486,13 +1540,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: None,
                 content_length: None,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn post(
         &self,
         py: Python<'_>,
@@ -1522,6 +1577,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -1556,13 +1612,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn request(
         &self,
         py: Python<'_>,
@@ -1593,6 +1650,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -1627,13 +1685,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn put(
         &self,
         py: Python<'_>,
@@ -1663,6 +1722,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -1697,13 +1757,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn delete(
         &self,
         py: Python<'_>,
@@ -1732,6 +1793,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -1765,13 +1827,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn head(
         &self,
         py: Python<'_>,
@@ -1795,6 +1858,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         self.make_blocking_request(
             py,
@@ -1824,13 +1888,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: None,
                 content_length: None,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn patch(
         &self,
         py: Python<'_>,
@@ -1860,6 +1925,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         let json_str = serialize_json(py, json)?;
         let upload = body_stream
@@ -1894,13 +1960,14 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         )
     }
 
-    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (url, *, headers=None, params=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     fn options(
         &self,
         py: Python<'_>,
@@ -1924,6 +1991,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<PyResponse> {
         self.make_blocking_request(
             py,
@@ -1953,10 +2021,33 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: None,
                 content_length: None,
             },
         )
+    }
+
+    // --- Attempt limits ------------------------------------------------------
+
+    /// The attempt limits this session was given; what it leaves out comes
+    /// from the client.
+    #[getter]
+    fn attempt_limits(&self) -> PyAttemptLimits {
+        PyAttemptLimits {
+            inner: self.inner.configured_attempt_limits(),
+        }
+    }
+
+    /// The attempt limits its requests start from, each with the scope that
+    /// set it.
+    #[getter]
+    fn effective_attempt_limits<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let limits = self.inner.effective_attempt_limits().map_err(to_py_err)?;
+        crate::attempts::effective_limits_dict(py, &limits)
     }
 
     // --- Pool Stats ----------------------------------------------------------
@@ -2131,7 +2222,7 @@ impl PyBlockingSession {
 
     // --- Streaming -----------------------------------------------------------
 
-    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None))]
+    #[pyo3(signature = (method, url, *, headers=None, params=None, json=None, data=None, body=None, multipart=None, body_stream=None, content_length=None, cookies=None, cookie_override=None, timeout=None, bearer_auth=None, basic_auth=None, proxy=None, no_decompress=false, accept_encoding=None, priority=None, h2_priority_weight=None, preferred_http_version=None, idempotency=None, header_order=None, cookie_order=None, h3_header_order=None, protocol_policy=None, http_intent=None, attempt_limits=None))]
     #[allow(clippy::too_many_arguments)]
     fn send_streaming(
         &self,
@@ -2163,6 +2254,7 @@ impl PyBlockingSession {
         h3_header_order: Option<Vec<String>>,
         protocol_policy: Option<PyProtocolPolicy>,
         http_intent: Option<PyHttpIntent>,
+        attempt_limits: Option<PyAttemptLimits>,
     ) -> PyResult<crate::response::PyBlockingStreamingResponse> {
         self.state.ensure_open()?;
         let closing = self.state.closing();
@@ -2206,15 +2298,21 @@ impl PyBlockingSession {
                 h3_header_order,
                 protocol_policy: protocol_policy.map(|p| p.inner),
                 http_intent: http_intent.map(|i| i.into()),
+                attempt_limits: attempt_limits.map(|limits| limits.inner),
                 body_stream: upload,
                 content_length,
             },
         };
         py.detach(|| {
             blocking_runtime().block_on(closing.guard(async move {
-                let rb = apply_request_options(&session, prepared)?;
-                let resp = Box::pin(rb.send_streaming()).await.map_err(to_py_err)?;
-                Ok(crate::response::PyBlockingStreamingResponse::new(resp))
+                let (rb, attempts) = apply_request_options(&session, prepared)?.observe_attempts();
+                let resp = Box::pin(rb.send_streaming())
+                    .await
+                    .map_err(|e| request_error(e, None, attempts.snapshot()))?;
+                Ok(crate::response::PyBlockingStreamingResponse::new(
+                    resp,
+                    attempts.snapshot(),
+                ))
             }))
         })
     }

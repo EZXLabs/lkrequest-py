@@ -123,6 +123,7 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "proxy_error_kind",
         "tls_alert",
         "diagnostics",
+        "attempt_summary",
     ] {
         request_error.setattr(name, m.py().None())?;
     }
@@ -155,24 +156,26 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 pub fn to_py_err(err: lkrequest::error::Error) -> PyErr {
     let cause = raised_in_python(&err).and_then(RaisedInPython::take);
-    raise(&err, None, cause)
+    raise(&err, None, None, cause)
 }
 
 /// The exception `err` is raised as, for a retry callback to look at. The
 /// Python exception behind it stays where it is, for the one finally raised.
 pub(crate) fn exception_for(py: Python<'_>, err: &lkrequest::error::Error) -> PyErr {
     let cause = raised_in_python(err).and_then(|raised| raised.clone_ref(py));
-    raise(err, None, cause)
+    raise(err, None, None, cause)
 }
 
-/// `to_py_err`, with the timings and transport of the failed request attached
-/// as `diagnostics`.
-pub(crate) fn to_py_err_with_diagnostics(
+/// `to_py_err` for a request that failed, with what it did attached: its
+/// timings and transport as `diagnostics`, where they were captured, and its
+/// attempt accounting as `attempt_summary`.
+pub(crate) fn request_error(
     err: lkrequest::error::Error,
-    diagnostics: RequestDiagnostics,
+    diagnostics: Option<RequestDiagnostics>,
+    attempts: lkrequest::AttemptSummary,
 ) -> PyErr {
     let cause = raised_in_python(&err).and_then(RaisedInPython::take);
-    raise(&err, Some(diagnostics), cause)
+    raise(&err, diagnostics, Some(attempts), cause)
 }
 
 /// `HttpStatusError` for a response that `error_for_status()` refuses.
@@ -180,12 +183,14 @@ pub(crate) fn status_error(
     message: String,
     status_code: u16,
     diagnostics: &RequestDiagnostics,
+    attempts: lkrequest::AttemptSummary,
 ) -> PyErr {
     let details = ErrorDetails {
         status_code: Some(status_code),
         // As upstream counts a status error: a 5xx is worth another try.
         retryable: status_code >= 500,
         diagnostics: Some(diagnostics.clone()),
+        attempt_summary: Some(attempts),
         ..ErrorDetails::default()
     };
     raised::<HttpStatusError>(message, details, None)
@@ -194,10 +199,14 @@ pub(crate) fn status_error(
 fn raise(
     err: &lkrequest::error::Error,
     diagnostics: Option<RequestDiagnostics>,
+    attempts: Option<lkrequest::AttemptSummary>,
     cause: Option<PyErr>,
 ) -> PyErr {
     use lkrequest::error::Error as E;
-    let details = ErrorDetails::of(err, diagnostics);
+    let details = ErrorDetails {
+        attempt_summary: attempts,
+        ..ErrorDetails::of(err, diagnostics)
+    };
     // A failed trust-anchor recovery keeps upstream's wording, which says a
     // second connection was tried; it is classified by its cause below.
     let message = match err {
@@ -209,15 +218,23 @@ fn raise(
     // original: a wrapper itself would always fall through to the catch-all
     // arm below.
     let err = err.unwrapped();
+    // A fatal alert after the TLS 1.3 handshake, such as `certificate_required`
+    // for the client certificate never sent, fails the request as a connection
+    // error whose cause is the alert. It is a `TlsError` all the same, as
+    // upstream's C API reports it; a proxy error or a timeout keeps its class.
+    let tls_alert = err.as_tls_alert().is_some();
     match err {
         E::Timeout { .. } => raised::<LkTimeoutError>(message, details, cause),
-        E::Connection(_) | E::Io(_) => raised::<LkConnectionError>(message, details, cause),
+        E::Connection(_) | E::Io(_) if !tls_alert => {
+            raised::<LkConnectionError>(message, details, cause)
+        }
         E::Tls(_) => raised::<TlsError>(message, details, cause),
         E::Proxy(_) => raised::<ProxyError>(message, details, cause),
         E::Status { .. } => raised::<HttpStatusError>(message, details, cause),
         E::TooManyRedirects(_) => raised::<TooManyRedirectsError>(message, details, cause),
         E::InvalidConfig(_) => PyValueError::new_err(message),
         E::ResourceLimitExceeded(_) => raised::<ResourceLimitError>(message, details, cause),
+        _ if tls_alert => raised::<TlsError>(message, details, cause),
         _ => raised::<RequestError>(message, details, cause),
     }
 }
@@ -308,6 +325,7 @@ struct ErrorDetails {
     proxy_error_kind: Option<&'static str>,
     tls_alert: Option<&'static str>,
     diagnostics: Option<RequestDiagnostics>,
+    attempt_summary: Option<lkrequest::AttemptSummary>,
 }
 
 impl ErrorDetails {
@@ -322,6 +340,7 @@ impl ErrorDetails {
                 .map(|proxy| proxy_error_kind(proxy.kind)),
             tls_alert: err.as_tls_alert().map(|alert| alert.description.name()),
             diagnostics,
+            attempt_summary: None,
         }
     }
 }
@@ -365,6 +384,12 @@ impl<T: PyTypeInfo> Raised<T> {
             instance.setattr(
                 "diagnostics",
                 crate::response::diagnostics_dict(py, diagnostics)?,
+            )?;
+        }
+        if let Some(summary) = &details.attempt_summary {
+            instance.setattr(
+                "attempt_summary",
+                crate::attempts::summary_dict(py, summary)?,
             )?;
         }
         if let Some(cause) = &self.cause {

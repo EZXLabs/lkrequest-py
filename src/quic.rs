@@ -117,6 +117,16 @@ impl PyQuicProfile {
             inner: lkrequest::lkh3::chrome_157_quic(),
         }
     }
+    /// Chrome 158 QUIC / HTTP/3 profile: identical to Chrome 157. The capture
+    /// confirmed its transport values, H3 SETTINGS and navigation/favicon
+    /// priority; timing, loss and resumption behaviour carry over from Chrome
+    /// 157 unobserved.
+    #[staticmethod]
+    fn chrome_158() -> Self {
+        PyQuicProfile {
+            inner: lkrequest::lkh3::chrome_158_quic(),
+        }
+    }
 
     /// Load a profile from a JSON string.
     #[staticmethod]

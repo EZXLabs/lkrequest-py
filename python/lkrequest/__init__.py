@@ -26,6 +26,7 @@ from lkrequest._lkrequest import (
     SessionPoolStats,
     SessionResumptionConfig,
     H2DataFramePolicy,
+    AttemptLimits,
     # Browser network session policies
     TlsSessionResumptionPolicy,
     TlsSessionCachePartitionPolicy,
@@ -110,6 +111,7 @@ from lkrequest._lkrequest import (
     blocking_drain_pending,
     features,
     list_presets,
+    export_preset_json,
     trust_anchor_identity,
 )
 
@@ -165,6 +167,7 @@ __all__ = [
     "SessionPoolStats",
     "SessionResumptionConfig",
     "H2DataFramePolicy",
+    "AttemptLimits",
     # Browser network session policies
     "TlsSessionResumptionPolicy",
     "TlsSessionCachePartitionPolicy",
@@ -249,6 +252,7 @@ __all__ = [
     "blocking_drain_pending",
     "features",
     "list_presets",
+    "export_preset_json",
     "trust_anchor_identity",
 ]
 

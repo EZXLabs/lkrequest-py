@@ -74,13 +74,30 @@ async def test_an_async_session_asks_as_well(raw_http):
 def test_a_challenge_is_answered_with_a_new_credential(raw_http):
     replies = iter([CHALLENGE, REFUSED])
     server = raw_http(lambda request: next(replies))
+    tokens = Tokens()
     proxy = ProxyConfig(f"http://127.0.0.1:{server.port}").with_custom_auth(
-        "tokens", Tokens()
+        "tokens", tokens
     )
     get_through(proxy)
     first, second = (r.values("proxy-authorization") for r in server.requests)
     assert first == ["Bearer token-1"]
-    assert second != first and second[0].startswith("Bearer token-")
+    # One call per CONNECT sent: a call whose answer went nowhere would use a
+    # one-time token up for nothing.
+    assert second == ["Bearer token-2"]
+    assert tokens.calls == 2
+
+
+def test_no_credential_for_a_challenge_gives_up(raw_http):
+    server = raw_http(lambda request: CHALLENGE)
+    answers = iter(["Bearer token-1", None])
+    proxy = ProxyConfig(f"http://127.0.0.1:{server.port}").with_custom_auth(
+        "tokens", lambda: next(answers)
+    )
+    error = get_through(proxy)
+    assert error.proxy_error_kind == "authentication_required"
+    assert "declined" in str(error)
+    [connect] = server.requests
+    assert connect.values("proxy-authorization") == ["Bearer token-1"]
 
 
 def test_the_credential_goes_in_the_header_chosen(raw_http):
@@ -150,3 +167,72 @@ def test_authorize_must_be_a_plain_function():
         proxy.with_custom_auth("x", authorize)
     with pytest.raises(TypeError, match="callable"):
         proxy.with_custom_auth("x", "Bearer x")
+
+
+TWO_CHALLENGES = (
+    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+    b'Proxy-Authenticate: Digest realm="proxy", nonce="abc123", qop="auth"\r\n'
+    b'Proxy-Authenticate: Basic realm="proxy"\r\n'
+    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+)
+
+
+def test_on_challenge_answers_the_proxy_challenges(raw_http):
+    replies = iter([TWO_CHALLENGES, REFUSED])
+    server = raw_http(lambda request: next(replies))
+    seen = []
+
+    def on_challenge(challenges: list[str]) -> str:
+        seen.append(challenges)
+        nonce = challenges[0].split('nonce="')[1].split('"')[0]
+        return f'Digest username="alice", nonce="{nonce}"'
+
+    tokens = Tokens()
+    proxy = ProxyConfig(f"http://127.0.0.1:{server.port}").with_custom_auth(
+        "digest", tokens, on_challenge=on_challenge
+    )
+    get_through(proxy)
+    # Every challenge, whole and in order, realm and nonce included.
+    assert seen == [
+        ['Digest realm="proxy", nonce="abc123", qop="auth"', 'Basic realm="proxy"']
+    ]
+    first, second = (r.values("proxy-authorization") for r in server.requests)
+    assert first == ["Bearer token-1"]
+    assert second == ['Digest username="alice", nonce="abc123"']
+    assert tokens.calls == 1
+
+
+def give_up(challenges: list[str]) -> None:
+    return None
+
+
+def fail(challenges: list[str]) -> str:
+    raise RuntimeError("nonce store unavailable")
+
+
+def not_a_string(challenges: list[str]) -> int:
+    return 42
+
+
+@pytest.mark.parametrize("on_challenge", [give_up, fail, not_a_string])
+def test_on_challenge_without_an_answer_declines(raw_http, on_challenge):
+    server = raw_http(lambda request: TWO_CHALLENGES)
+    proxy = ProxyConfig(f"http://127.0.0.1:{server.port}").with_custom_auth(
+        "digest", Tokens(), on_challenge=on_challenge
+    )
+    error = get_through(proxy)
+    assert error.proxy_error_kind == "authentication_required"
+    assert "declined" in str(error)
+    assert len(server.requests) == 1
+
+
+def test_on_challenge_must_be_a_plain_function():
+    proxy = ProxyConfig("http://127.0.0.1:8080")
+
+    async def on_challenge(challenges):
+        return None
+
+    with pytest.raises(TypeError, match="on_challenge must be a plain function"):
+        proxy.with_custom_auth("digest", Tokens(), on_challenge=on_challenge)
+    with pytest.raises(TypeError, match="on_challenge must be callable"):
+        proxy.with_custom_auth("digest", Tokens(), on_challenge="Digest")

@@ -498,6 +498,33 @@ def test_h3_get(h3_server_url):
     not hasattr(lkrequest, "QuicProfile"),
     reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
 )
+def test_h3_diagnostics_name_the_connection(h3_server_url):
+    # An HTTP/3 response used to come without remote_addr or cipher_suite, and
+    # nothing timed its QUIC handshake. The first request opens the connection,
+    # so quic_ms times the handshake; the second rides it and has none.
+    session = BlockingClient(quic_profile="chrome_158", verify=False).session(
+        http3_only=True
+    )
+    first = session.get(f"{h3_server_url}/get", timeout=5.0)
+    second = session.get(f"{h3_server_url}/get", timeout=5.0)
+    host = h3_server_url.split("//", 1)[1]
+    for resp in (first, second):
+        diagnostics = resp.diagnostics
+        assert (resp.version, diagnostics["protocol"]) == (
+            lkrequest.HttpVersion.H3,
+            "h3",
+        )
+        assert diagnostics["remote_addr"] == host
+        assert diagnostics["cipher_suite"] in {"0x1301", "0x1302", "0x1303"}
+        assert (diagnostics["tcp_ms"], diagnostics["tls_ms"]) == (None, None)
+    assert first.diagnostics["quic_ms"] is not None
+    assert second.diagnostics["quic_ms"] is None
+
+
+@pytest.mark.skipif(
+    not hasattr(lkrequest, "QuicProfile"),
+    reason="built without the quic-h3 feature (maturin develop --features quic-h3)",
+)
 @pytest.mark.parametrize(
     "preset",
     [
@@ -508,6 +535,7 @@ def test_h3_get(h3_server_url):
         "chrome_155",
         "chrome_156",
         "chrome_157",
+        "chrome_158",
     ],
 )
 def test_h3_connection_survives_the_qpack_dynamic_table(h3_server_url, preset):
@@ -650,7 +678,8 @@ async def test_max_connections_counts_checked_out_connections(server_url):
     "fails instead of redialling. Measured ~28% failure at concurrency 20 on "
     "both 7da5345 and 5b09bf7, so this is pre-existing, not a sync regression. "
     "Timing-dependent, hence strict=False: it passes when the client notices "
-    "the close before checking the connection out.",
+    "the close before checking the connection out. The retry is off by "
+    "default since upstream 0.3.0, so the test turns it on.",
     strict=False,
 )
 @pytest.mark.asyncio
@@ -676,7 +705,11 @@ async def test_redirect_reconnects_when_pooled_h1_closed_after_302():
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     async with server:
-        client = lkrequest.Client(tls_profile="chrome_144", h2_profile="chrome_144")
+        client = lkrequest.Client(
+            tls_profile="chrome_144",
+            h2_profile="chrome_144",
+            retry_on_connection_close=True,
+        )
         session = client.session(http1_only=True)
         resp = await session.post(
             f"http://127.0.0.1:{port}/submit", body=b"payload", timeout=10.0

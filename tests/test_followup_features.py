@@ -1,6 +1,6 @@
 """Tests for features added while tracking the lkrequest core update:
 
-new browser presets (chrome_145 through chrome_157, firefox_156), request
+new browser presets (chrome_145 through chrome_158, firefox_156), request
 priority, protocol
 policy / HTTP intent, session resumption, per-request preferred HTTP version /
 idempotency, and the QUIC/H3 surface.
@@ -30,6 +30,7 @@ NEW_CHROME_PRESETS = [
     "chrome_155",
     "chrome_156",
     "chrome_157",
+    "chrome_158",
 ]
 
 
@@ -104,6 +105,7 @@ class TestNewPresets:
             "chrome_155",
             "chrome_156",
             "chrome_157",
+            "chrome_158",
         }
 
     def test_chrome_152_carries_trust_anchor_ids(self):
@@ -281,6 +283,22 @@ class TestNewPresets:
             == lkrequest.H2Profile.chrome_156().to_json()
         )
 
+    def test_chrome_158_is_chrome_157_under_a_new_name(self):
+        # The Chrome 158.0.8127.37 capture matched Chrome 157 over TCP TLS, QUIC
+        # TLS and H2, the sorted trust-anchor IDs included.
+        for prev, cur in (
+            ("chrome_157", "chrome_158"),
+            ("chrome_157_quic", "chrome_158_quic"),
+        ):
+            old = json.loads(getattr(lkrequest.TlsProfile, prev)().to_json())
+            new = json.loads(getattr(lkrequest.TlsProfile, cur)().to_json())
+            assert new.pop("name") == old.pop("name").replace("157", "158")
+            assert new == old
+        assert (
+            lkrequest.H2Profile.chrome_158().to_json()
+            == lkrequest.H2Profile.chrome_157().to_json()
+        )
+
     @pytest.mark.parametrize(
         "hpack, expected",
         [
@@ -403,6 +421,7 @@ class TestNewPresets:
             "chrome_155",
             "chrome_156",
             "chrome_157",
+            "chrome_158",
         ):
             tcp = json.loads(getattr(lkrequest.TlsProfile, name)().to_json())
             quic = json.loads(getattr(lkrequest.TlsProfile, f"{name}_quic")().to_json())
@@ -463,6 +482,7 @@ class TestNewPresets:
             "chrome_155",
             "chrome_156",
             "chrome_157",
+            "chrome_158",
             "firefox_133",
             "firefox_147",
             "firefox_156",
@@ -653,6 +673,7 @@ class TestQuicSurface:
             "chrome_155",
             "chrome_156",
             "chrome_157",
+            "chrome_158",
         ):
             qp = getattr(lkrequest.QuicProfile, name)()
             assert qp.connection_id_length >= 0
@@ -717,6 +738,8 @@ class TestQuicSurface:
         assert profiles["chrome_156"] == profiles["chrome_155"]
         # So is Chrome 157 Chrome 156's.
         assert profiles["chrome_157"] == profiles["chrome_156"]
+        # And Chrome 158 Chrome 157's.
+        assert profiles["chrome_158"] == profiles["chrome_157"]
 
     def test_chrome_152_quic_drops_google_initial_rtt(self):
         # Unlike Chrome 151 (identical to 150), Chrome 152 is the first preset
@@ -759,6 +782,7 @@ class TestQuicSurface:
             "chrome_155",
             "chrome_156",
             "chrome_157",
+            "chrome_158",
         )
         for name in captured + ("chrome",):
             p = json.loads(getattr(lkrequest.QuicProfile, name)().to_json())

@@ -30,6 +30,7 @@ OPTIONS = {
     "ip_family": "ipv4",
     "proxy_fallback_direct": True,
     "h2_fallback_h1": False,
+    "retry_on_connection_close": True,
     "max_pending_h2_requests": 8,
     "ech_config": b"\x00\x01",
 }
@@ -63,6 +64,7 @@ def test_the_options_given_read_back(client_cls):
     assert client.verify is False
     assert client.ip_family == "ipv4"
     assert (client.proxy_fallback_direct, client.h2_fallback_h1) == (True, False)
+    assert client.retry_on_connection_close is True
     assert client.max_pending_h2_requests == 8
     assert client.ech_config == b"\x00\x01"
 
@@ -83,12 +85,21 @@ def test_what_is_left_out_reads_as_the_default():
         "ttfb_timeout",
         "total_timeout",
         "quic_connect_timeout",
+        "read_idle_timeout",
     }
     # No cap, as the argument's None means.
     assert client.resource_limits["max_connections_per_session"] is None
     assert axes(client.protocol_policy) == axes(ProtocolPolicy.crawler_throughput())
     assert (client.verify, client.ip_family) == (True, "any")
     assert (client.max_pending_h2_requests, client.ech_config) == (None, None)
+    # Since upstream 0.3.0, no recovery is turned on unless asked for, and
+    # a request has two minutes in all.
+    assert (
+        client.h2_fallback_h1,
+        client.proxy_fallback_direct,
+        client.retry_on_connection_close,
+    ) == (False, False, False)
+    assert client.timeouts["total_timeout"] == 120.0
 
 
 def test_a_preset_reads_back_as_the_browser_it_copies():
@@ -126,6 +137,7 @@ def test_a_randomized_copy_keeps_the_rest_of_the_client(client_cls):
         "ip_family",
         "proxy_fallback_direct",
         "h2_fallback_h1",
+        "retry_on_connection_close",
         "max_pending_h2_requests",
         "ech_config",
     ):

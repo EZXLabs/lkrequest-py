@@ -83,18 +83,23 @@ impl PyProxyConfig {
     /// Return a new config whose credential `authorize()` gives for each
     /// connection through this hop, replacing any credential already set.
     /// `identity` tells it apart from other credentials on the same address.
-    fn with_custom_auth(&self, identity: String, authorize: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if !authorize.is_callable() {
-            return Err(PyTypeError::new_err("authorize must be callable"));
-        }
-        if is_async_function(authorize)? {
-            return Err(PyTypeError::new_err(
-                "authorize must be a plain function, not an async one",
-            ));
+    /// `on_challenge(challenges)`, if given, answers a 407 in its place, from
+    /// the `Proxy-Authenticate` challenges the proxy sent.
+    #[pyo3(signature = (identity, authorize, on_challenge=None))]
+    fn with_custom_auth(
+        &self,
+        identity: String,
+        authorize: &Bound<'_, PyAny>,
+        on_challenge: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        plain_function("authorize", authorize)?;
+        if let Some(function) = on_challenge {
+            plain_function("on_challenge", function)?;
         }
         let authenticator = Arc::new(PyAuthenticator {
             identity,
             authorize: authorize.clone().unbind(),
+            on_challenge: on_challenge.map(|function| function.clone().unbind()),
         });
         Ok(Self {
             inner: self
@@ -186,12 +191,28 @@ pub(crate) fn proxy_check(
     })
 }
 
+/// Refuse what the Rust library cannot call: something not callable, or an
+/// `async def`, whose call would only give it an unawaited coroutine.
+fn plain_function(name: &str, function: &Bound<'_, PyAny>) -> PyResult<()> {
+    if !function.is_callable() {
+        return Err(PyTypeError::new_err(format!("{name} must be callable")));
+    }
+    if is_async_function(function)? {
+        return Err(PyTypeError::new_err(format!(
+            "{name} must be a plain function, not an async one"
+        )));
+    }
+    Ok(())
+}
+
 /// Upstream's `ProxyAuthenticator` backed by a Python function giving the
-/// header value. The identity is fixed, as `ProxyConfig.identity()` asks for
-/// it on whatever thread it runs.
+/// header value, and optionally one answering a 407's challenges. The
+/// identity is fixed, as `ProxyConfig.identity()` asks for it on whatever
+/// thread it runs.
 struct PyAuthenticator {
     identity: String,
     authorize: Py<PyAny>,
+    on_challenge: Option<Py<PyAny>>,
 }
 
 impl ProxyAuthenticator for PyAuthenticator {
@@ -206,6 +227,25 @@ impl ProxyAuthenticator for PyAuthenticator {
         let value = Python::try_attach(|py| self.authorize.bind(py).call0()?.extract())?;
         value.unwrap_or_else(|err: PyErr| {
             tracing::warn!(identity = %self.identity, error = %err, "proxy.authorize_failed");
+            None
+        })
+    }
+
+    /// Called for the one more CONNECT a 407 with challenges prompts, with the
+    /// complete `Proxy-Authenticate` values: `on_challenge` answers them when
+    /// given, `authorize` again otherwise. A failure declines the challenge.
+    fn authorization_for_challenge(&self, challenges: &[&str]) -> Option<String> {
+        let Some(on_challenge) = &self.on_challenge else {
+            return self.authorization_value();
+        };
+        let value = Python::try_attach(|py| {
+            on_challenge
+                .bind(py)
+                .call1((challenges.to_vec(),))?
+                .extract()
+        })?;
+        value.unwrap_or_else(|err: PyErr| {
+            tracing::warn!(identity = %self.identity, error = %err, "proxy.on_challenge_failed");
             None
         })
     }

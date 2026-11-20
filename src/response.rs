@@ -283,6 +283,7 @@ pub struct PyResponse {
     elapsed: f64,
     history: Vec<PyRedirectRecord>,
     diagnostics: lkrequest::diagnostics::RequestDiagnostics,
+    attempt_summary: lkrequest::AttemptSummary,
     cached_text: OnceLock<String>,
     cached_json: OnceLock<Py<PyAny>>,
     // Only read by the buffer-protocol surface (see the cfg-gated impl block
@@ -297,6 +298,7 @@ impl PyResponse {
         resp: lkrequest::Response,
         elapsed: f64,
         diagnostics: lkrequest::diagnostics::RequestDiagnostics,
+        attempt_summary: lkrequest::AttemptSummary,
     ) -> PyResult<Self> {
         let status_code = resp.status().as_u16();
         let headers: Vec<(String, String)> = resp
@@ -333,6 +335,7 @@ impl PyResponse {
             elapsed,
             history,
             diagnostics,
+            attempt_summary,
             cached_text: OnceLock::new(),
             cached_json: OnceLock::new(),
             body_shape,
@@ -349,6 +352,7 @@ pub(crate) fn diagnostics_dict<'py>(
     d.set_item("dns_ms", diag.dns_ms)?;
     d.set_item("tcp_ms", diag.tcp_ms)?;
     d.set_item("tls_ms", diag.tls_ms)?;
+    d.set_item("quic_ms", diag.quic_ms)?;
     d.set_item("ttfb_ms", diag.ttfb_ms)?;
     d.set_item("total_ms", diag.total_ms)?;
     d.set_item("remote_addr", diag.remote_addr.clone())?;
@@ -435,6 +439,13 @@ impl PyResponse {
         diagnostics_dict(py, &self.diagnostics)
     }
 
+    /// What the request did to get this response: its HTTP submissions,
+    /// redirects, recoveries and connection starts, and the limits in effect.
+    #[getter]
+    fn attempt_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        crate::attempts::summary_dict(py, &self.attempt_summary)
+    }
+
     /// Decode the body as text.
     ///
     /// The charset comes from `Content-Type` (the same value `encoding`
@@ -497,6 +508,7 @@ impl PyResponse {
                 format!("{} for url: {}", self.status_code, self.url),
                 self.status_code,
                 &self.diagnostics,
+                self.attempt_summary,
             ))
         } else {
             Ok(())
@@ -584,10 +596,16 @@ pub struct PyStreamingResponse {
     pub(crate) status_code: u16,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) inner: Arc<Mutex<Option<lkrequest::StreamingResponse>>>,
+    /// Taken when the response was handed over; reading the body sends no
+    /// more HTTP.
+    attempt_summary: lkrequest::AttemptSummary,
 }
 
 impl PyStreamingResponse {
-    pub fn new(resp: lkrequest::StreamingResponse) -> Self {
+    pub fn new(
+        resp: lkrequest::StreamingResponse,
+        attempt_summary: lkrequest::AttemptSummary,
+    ) -> Self {
         let status_code = resp.status().as_u16();
         let headers: Vec<(String, String)> = resp
             .headers()
@@ -598,6 +616,7 @@ impl PyStreamingResponse {
             status_code,
             headers,
             inner: Arc::new(Mutex::new(Some(resp))),
+            attempt_summary,
         }
     }
 }
@@ -607,6 +626,14 @@ impl PyStreamingResponse {
     #[getter]
     fn status_code(&self) -> u16 {
         self.status_code
+    }
+
+    /// What the request did before this response was handed over: its HTTP
+    /// submissions, redirects, recoveries and connection starts, and the
+    /// limits in effect. Reading the body sends no more HTTP.
+    #[getter]
+    fn attempt_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        crate::attempts::summary_dict(py, &self.attempt_summary)
     }
 
     #[getter]
@@ -727,10 +754,16 @@ pub struct PyBlockingStreamingResponse {
     status_code: u16,
     headers: Vec<(String, String)>,
     inner: Arc<Mutex<Option<lkrequest::StreamingResponse>>>,
+    /// Taken when the response was handed over; reading the body sends no
+    /// more HTTP.
+    attempt_summary: lkrequest::AttemptSummary,
 }
 
 impl PyBlockingStreamingResponse {
-    pub fn new(resp: lkrequest::StreamingResponse) -> Self {
+    pub fn new(
+        resp: lkrequest::StreamingResponse,
+        attempt_summary: lkrequest::AttemptSummary,
+    ) -> Self {
         let status_code = resp.status().as_u16();
         let headers: Vec<(String, String)> = resp
             .headers()
@@ -741,6 +774,7 @@ impl PyBlockingStreamingResponse {
             status_code,
             headers,
             inner: Arc::new(Mutex::new(Some(resp))),
+            attempt_summary,
         }
     }
 }
@@ -750,6 +784,14 @@ impl PyBlockingStreamingResponse {
     #[getter]
     fn status_code(&self) -> u16 {
         self.status_code
+    }
+
+    /// What the request did before this response was handed over: its HTTP
+    /// submissions, redirects, recoveries and connection starts, and the
+    /// limits in effect. Reading the body sends no more HTTP.
+    #[getter]
+    fn attempt_summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        crate::attempts::summary_dict(py, &self.attempt_summary)
     }
 
     #[getter]

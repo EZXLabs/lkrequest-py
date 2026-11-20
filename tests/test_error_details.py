@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pickle
 import socket
+import ssl
 import threading
 
 import pytest
@@ -57,6 +58,41 @@ def answer_once(reply: bytes) -> int:
             conn.recv(4096)
             conn.sendall(reply)
         listener.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1]
+
+
+def handshake_and_close(context: ssl.SSLContext, connections: int) -> int:
+    """A TLS server that makes a handshake on each of `connections`
+    connections and closes them. It blocks, so an alert its handshake ends in
+    is written out before the connection closes; an asyncio server drops it.
+    It then reads what the client still sends before closing, so that the
+    client can write its request and read the alert rather than run into a
+    reset."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+
+    def serve() -> None:
+        with listener:
+            for _ in range(connections):
+                conn, _ = listener.accept()
+                tls = context.wrap_socket(
+                    conn, server_side=True, do_handshake_on_connect=False
+                )
+                try:
+                    tls.do_handshake()
+                except OSError:  # ssl.SSLError included: the alert is out
+                    pass
+                with socket.socket(fileno=tls.detach()) as raw:
+                    raw.settimeout(5.0)
+                    try:
+                        raw.shutdown(socket.SHUT_WR)
+                        while raw.recv(65536):
+                            pass
+                    except OSError:
+                        pass
 
     threading.Thread(target=serve, daemon=True).start()
     return listener.getsockname()[1]
@@ -113,6 +149,7 @@ def test_a_refused_connection():
         "dns_ms",
         "tcp_ms",
         "tls_ms",
+        "quic_ms",
         "ttfb_ms",
         "total_ms",
         "remote_addr",
@@ -139,6 +176,42 @@ def test_a_tls_alert_from_the_server():
     assert isinstance(err, lkrequest.TlsError)
     assert (err.phase, err.tls_alert) == ("tls_handshake", "handshake_failure")
     assert err.diagnostics["remote_addr"] == f"127.0.0.1:{port}"
+
+
+@pytest.mark.parametrize(
+    ("version", "alert", "phase", "retryable"),
+    [
+        # A request already sent and refused is not tried again.
+        (ssl.TLSVersion.TLSv1_3, "certificate_required", "http_request", False),
+        # A handshake that failed counts as worth another try, as upstream has it.
+        (ssl.TLSVersion.TLSv1_2, "handshake_failure", "tls_handshake", True),
+    ],
+    ids=["tls13", "tls12"],
+)
+def test_a_server_that_wants_a_client_certificate(
+    _certs, version, alert, phase, retryable
+):
+    # The client sends no certificate. Over TLS 1.3 the server finds out only
+    # after the client has finished its handshake and sent the request, so
+    # its alert arrives as the response would: it is a TlsError all the same.
+    cert_file, key_file, ca_pem = _certs
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_file, key_file)
+    context.load_verify_locations(cadata=ca_pem.decode())
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.minimum_version = context.maximum_version = version
+    # The alert used to be lost now and then, the request then waiting for its
+    # TTFB timeout, so a few tries.
+    tries = 5
+    port = handshake_and_close(context, tries)
+    for _ in range(tries):
+        client = BlockingClient(verify=False, ttfb_timeout=5.0)
+        err = raised(
+            lambda client=client: client.session().get(f"https://127.0.0.1:{port}/")
+        )
+        assert isinstance(err, lkrequest.TlsError), repr(err)
+        assert (err.tls_alert, err.phase, err.retryable) == (alert, phase, retryable)
+        assert f"fatal alert: {alert}" in str(err)
 
 
 @pytest.mark.parametrize(

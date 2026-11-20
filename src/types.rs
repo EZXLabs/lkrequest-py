@@ -16,6 +16,15 @@ pub fn validated_duration(secs: f64) -> PyResult<Duration> {
     })
 }
 
+/// A client deadline in seconds: `math.inf` turns it off (`None`), and any
+/// other value must be a duration `validated_duration` accepts.
+pub fn deadline(secs: f64) -> PyResult<Option<Duration>> {
+    if secs == f64::INFINITY {
+        return Ok(None);
+    }
+    validated_duration(secs).map(Some)
+}
+
 /// Whether `function` is an `async def`, whose call the Rust library, which
 /// calls back synchronously, would only get an unawaited coroutine from.
 pub(crate) fn is_async_function(function: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -184,16 +193,56 @@ pub fn resolve_tls_profile(name: &str) -> PyResult<lktls::profile::TlsProfile> {
         "chrome_155" => Ok(lktls::profile::presets::chrome_155()),
         "chrome_156" => Ok(lktls::profile::presets::chrome_156()),
         "chrome_157" => Ok(lktls::profile::presets::chrome_157()),
+        "chrome_158" => Ok(lktls::profile::presets::chrome_158()),
         "firefox_133" => Ok(lktls::profile::presets::firefox_133()),
         "firefox_147" => Ok(lktls::profile::presets::firefox_147()),
         "firefox_156" => Ok(lktls::profile::presets::firefox_156()),
         "safari_18" => Ok(lktls::profile::presets::safari_18()),
         "safari_26" => Ok(lktls::profile::presets::safari_26()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
+            "Unknown TLS profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157, chrome_158, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
             name
         ))),
     }
+}
+
+/// A QUIC-TLS preset: the name of its `TlsProfile` constructor, and the
+/// upstream function that builds it.
+type QuicTlsPreset = (&'static str, fn() -> lktls::profile::TlsProfile);
+
+/// The QUIC-TLS presets, under the names of their `TlsProfile` constructors.
+/// A sync that adds one adds it here as well; `tests/test_quic_fingerprint.py`
+/// checks that every `TlsProfile.*_quic()` is listed.
+const QUIC_TLS_PRESETS: &[QuicTlsPreset] = &[
+    ("chrome_146_quic", lktls::profile::presets::chrome_146_quic),
+    ("chrome_150_quic", lktls::profile::presets::chrome_150_quic),
+    ("chrome_151_quic", lktls::profile::presets::chrome_151_quic),
+    ("chrome_152_quic", lktls::profile::presets::chrome_152_quic),
+    ("chrome_153_quic", lktls::profile::presets::chrome_153_quic),
+    ("chrome_154_quic", lktls::profile::presets::chrome_154_quic),
+    ("chrome_155_quic", lktls::profile::presets::chrome_155_quic),
+    ("chrome_156_quic", lktls::profile::presets::chrome_156_quic),
+    ("chrome_157_quic", lktls::profile::presets::chrome_157_quic),
+    ("chrome_158_quic", lktls::profile::presets::chrome_158_quic),
+];
+
+/// A `quic_fingerprint=` name: a browser preset stands for the ClientHello it
+/// sends inside QUIC (`"chrome_158"` for `chrome_158_quic`), which for a
+/// preset without a QUIC-TLS profile is its TLS profile; a QUIC-TLS preset is
+/// named as its `TlsProfile` constructor is (`"chrome_158_quic"`).
+pub fn resolve_quic_tls_profile(name: &str) -> PyResult<lktls::profile::TlsProfile> {
+    if let Some((_, build)) = QUIC_TLS_PRESETS.iter().find(|(preset, _)| *preset == name) {
+        return Ok(build());
+    }
+    crate::build_info::preset_quic_tls_profile(name).ok_or_else(|| {
+        let names: Vec<&str> = crate::build_info::preset_names()
+            .chain(QUIC_TLS_PRESETS.iter().map(|(preset, _)| *preset))
+            .collect();
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown QUIC TLS profile: '{name}'. Available: {}",
+            names.join(", ")
+        ))
+    })
 }
 
 pub fn resolve_h2_profile(name: &str) -> PyResult<lkh2::profile::H2Profile> {
@@ -213,13 +262,14 @@ pub fn resolve_h2_profile(name: &str) -> PyResult<lkh2::profile::H2Profile> {
         "chrome_155" => Ok(lkh2::profile::chrome_155_h2()),
         "chrome_156" => Ok(lkh2::profile::chrome_156_h2()),
         "chrome_157" => Ok(lkh2::profile::chrome_157_h2()),
+        "chrome_158" => Ok(lkh2::profile::chrome_158_h2()),
         "firefox_133" => Ok(lkh2::profile::firefox_133_h2()),
         "firefox_147" => Ok(lkh2::profile::firefox_147_h2()),
         "firefox_156" => Ok(lkh2::profile::firefox_156_h2()),
         "safari_18" => Ok(lkh2::profile::safari_18_h2()),
         "safari_26" => Ok(lkh2::profile::safari_26_h2()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
+            "Unknown H2 profile: '{}'. Available: chrome_131, chrome_144, chrome_145, chrome_146, chrome_147, chrome_148, chrome_149, chrome_150, chrome_151, chrome_152, chrome_153, chrome_154, chrome_155, chrome_156, chrome_157, chrome_158, firefox_133, firefox_147, firefox_156, safari_18, safari_26",
             name
         ))),
     }

@@ -12,6 +12,7 @@ fails the request, which is how a test sees that no upgrade happened.
 
 from __future__ import annotations
 
+import time
 from urllib.parse import urlsplit
 
 import pytest
@@ -35,11 +36,11 @@ def client() -> BlockingClient:
     )
 
 
-def learn(session, localhost: str) -> None:
+def learn(session, localhost: str, header: str = "max-age=3600") -> None:
     """Have `session` receive a Strict-Transport-Security header over HTTPS."""
     session.get(
         f"https://{localhost}/response-headers",
-        params={"Strict-Transport-Security": "max-age=3600"},
+        params={"Strict-Transport-Security": header},
     )
 
 
@@ -58,6 +59,38 @@ def test_another_dynamic_policy_has_learned_nothing(localhost):
     assert other.should_upgrade("localhost") is False
     with pytest.raises(lkrequest.RequestError):
         client().session(hsts=other).get(f"http://{localhost}/get", timeout=5.0)
+
+
+def test_a_learned_host_covers_its_subdomains_only_when_told_to(localhost):
+    hsts = Hsts.dynamic()
+    session = client().session(hsts=hsts)
+    learn(session, localhost)
+    assert hsts.should_upgrade("localhost")
+    assert hsts.should_upgrade("api.localhost") is False
+    learn(session, localhost, "max-age=3600; includeSubDomains")
+    assert hsts.should_upgrade("api.localhost")
+
+
+def test_a_learned_host_is_forgotten_once_its_max_age_runs_out(localhost):
+    hsts = Hsts.dynamic()
+    learn(client().session(hsts=hsts), localhost, "max-age=1")
+    assert hsts.should_upgrade("localhost")
+    time.sleep(1.2)
+    assert hsts.should_upgrade("localhost") is False
+
+
+def test_max_age_zero_forgets_a_learned_host(localhost):
+    hsts = Hsts.dynamic()
+    session = client().session(hsts=hsts)
+    learn(session, localhost)
+    learn(session, localhost, "max-age=0")
+    assert hsts.should_upgrade("localhost") is False
+
+
+def test_a_seeded_host_covers_its_subdomains():
+    hsts = Hsts.dynamic(seed=["example.com"])
+    assert hsts.should_upgrade("api.example.com")
+    assert hsts.should_upgrade("example.org") is False
 
 
 def test_the_presets_answer_as_a_session_would_ask_them():

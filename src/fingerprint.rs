@@ -675,6 +675,14 @@ impl PyTlsProfile {
             inner: lktls::profile::presets::chrome_157(),
         }
     }
+    /// Chrome 158: the Chrome 158.0.8127.37 capture kept Chrome 157's TLS shape,
+    /// sorted trust-anchor IDs included; only the profile name differs.
+    #[staticmethod]
+    fn chrome_158() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_158(),
+        }
+    }
     /// Chrome 146 QUIC-TLS profile: the ClientHello Chrome sends *inside* QUIC,
     /// which differs from the TCP profile of the same version. Pass it to
     /// `Client(quic_fingerprint=...)`; HTTP/3 otherwise reuses the main TLS profile.
@@ -744,6 +752,14 @@ impl PyTlsProfile {
     fn chrome_157_quic() -> Self {
         PyTlsProfile {
             inner: lktls::profile::presets::chrome_157_quic(),
+        }
+    }
+    /// Chrome 158 QUIC-TLS profile: derived from the Chrome 158 TLS profile the
+    /// way Chrome 157's is, so it matches Chrome 157's QUIC ClientHello.
+    #[staticmethod]
+    fn chrome_158_quic() -> Self {
+        PyTlsProfile {
+            inner: lktls::profile::presets::chrome_158_quic(),
         }
     }
     #[staticmethod]
@@ -1341,6 +1357,13 @@ impl PyH2Profile {
     fn chrome_157() -> Self {
         PyH2Profile {
             inner: lkh2::profile::chrome_157_h2(),
+        }
+    }
+    /// Chrome 158 H2 profile: unchanged from Chrome 157.
+    #[staticmethod]
+    fn chrome_158() -> Self {
+        PyH2Profile {
+            inner: lkh2::profile::chrome_158_h2(),
         }
     }
     #[staticmethod]

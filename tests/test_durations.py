@@ -2,11 +2,13 @@
 
 A negative, NaN or infinite value, or one too large for the Rust library to
 hold, raises `ValueError` instead of crashing with a `PanicException`, which
-`except Exception` does not catch.
+`except Exception` does not catch. A client's timeouts are the exception to
+infinity: `math.inf` turns that deadline off (see `test_deadlines.py`).
 """
 
 from __future__ import annotations
 
+import math
 import socket
 
 import pytest
@@ -17,6 +19,8 @@ from lkrequest.blocking import Client as BlockingClient
 # Seconds, more than a Rust `Duration` holds.
 TOO_LARGE = 1e30
 NOT_DURATIONS = [-1.0, float("nan"), float("inf"), TOO_LARGE]
+# A client timeout takes math.inf, which turns the deadline off.
+NOT_DEADLINES = [-1.0, float("nan"), -math.inf, TOO_LARGE]
 
 
 def closed_port() -> int:
@@ -25,7 +29,7 @@ def closed_port() -> int:
         return sock.getsockname()[1]
 
 
-@pytest.mark.parametrize("seconds", NOT_DURATIONS)
+@pytest.mark.parametrize("seconds", NOT_DEADLINES)
 def test_a_client_timeout_must_be_a_duration(seconds):
     with pytest.raises(ValueError, match="Duration must be"):
         lkrequest.Client(total_timeout=seconds)
